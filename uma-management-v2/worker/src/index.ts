@@ -5,7 +5,42 @@ const out=(v:unknown,s=200)=>new Response(JSON.stringify(v),{status:s,headers:{"
 const err=(m:string,s=400)=>out({error:m},s);
 async function digest(v:string){const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(v));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("")}
 async function hashPass(p:string,salt=crypto.getRandomValues(new Uint8Array(16))){const k=await crypto.subtle.importKey("raw",new TextEncoder().encode(p),"PBKDF2",false,["deriveBits"]);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:310000,hash:"SHA-256"},k,256);const h=(a:Uint8Array)=>[...a].map(x=>x.toString(16).padStart(2,"0")).join("");return `pbkdf2$${h(salt)}$${h(new Uint8Array(bits))}`}
-async function checkPass(p:string,s:string){const a=s.split("$");if(a.length!==3||a[0]!=="pbkdf2")return false;const salt=new Uint8Array(a[1].match(/../g)!.map(x=>parseInt(x,16)));return await hashPass(p,salt)===s}
+async function checkPass(p: string, s: string) {
+  const a = s.split("$");
+  if (a.length !== 3 || a[0] !== "pbkdf2") return false;
+
+  const salt = new Uint8Array(
+    a[1].match(/../g)!.map(x => parseInt(x, 16))
+  );
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(p),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+
+  const toHex = (value: Uint8Array) =>
+    [...value].map(x => x.toString(16).padStart(2, "0")).join("");
+
+  for (const iterations of [310000, 100000]) {
+    const bits = await crypto.subtle.deriveBits(
+      {
+        name: "PBKDF2",
+        salt,
+        iterations,
+        hash: "SHA-256"
+      },
+      key,
+      256
+    );
+
+    if (toHex(new Uint8Array(bits)) === a[2]) return true;
+  }
+
+  return false;
+}
 function token(req:Request){return (req.headers.get("cookie")||"").split(";").map(x=>x.trim()).find(x=>x.startsWith("uma="))?.slice(4)}
 async function current(req:Request,e:Env){const t=token(req);if(!t)return null;return await e.DB.prepare("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id_hash=? AND s.expires_at>? AND u.active=1").bind(await digest(decodeURIComponent(t)),now()).first<U>()}
 async function audit(e:Env,u:string,a:string,t:string,id:string|null){await e.DB.prepare("INSERT INTO audit_log VALUES(?,?,?,?,?,?,?)").bind(uid(),u,a,t,id,null,now()).run()}
