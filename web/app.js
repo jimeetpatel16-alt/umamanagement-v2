@@ -428,6 +428,150 @@ async function recordPage() {
   };
 }
 
+function parseBulkLine(line, drivers, index) {
+  const clean = value => String(value || "").trim();
+  const normal = value => clean(value).toLowerCase();
+
+  const splitCells = (text, delimiter) => {
+    const cells = [];
+    let cell = "";
+    let quoted = false;
+
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+
+      if (ch === '"' && text[i + 1] === '"' && quoted) {
+        cell += '"';
+        i++;
+      } else if (ch === '"') {
+        quoted = !quoted;
+      } else if (ch === delimiter && !quoted) {
+        cells.push(clean(cell));
+        cell = "";
+      } else {
+        cell += ch;
+      }
+    }
+
+    cells.push(clean(cell));
+    return cells;
+  };
+
+  const knownDrivers = drivers
+    .filter(d => d.active !== 0)
+    .map(d => d.name)
+    .sort((a, b) => b.length - a.length);
+
+  const delimiter = line.includes("\t")
+    ? "\t"
+    : line.includes("|")
+      ? "|"
+      : line.includes(",")
+        ? ","
+        : null;
+
+  // Structured Excel, CSV or pipe-separated row
+  if (delimiter) {
+    const c = splitCells(line, delimiter);
+
+    const first = normal(c[0]);
+
+    if (["driver", "driver name", "name"].includes(first)) {
+      return null;
+    }
+
+    if (c.length >= 3) {
+      const vehicleText = normal(c[2]);
+
+      return {
+        line: index + 1,
+        driver: clean(c[0]),
+        block: clean(c[1]),
+        vehicle: /\bvan\b/.test(vehicleText)
+          ? "Van"
+          : /\bother\b/.test(vehicleText)
+            ? "Other"
+            : /\bcar\b/.test(vehicleText)
+              ? "Car"
+              : clean(c[2]),
+        parcels: Number(c[3] || 0),
+        delivered: Number(c[4] || 0),
+        failed: Number(c[5] || 0)
+      };
+    }
+  }
+
+  // Free-text delivery notes
+  const blockMatch = line.match(
+    /\b(block|route|zone)\s*#?\s*([a-z0-9-]+)\b/i
+  );
+
+  const vehicleMatch = line.match(/\b(car|van|other)\b/i);
+
+  const matchedDriver = knownDrivers.find(name =>
+    new RegExp(
+      "(^|[^a-z0-9])" +
+      name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+      "($|[^a-z0-9])",
+      "i"
+    ).test(line)
+  );
+
+  let driver = matchedDriver || "";
+
+  if (!driver) {
+    let candidate = line;
+
+    if (blockMatch) {
+      candidate = candidate.replace(blockMatch[0], " ");
+    }
+
+    if (vehicleMatch) {
+      candidate = candidate.replace(vehicleMatch[0], " ");
+    }
+
+    candidate = candidate
+      .replace(/\b\d+\s*(parcels?|deliveries|packages)\b/ig, " ")
+      .replace(/\b(delivered|failed|parcels?|deliveries|packages)\b/ig, " ")
+      .replace(/\b(bonus|adjustment|deduction)\s*[:=]?\s*\$?[\d.]+/ig, " ")
+      .replace(/\s+/g, " ")
+      .replace(/^[,;:\s-]+|[,;:\s-]+$/g, "")
+      .trim();
+
+    driver = candidate;
+  }
+
+  const numberAfter = (label) => {
+    const match = line.match(
+      new RegExp("\\b" + label + "\\s*[:=]?\\s*(\\d+)", "i")
+    );
+    return match ? Number(match[1]) : 0;
+  };
+
+  const parcelMatch = line.match(
+    /\b(\d+)\s*(?:parcels?|packages)\b/i
+  );
+
+  return {
+    line: index + 1,
+    driver: clean(driver),
+    block: blockMatch
+      ? (blockMatch[1].toLowerCase() === "block"
+          ? "Block "
+          : blockMatch[1][0].toUpperCase() +
+            blockMatch[1].slice(1).toLowerCase() + " ") +
+        blockMatch[2]
+      : "",
+    vehicle: vehicleMatch
+      ? vehicleMatch[1][0].toUpperCase() +
+        vehicleMatch[1].slice(1).toLowerCase()
+      : "Car",
+    parcels: parcelMatch ? Number(parcelMatch[1]) : 0,
+    delivered: numberAfter("delivered"),
+    failed: numberAfter("failed")
+  };
+}
+
 /* BULK ADD */
 
 async function bulkPage() {
@@ -506,13 +650,15 @@ Shilpa | Block 7 | Van | 180 | 175 | 5"></textarea>
       return;
     }
 
+    
     parsed = text
       .split(/\r?\n/)
       .filter(line => line.trim())
-      .map((line, index) => {
-        const columns = line.includes("|")
-          ? line.split("|")
-          : line.split(",");
+      .map((line, index) =>
+        parseBulkLine(line, drivers, index)
+      )
+      .filter(Boolean);
+
 
         return {
           line: index + 1,
