@@ -1,0 +1,56 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<meta charset="utf-8">
+<title>UMA Management</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+
+<div id="shell">
+  <nav id="sidebar" aria-label="Main navigation"></nav>
+
+  <div id="main">
+    <div id="portalbar" class="hidden"></div>
+    <div id="topbar">
+      <button class="btn btn-icon" id="hamburgerBtn" aria-label="Open menu">☰</button>
+      <div class="brand" style="padding:0;">
+        <div class="brand-mark">UM</div>
+      </div>
+      <div style="width:36px;"></div>
+    </div>
+    <main id="content" role="main"></main>
+  </div>
+</div>
+
+<div id="drawer-backdrop" class="hidden"></div>
+<nav id="mobilenav" class="hidden" aria-label="Mobile navigation"></nav>
+
+<div id="gate"></div>
+<div id="modal-root"></div>
+<div id="toasts" aria-live="polite"></div>
+
+<script>
+// Load ExcelJS from several CDNs. Continue loading the app even if every CDN fails,
+// so the website itself remains usable and can show a clear export error.
+(function () {
+  var sources = [
+    'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js',
+    'https://unpkg.com/exceljs@4.4.0/dist/exceljs.min.js'
+  ];
+  function loadApp() {
+    var excel = document.createElement('script'); excel.src = 'excel.js';
+    excel.onload = function () { var app = document.createElement('script'); app.src = 'app.js'; document.body.appendChild(app); };
+    document.body.appendChild(excel);
+  }
+  function trySource(i) {
+    if (i >= sources.length) { window.UMA_EXCELJS_LOAD_ERROR = true; loadApp(); return; }
+    var script = document.createElement('script'); script.src = sources[i];
+    script.onload = function () { if (window.ExcelJS) loadApp(); else trySource(i + 1); };
+    script.onerror = function () { trySource(i + 1); };
+    document.head.appendChild(script);
+  }
+  trySource(0);
+})();
+</script>
+
+</body></html>
