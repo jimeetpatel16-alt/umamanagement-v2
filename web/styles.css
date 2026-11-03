@@ -2,19 +2,19 @@
    Driver Payments — design tokens
    ============================================================ */
 :root {
-  --bg: #f3f6fb;
+  --bg: #f6f4ef;
   --surface: #ffffff;
-  --surface-2: #eaf0f7;
-  --surface-3: #dce6f1;
-  --border: #d7e0eb;
-  --ink: #142238;
-  --ink-muted: #5d6d82;
-  --ink-faint: #8795a8;
+  --surface-2: #efebe2;
+  --surface-3: #e6e1d5;
+  --border: #ddd7c8;
+  --ink: #23211c;
+  --ink-muted: #746c5c;
+  --ink-faint: #9a9280;
 
-  --accent: #087e8b;
-  --accent-hover: #066874;
-  --accent-ink: #ffffff;
-  --accent-soft: #d9f0f1;
+  --accent: #c1602a;
+  --accent-hover: #a94f21;
+  --accent-ink: #fffaf4;
+  --accent-soft: #f3ddc7;
 
   --good: #2f7d52;
   --good-soft: #dcefdf;
@@ -406,103 +406,3 @@ table.data tfoot td { font-weight: 700; border-top: 2px solid var(--border); bac
 }
 @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
 @keyframes drawerin { from { transform: translateX(-12px); opacity: 0.6; } to { transform: none; opacity: 1; } }
-
-
-/* UMA Management refreshed visual theme — navy, teal and clean workspace surfaces */
-body { background: var(--bg); color: var(--ink); }
-#shell { background: var(--bg); }
-#sidebar { background: linear-gradient(180deg, #10243b 0%, #173b52 100%); color: #eef8fb; border-right: 0; box-shadow: 8px 0 28px rgba(15,35,57,.08); }
-#sidebar .brand-text, #sidebar .nav-label, #sidebar .nav-item { color: #e8f2f7; }
-#sidebar .nav-item { border-radius: 10px; margin: 3px 10px; transition: background .18s ease, transform .18s ease; }
-#sidebar .nav-item:hover { background: rgba(255,255,255,.10); transform: translateX(2px); }
-#sidebar .nav-item.active { background: linear-gradient(90deg, #087e8b, #12a3a0); color: #fff; box-shadow: 0 6px 18px rgba(0,0,0,.16); }
-.brand-mark { background: linear-gradient(135deg, #0c9aa0, #086b83) !important; color: #fff !important; box-shadow: 0 5px 16px rgba(8,126,139,.25); }
-#topbar { background: rgba(255,255,255,.88); backdrop-filter: blur(14px); border-bottom: 1px solid var(--border); }
-.view-header h1 { letter-spacing: -.035em; }
-.card { border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 5px 20px rgba(23,48,75,.045); }
-.btn-primary { background: linear-gradient(135deg, #087e8b, #0a9b9d); border-color: transparent; color: #fff; box-shadow: 0 4px 12px rgba(8,126,139,.18); }
-.btn-primary:hover { background: linear-gradient(135deg, #066874, #087e8b); transform: translateY(-1px); }
-input, select, textarea { border-radius: 9px; border-color: #d4dfeb; }
-input:focus, select:focus, textarea:focus { border-color: #0a9b9d; box-shadow: 0 0 0 3px rgba(10,155,157,.12); outline: none; }
-table.data thead th { background: #edf3f8; color: #43566e; }
-table.data tbody tr:hover { background: #f4fafb; }
-.pill-paid { background: #d9f3e8; color: #126344; }
-@media (prefers-color-scheme: dark) {
-  #topbar { background: rgba(27,36,51,.92); }
-  table.data thead th { background: #26364b; color: #dce8f4; }
-  table.data tbody tr:hover { background: #1d3440; }
-}
-
-/* UMA requested white + blue visual system: keep the admin workspace light. */
-:root, :root[data-theme="dark"] {
-  --bg: #f4f7fc !important;
-  --surface: #ffffff !important;
-  --surface-2: #edf3fb !important;
-  --surface-3: #e1eaf7 !important;
-  --border: #d7e2f0 !important;
-  --ink: #142b4a !important;
-  --ink-muted: #5e718d !important;
-  --ink-faint: #8292a9 !important;
-  --accent: #1769d2 !important;
-  --accent-hover: #1056b5 !important;
-  --accent-ink: #ffffff !important;
-  --accent-soft: #e3efff !important;
-  --shadow: 0 2px 10px rgba(22, 62, 115, .07) !important;
-  --shadow-lift: 0 8px 24px rgba(22, 62, 115, .12) !important;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #f4f7fc !important;
-    --surface: #ffffff !important;
-    --surface-2: #edf3fb !important;
-    --surface-3: #e1eaf7 !important;
-    --border: #d7e2f0 !important;
-    --ink: #142b4a !important;
-    --ink-muted: #5e718d !important;
-    --ink-faint: #8292a9 !important;
-    --accent: #1769d2 !important;
-    --accent-hover: #1056b5 !important;
-    --accent-ink: #ffffff !important;
-    --accent-soft: #e3efff !important;
-  }
-}
-#sidebar { background: #ffffff !important; border-right: 1px solid #d7e2f0 !important; }
-#sidebar .brand-text, #sidebar .nav-label, #sidebar .nav-item { color: #294363 !important; }
-#sidebar .nav-item:hover { background: #edf4ff !important; }
-#sidebar .nav-item.active { background: linear-gradient(100deg, #1769d2, #4389e8) !important; color: #ffffff !important; box-shadow: 0 5px 16px rgba(23,105,210,.18) !important; }
-.brand-mark { background: linear-gradient(135deg, #1769d2, #4389e8) !important; }
-.btn-primary { background: linear-gradient(135deg, #1769d2, #4389e8) !important; color: #fff !important; }
-
-/* Keep the interface visually steady when the pointer moves over controls. */
-a:hover { color: inherit !important; }
-.nav-link:hover { background: transparent !important; color: var(--ink-muted) !important; }
-.nav-link.active:hover { background: var(--accent-soft) !important; color: var(--accent-hover) !important; }
-#staffbox button:hover { color: var(--ink-muted) !important; background: transparent !important; }
-.btn:hover { background: var(--surface) !important; border-color: var(--border) !important; color: var(--ink) !important; transform: none !important; }
-.btn-primary:hover { background: linear-gradient(135deg, #1769d2, #4389e8) !important; border-color: transparent !important; color: #fff !important; }
-.btn-danger:hover { background: var(--surface) !important; color: var(--danger) !important; }
-.stat-tile:hover { box-shadow: none !important; }
-table.data tbody tr:hover { background: transparent !important; }
-.modal-head button:hover, .keypad button:hover { background: transparent !important; color: inherit !important; }
-.staff-chip:hover { border-color: var(--border) !important; background: var(--surface) !important; }
-#sidebar .nav-item:hover { background: transparent !important; transform: none !important; }
-
-/* Dedicated, independent Driver and Labour portal — no admin workspace chrome. */
-#portalbar { display:block; position:sticky; top:0; z-index:30; background:#fff; border-bottom:1px solid #d9e5f4; padding:14px clamp(14px,3vw,34px) 0; }
-#portalbar.hidden { display:none !important; }
-.portal-head { display:flex; align-items:center; justify-content:space-between; gap:14px; max-width:1180px; margin:0 auto 12px; }
-.portal-brand { display:flex; align-items:center; gap:11px; color:#18365b; }
-.portal-brand .brand-mark { width:42px; height:42px; border-radius:12px; color:#fff; background:#2878df; }
-.portal-brand strong { display:block; font-size:1rem; font-weight:800; }
-.portal-brand small { display:block; margin-top:2px; color:#66809f; font-size:.7rem; letter-spacing:.08em; text-transform:uppercase; }
-.portal-user { display:flex; align-items:center; gap:10px; color:#385574; font-size:.84rem; font-weight:700; }
-.portal-tabs { display:flex; gap:8px; max-width:1180px; margin:0 auto; overflow-x:auto; }
-.portal-tab { border:0; border-bottom:3px solid transparent; background:transparent; color:#536d8c; padding:12px 15px; font-family:inherit; font-size:.9rem; font-weight:600; white-space:nowrap; cursor:pointer; }
-.portal-tab.active { color:#1769d2; border-bottom-color:#1769d2; background:#f1f6ff; }
-body.worker-portal #shell { display:block; min-height:100vh; background:#f5f8fd; }
-body.worker-portal #sidebar, body.worker-portal #topbar, body.worker-portal #mobilenav, body.worker-portal #drawer-backdrop { display:none !important; }
-body.worker-portal #main { width:100%; }
-body.worker-portal #content { max-width:1180px; margin:0 auto; padding:26px clamp(14px,3vw,34px) 60px; }
-body.worker-portal .view-header h1 { color:#17385f; }
-body.worker-portal .card { border:1px solid #e0e9f5; box-shadow:0 8px 24px rgba(30,70,120,.05); }
-@media(max-width:600px) { .portal-head { align-items:flex-start; } .portal-user { flex-direction:column; align-items:flex-end; gap:5px; } .portal-tabs { margin-right:-14px; } body.worker-portal #content { padding-top:18px; } }

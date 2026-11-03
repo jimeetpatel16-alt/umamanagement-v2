@@ -395,15 +395,14 @@
     { id: 'dashboard', label: 'Dashboard', mono: 'DB', roles: ['admin', 'manager', 'staff'] },
     { id: 'entry', label: 'Daily Entry', mono: 'EN', roles: ['admin', 'manager', 'staff'] },
     { id: 'records', label: 'Records', mono: 'RC', roles: ['admin', 'manager', 'staff'] },
-    { id: 'drivers', label: 'Drivers', mono: 'DR', roles: ['admin', 'manager', 'staff'] },
+    { id: 'drivers', label: 'Drivers', mono: 'DR', roles: ['admin', 'manager'] },
     { id: 'companies', label: 'Companies', mono: 'CO', roles: ['admin', 'manager'] },
     { id: 'labour', label: 'Labour', mono: 'LB', roles: ['admin', 'manager'] },
     { id: 'rate-cards', label: 'Rate Cards', mono: 'RT', roles: ['admin', 'manager'] },
-    { id: 'labour-shifts', label: 'Labour Shift', mono: 'SH', roles: ['admin', 'manager', 'staff'] },
+    { id: 'labour-shifts', label: 'Labour Shifts', mono: 'SH', roles: ['admin', 'manager'] },
     { id: 'summary', label: 'Driver Summary', mono: 'SU', roles: ['admin', 'manager', 'staff'] },
     { id: 'payments', label: 'Payments', mono: 'PA', roles: ['admin', 'manager', 'staff'] },
-    { id: 'driver-submissions', label: 'Submission Approvals', mono: 'AP', roles: ['admin', 'manager', 'staff'] },
-    { id: 'team-accounts', label: 'Team Accounts', mono: 'TA', roles: ['admin', 'staff'] },
+    { id: 'driver-submissions', label: 'Driver Submissions', mono: 'DS', roles: ['admin', 'manager'] },
     { id: 'delivery-blocks', label: 'Delivery Blocks', mono: 'BK', roles: ['admin', 'manager'] },
     { id: 'driver-assignments', label: 'Driver Assignments', mono: 'AS', roles: ['admin', 'manager'] },
     { id: 'driver-performance', label: 'Driver Performance', mono: 'DP', roles: ['admin', 'manager'] },
@@ -431,9 +430,8 @@
   // only (no server-side rule enforcement is possible on this platform).
   function roleAllowed(route, role) {
     const nav = NAV.find((n) => n.id === route);
-    if (!nav || !nav.roles || !nav.roles.includes(role)) return false;
-    if (role === 'staff') return ['dashboard', 'entry', 'records', 'drivers', 'labour-shifts', 'payments', 'driver-submissions', 'export'].includes(route);
-    return true;
+    if (!nav || !nav.roles) return true;
+    return nav.roles.includes(role);
   }
 
   function navHtml() {
@@ -445,25 +443,7 @@
     `).join('');
   }
 
-  function renderPortalBar() {
-    const bar = document.getElementById('portalbar');
-    if (!bar) return;
-    const role = state.session && state.session.role;
-    if (role !== 'driver' && role !== 'labour') {
-      bar.classList.add('hidden');
-      document.body.classList.remove('worker-portal');
-      return;
-    }
-    document.body.classList.add('worker-portal');
-    const links = role === 'driver'
-      ? [{ id: 'driver-submit', label: "Today's Deliveries" }, { id: 'driver-my-history', label: 'My Submissions' }]
-      : [{ id: 'labour-log', label: 'Today' }, { id: 'labour-my-shifts', label: 'My Shifts' }, { id: 'labour-my-history', label: 'My Logs' }];
-    bar.classList.remove('hidden');
-    bar.innerHTML = `<div class="portal-head"><div class="portal-brand"><div class="brand-mark">UM</div><div><strong>${esc(state.settings.businessName || 'UMA Management')}</strong><small>${role === 'driver' ? 'Driver Portal' : 'Labour Portal'}</small></div></div><div class="portal-user"><span>${esc(state.session.name || '')}</span><button class="btn btn-sm" data-action="switch-user">Log out</button></div></div><nav class="portal-tabs" aria-label="${role} navigation">${links.map(x => `<button class="portal-tab ${state.route === x.id ? 'active' : ''}" data-action="nav" data-route="${x.id}">${esc(x.label)}</button>`).join('')}</nav>`;
-  }
-
   function renderSidebar() {
-    renderPortalBar();
     const sb = document.getElementById('sidebar');
     sb.innerHTML = `
       <div class="brand"><div class="brand-mark">UM</div><div class="brand-text">${esc(state.settings.businessName || 'UMA Management')}<small>UMA Management</small></div></div>
@@ -1073,8 +1053,7 @@
     }
     const body = rows.length ? rows.map((d) => {
       const recCount = allRecordsFlat().filter((r) => r.driverName === d.name).length;
-      const linkedLogin = state.staff.find((s) => s.driverId === d.id);
-      const hasLogin = !!linkedLogin && linkedLogin.active !== false;
+      const hasLogin = state.staff.some((s) => s.driverId === d.id && s.active !== false);
       return `
       <tr>
         <td><div class="avatar" style="width:26px;height:26px;font-size:.68rem;">${esc(d.name.slice(0, 2).toUpperCase())}</div></td>
@@ -1082,11 +1061,11 @@
         <td>${vehiclePillHtml(d.vehicleType || 'Car')}</td>
         <td class="tnum">${recCount}</td>
         <td>${d.active !== false ? '<span class="pill pill-paid">Active</span>' : '<span class="pill pill-cancelled">Inactive</span>'}</td>
-        <td>${hasLogin ? '<span class="pill pill-paid">Active</span>' : linkedLogin ? '<span class="pill pill-cancelled">Disabled</span>' : '<span class="pill pill-cancelled">Not set</span>'}</td>
+        <td>${hasLogin ? '<span class="pill pill-paid">Yes</span>' : '<span class="pill pill-cancelled">No</span>'}</td>
         <td>
           <button class="btn btn-sm" data-action="driver-history" data-name="${esc(d.name)}">History</button>
           <button class="btn btn-sm" data-action="driver-edit" data-id="${d.id}">Edit</button>
-          <button class="btn btn-sm btn-primary" data-action="driver-grant-login" data-id="${d.id}">${linkedLogin ? 'Manage login' : 'Grant login'}</button>
+          ${!hasLogin ? `<button class="btn btn-sm" data-action="driver-grant-login" data-id="${d.id}">Grant login</button>` : ''}
           ${d.active !== false
             ? `<button class="btn btn-sm btn-danger" data-action="driver-deactivate" data-id="${d.id}">Deactivate</button>`
             : `<button class="btn btn-sm" data-action="driver-reactivate" data-id="${d.id}">Reactivate</button>`}
@@ -1202,14 +1181,6 @@
             <select name="rateType" data-onchange="company-rate-type-change">${RATE_TYPES.map((r) => `<option value="${r.value}" ${r.value === rateType ? 'selected' : ''}>${r.label}</option>`).join('')}</select>
           </div>
           <p class="helptext" style="margin:0 0 10px;">Rates can differ by vehicle — set a rate for each vehicle type this company uses.</p>
-          <div class="field" style="margin:0 0 12px;">
-            <label class="field-label">Vehicles drivers may use for this company</label>
-            <div style="display:flex;gap:18px;flex-wrap:wrap;">
-              <label><input type="checkbox" name="allowedVehicles" value="Car" ${(isEdit ? (company.allowedVehicles || ['Car','Van']).includes('Car') : true) ? 'checked' : ''}> Car</label>
-              <label><input type="checkbox" name="allowedVehicles" value="Van" ${(isEdit ? (company.allowedVehicles || ['Car','Van']).includes('Van') : true) ? 'checked' : ''}> Van</label>
-            </div>
-            <p class="helptext">Only selected vehicle types will appear in this company's driver start-work screen.</p>
-          </div>
           <div class="field-row">
             <div class="field"><label class="field-label">Car rate ($<span class="rate-unit">${unit}</span>)</label><input type="number" step="0.01" min="0" name="carRate" value="${isEdit ? (company.carRate || 0) : ''}"></div>
             <div class="field"><label class="field-label">Van rate ($<span class="rate-unit">${unit}</span>)</label><input type="number" step="0.01" min="0" name="vanRate" value="${isEdit ? (company.vanRate || 0) : ''}"></div>
@@ -1532,35 +1503,6 @@
   }
 
   // ---------------------------------------------------------------
-  // Staff workspace: limited to one assigned company and basic account creation
-  // ---------------------------------------------------------------
-  function viewTeamAccounts() {
-    const company = state.companies.find((c) => c.id === (state.session && state.session.companyId));
-    if (!company) return `<div class="view-header"><div><h1>Team Accounts</h1><div class="sub">No company has been assigned to this staff login. Ask an administrator.</div></div></div>`;
-    const drivers = state.drivers.filter((d) => d.companyId === company.id && d.active !== false);
-    const labour = state.labour.filter((l) => l.companyId === company.id && l.active !== false);
-    return `<div class="view-header"><div><h1>Team Accounts</h1><div class="sub">Create driver and labour logins for ${esc(company.name)} only</div></div></div>
-      <div class="grid-2" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;">
-        <div class="card"><h3>Create driver login</h3><form data-onsubmit="staff-create-driver">
-          <div class="field"><label class="field-label">Driver name</label><input name="name" required></div>
-          <div class="field"><label class="field-label">Mobile number</label><input name="mobile" type="tel" required></div>
-          <div class="field"><label class="field-label">4-digit PIN</label><input name="pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required></div>
-          <div class="field"><label class="field-label">Default vehicle</label><select name="vehicleType">${vehicleOptions('Car')}</select></div>
-          <button class="btn btn-primary" type="submit">Create driver login</button>
-        </form></div>
-        <div class="card"><h3>Create labour login</h3><form data-onsubmit="staff-create-labour">
-          <div class="field"><label class="field-label">Labour name</label><input name="name" required></div>
-          <div class="field"><label class="field-label">Mobile number</label><input name="mobile" type="tel" required></div>
-          <div class="field"><label class="field-label">4-digit PIN</label><input name="pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required></div>
-          <div class="field"><label class="field-label">Work type</label><select name="labourType"><option value="warehouse">Warehouse</option><option value="delivery_person">Delivery Person</option></select></div>
-          <button class="btn btn-primary" type="submit">Create labour login</button>
-        </form></div>
-      </div>
-      <div class="card" style="margin-top:16px;"><h3>Drivers in ${esc(company.name)}</h3><p class="helptext">${drivers.length} active driver account(s)</p>${drivers.map(d => `<div class="list-row" style="padding:7px 0;">${esc(d.name)} · ${esc(d.vehicleType || 'Car')}</div>`).join('') || '<p class="helptext">No drivers yet.</p>'}</div>
-      <div class="card" style="margin-top:16px;"><h3>Labour in ${esc(company.name)}</h3><p class="helptext">${labour.length} active labour account(s)</p>${labour.map(l => `<div class="list-row" style="padding:7px 0;">${esc(l.name)} · ${esc((l.labourTypes || []).join(', '))}</div>`).join('') || '<p class="helptext">No labour accounts yet.</p>'}</div>`;
-  }
-
-  // ---------------------------------------------------------------
   // View: Settings
   // ---------------------------------------------------------------
   function viewSettings() {
@@ -1714,12 +1656,6 @@
   let pinTargetStaffId = null;
   let gateStage = 'mobile';
   let gateMobileDraft = '';
-  let gateAccountChoices = [];
-  function accountRole(account) {
-    if (account && account.driverId) return 'driver';
-    if (account && account.labourId) return 'labour';
-    return account && account.role || 'staff';
-  }
 
   function renderGate() {
     const gate = document.getElementById('gate');
@@ -1735,18 +1671,6 @@
             <div class="field" style="margin-bottom:12px;"><label class="field-label">Choose a 4-digit PIN</label><input type="password" name="pin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required></div>
             <button class="btn btn-primary" type="submit" style="width:100%;">Sign up & continue</button>
           </form>
-        </div>`;
-      return;
-    }
-    if (gateStage === 'account' && gateAccountChoices.length) {
-      gate.innerHTML = `
-        <div class="gate-card card">
-          <h2 style="margin-bottom:6px;">Choose your login</h2>
-          <p class="helptext" style="margin-bottom:16px;">More than one account uses this mobile number. Select the account you want to open.</p>
-          <div style="display:grid;gap:10px;">
-            ${gateAccountChoices.map((a) => `<button class="btn" data-action="gate-account-select" data-id="${a.id}" style="width:100%;text-align:left;justify-content:flex-start;">${esc(a.name)} — ${esc(accountRole(a).toUpperCase())}</button>`).join('')}
-          </div>
-          <button class="btn" data-action="gate-back" style="width:100%;margin-top:12px;">Back</button>
         </div>`;
       return;
     }
@@ -1785,7 +1709,7 @@
     const staffMember = state.staff.find((s) => s.id === pinTargetStaffId);
     if (!staffMember) return;
     if (pinBuffer === String(staffMember.pin)) {
-      state.session = { staffId: staffMember.id, name: staffMember.name, role: accountRole(staffMember), companyId: staffMember.companyId || null, driverId: staffMember.driverId || null, labourId: staffMember.labourId || null };
+      state.session = { staffId: staffMember.id, name: staffMember.name, role: staffMember.role, driverId: staffMember.driverId || null, labourId: staffMember.labourId || null };
       try { localStorage.setItem('driverpay_session', JSON.stringify(state.session)); } catch (e) {}
       pinBuffer = ''; pinTargetStaffId = null; gateStage = 'mobile'; gateMobileDraft = '';
       document.getElementById('gate').innerHTML = ''; document.getElementById('gate').classList.add('hidden');
@@ -1808,15 +1732,14 @@
     'labour-shifts': () => viewLabourShifts(),
     'labour-log': () => viewLabourLog(), 'labour-my-shifts': () => viewLabourMyShifts(), 'labour-my-history': () => viewLabourMyHistory(), 'labour-logs': () => viewLabourLogs(),
     invoices: () => viewInvoices(),
-    'driver-submissions': () => viewDriverSubmissions(), 'team-accounts': () => viewTeamAccounts(), 'driver-submit': () => viewDriverSubmit(), 'driver-my-history': () => viewDriverMyHistory(),
+    'driver-submissions': () => viewDriverSubmissions(), 'driver-submit': () => viewDriverSubmit(), 'driver-my-history': () => viewDriverMyHistory(),
     'delivery-blocks': () => viewDeliveryBlocks(), 'driver-assignments': () => viewDriverAssignments(), 'driver-performance': () => viewDriverPerformance(),
   };
   function renderView() {
     let route = VIEWS[state.route] ? state.route : 'dashboard';
     const role = state.session ? state.session.role : null;
-    if (!roleAllowed(route, role)) { route = role === 'driver' ? 'driver-submit' : role === 'labour' ? 'labour-log' : role === 'staff' ? 'dashboard' : 'dashboard'; }
+    if (!roleAllowed(route, role)) { route = role === 'driver' ? 'driver-submit' : role === 'labour' ? 'labour-log' : 'dashboard'; }
     state.route = route;
-    renderPortalBar();
     document.getElementById('content').innerHTML = VIEWS[route]();
   }
 
@@ -1936,8 +1859,7 @@
     'confirm-no': () => window.__confirmResolve && window.__confirmResolve(false),
 
     // Gate
-    'gate-back': () => { pinTargetStaffId = null; pinBuffer = ''; gateAccountChoices = []; gateStage = 'mobile'; renderGate(); },
-    'gate-account-select': (el) => { pinTargetStaffId = el.dataset.id; pinBuffer = ''; gateStage = 'pin'; renderGate(); },
+    'gate-back': () => { pinTargetStaffId = null; pinBuffer = ''; gateStage = 'mobile'; renderGate(); },
     'gate-key': (el) => { if (pinBuffer.length < 4) pinBuffer += el.dataset.key; renderGate(); if (pinBuffer.length === 4) checkPin(); },
     'gate-backspace': () => { pinBuffer = pinBuffer.slice(0, -1); renderGate(); },
 
@@ -2157,7 +2079,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         <div class="field" style="margin-bottom:12px;"><label class="field-label">Name</label><input type="text" name="name" required></div>
         <div class="field" style="margin-bottom:12px;"><label class="field-label">Mobile number</label><input type="tel" inputmode="numeric" name="mobile" required></div>
         <div class="field" style="margin-bottom:12px;"><label class="field-label">4-digit PIN</label><input type="password" name="pin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required></div>
-        <div class="field"><label class="field-label">Role</label><select name="role"><option value="staff">Company Staff (approvals + create logins)</option><option value="manager">Manager</option><option value="admin">Admin</option></select></div><div class="field" style="margin-top:12px;"><label class="field-label">Assigned company (required for Company Staff)</label><select name="companyId"><option value="">— Select company —</option>${activeCompanies().map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}</select></div>
+        <div class="field"><label class="field-label">Role</label><select name="role"><option value="staff">Staff</option><option value="manager">Manager</option><option value="admin">Admin</option></select></div>
         <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;"><button type="button" class="btn" data-action="modal-close">Cancel</button><button type="submit" class="btn btn-primary">Add</button></div>
       </form>
     `),
@@ -2267,7 +2189,6 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       if (baseInput) baseInput.value = computeBaseRate(companySel.value, vehicleSel ? vehicleSel.value : 'Car', parcelsInput ? parcelsInput.value : 0);
     },
     'company-search': (el) => { companiesUi.search = el.value; renderView(); },
-    'driver-company-vehicle-options': (el) => { const form = el.closest('form'); const vehicle = form && form.querySelector('#driverVehicleType'); if (!vehicle) return; const opts = companyAllowedVehicles(el.value); vehicle.innerHTML = opts.length ? opts.map((v) => `<option value="${v}">${v}</option>`).join('') : '<option value="">No vehicle types configured</option>'; vehicle.disabled = !opts.length; },
     'company-rate-type-change': (el) => {
       const form = el.closest('form');
       if (!form) return;
@@ -2300,15 +2221,9 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const fd = new FormData(form);
       const mobile = normalizeMobile(fd.get('mobile'));
       gateMobileDraft = fd.get('mobile') || '';
-      const matches = state.staff.filter((s) => s.active !== false && normalizeMobile(s.mobile) === mobile && mobile);
-      if (!matches.length) { toast('No account found for that mobile number.', 'err'); renderGate(); return; }
-      if (matches.length > 1) {
-        gateAccountChoices = matches;
-        pinTargetStaffId = null; pinBuffer = ''; gateStage = 'account';
-        renderGate(); return;
-      }
-      gateAccountChoices = [];
-      pinTargetStaffId = matches[0].id; pinBuffer = ''; gateStage = 'pin';
+      const staffMember = state.staff.find((s) => s.active !== false && normalizeMobile(s.mobile) === mobile && mobile);
+      if (!staffMember) { toast('No account found for that mobile number.', 'err'); renderGate(); return; }
+      pinTargetStaffId = staffMember.id; pinBuffer = ''; gateStage = 'pin';
       renderGate();
     },
     'rec-save-edit': async (form) => {
@@ -2361,49 +2276,23 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         data.siteAddress = fd.get('siteAddress') || '';
         data.contractStartDate = fd.get('contractStartDate') || ''; data.contractEndDate = fd.get('contractEndDate') || '';
         data.contractStatus = fd.get('contractStatus') || 'Active';
-        data.allowedVehicles = [];
       } else {
         data.rateType = fd.get('rateType');
         data.carRate = Number(fd.get('carRate')) || 0;
         data.vanRate = Number(fd.get('vanRate')) || 0;
         data.otherRate = Number(fd.get('otherRate')) || 0;
         data.rate = 0;
-        data.allowedVehicles = fd.getAll('allowedVehicles').filter((v) => v === 'Car' || v === 'Van');
-        if (!data.allowedVehicles.length) { toast('Select at least one vehicle type for this company.', 'err'); return; }
       }
       if (id) await state.db.doc('companies/' + id).update(data);
       else await state.db.collection('companies').add(Object.assign({ active: true, createdAt: new Date().toISOString() }, data));
       await loadCompanies(); closeModal(); toast('Company saved.', 'ok'); renderView();
-    },
-    'staff-create-driver': async (form) => {
-      if (!state.session || state.session.role !== 'staff') return;
-      const companyId = state.session.companyId; const company = state.companies.find(c => c.id === companyId);
-      if (!company) { toast('Your login has no assigned company.', 'err'); return; }
-      const fd = new FormData(form); const mobile = normalizeMobile(fd.get('mobile'));
-      if (!mobile || mobileTaken(mobile, null)) { toast('Enter a unique mobile number.', 'err'); return; }
-      const name = String(fd.get('name') || '').trim();
-      const driverRef = await state.db.collection('drivers').add({ name, vehicleType: fd.get('vehicleType') || 'Car', companyId, active: true, createdAt: new Date().toISOString() });
-      await state.db.collection('staff').add({ name, mobile, pin: fd.get('pin'), role: 'driver', driverId: driverRef.id, companyId, active: true, createdAt: new Date().toISOString() });
-      await loadDrivers(); await loadStaff(); closeModal(); toast('Driver login created.', 'ok'); renderView();
-    },
-    'staff-create-labour': async (form) => {
-      if (!state.session || state.session.role !== 'staff') return;
-      const companyId = state.session.companyId; const company = state.companies.find(c => c.id === companyId);
-      if (!company) { toast('Your login has no assigned company.', 'err'); return; }
-      const fd = new FormData(form); const mobile = normalizeMobile(fd.get('mobile'));
-      if (!mobile || mobileTaken(mobile, null)) { toast('Enter a unique mobile number.', 'err'); return; }
-      const name = String(fd.get('name') || '').trim();
-      const labourRef = await claimLabourRef();
-      const labourDoc = await state.db.collection('labour').add({ labourRef, name, mobile, companyId, labourTypes: [fd.get('labourType') || 'warehouse'], payRate: 0, employmentType: 'Standard', active: true, createdAt: new Date().toISOString() });
-      await state.db.collection('staff').add({ name, mobile, pin: fd.get('pin'), role: 'labour', labourId: labourDoc.id, companyId, active: true, createdAt: new Date().toISOString() });
-      await loadLabour(); await loadStaff(); closeModal(); toast('Labour login created.', 'ok'); renderView();
     },
     'staff-save': async (form) => {
       const fd = new FormData(form);
       const mobile = normalizeMobile(fd.get('mobile'));
       if (!mobile) { toast('Enter a mobile number.', 'err'); return; }
       if (mobileTaken(mobile, null)) { toast('That mobile number is already used for another login.', 'err'); return; }
-      const role = fd.get('role'); const companyId = fd.get('companyId') || ''; if (role === 'staff' && !companyId) { toast('Choose a company for this staff login.', 'err'); return; } await state.db.collection('staff').add({ name: fd.get('name').trim(), mobile, pin: fd.get('pin'), role, companyId: role === 'staff' ? companyId : '', active: true, createdAt: new Date().toISOString() });
+      await state.db.collection('staff').add({ name: fd.get('name').trim(), mobile, pin: fd.get('pin'), role: fd.get('role'), active: true, createdAt: new Date().toISOString() });
       await loadStaff(); closeModal(); toast('Staff added.', 'ok'); renderView();
     },
     'staff-reset-pin-save': async (form) => {
@@ -3727,15 +3616,6 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   //   3. status 'Pending'      -> read-only "waiting for review" summary
   //   4. status 'Rejected'     -> correction banner + the same Finish Work form, resubmit writes an audit trail
   //   5. status 'Approved'     -> read-only approved summary
-  function companyAllowedVehicles(companyName) {
-    const company = companyByName(companyName);
-    const configured = company && Array.isArray(company.allowedVehicles) ? company.allowedVehicles : ['Car', 'Van'];
-    return configured.filter((v) => v === 'Car' || v === 'Van');
-  }
-  function driverVehicleOptions(companyName) {
-    return companyAllowedVehicles(companyName).map((v) => `<option value="${v}">${v}</option>`).join('');
-  }
-
   function viewDriverSubmit() {
     const driverId = currentDriverId();
     const driver = state.drivers.find((d) => d.id === driverId);
@@ -3786,14 +3666,12 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
           <p class="field-label" style="margin-bottom:4px;">Today's assignment</p>
           <p style="font-size:1.1rem;margin-bottom:16px;">${esc(assignment.companyName || '—')}${assignment.blockName ? ' — ' + esc(assignment.blockName) : ''}</p>
           <form data-onsubmit="driver-start-work" data-assignment="${assignment.id}">
-            <div class="field" style="margin-bottom:16px;"><label class="field-label">Vehicle for this company</label><select name="vehicleType" required>${driverVehicleOptions(assignment.companyName)}</select></div>
             <button class="btn btn-primary" type="submit" style="width:100%;font-size:1.1rem;padding:16px;">START WORK</button>
           </form>
         ` : `
           <p class="helptext" style="margin-bottom:12px;">No block assigned to you today — pick who you're working for to start.</p>
           <form data-onsubmit="driver-start-work">
-            <div class="field" style="margin-bottom:12px;"><label class="field-label">Which company are you working for today?</label><select name="companyName" required data-onchange="driver-company-vehicle-options"><option value="">Select company…</option>${activeDeliveryCompanies().filter((c) => !driver || !driver.companyId || c.id === driver.companyId).map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('')}</select></div>
-            <div class="field" style="margin-bottom:16px;"><label class="field-label">Which vehicle are you using?</label><select name="vehicleType" id="driverVehicleType" required disabled><option value="">Select a company first</option></select></div>
+            <div class="field" style="margin-bottom:16px;"><label class="field-label">Which company are you working for today?</label><select name="companyName" required>${companyOptions('')}</select></div>
             <button class="btn btn-primary" type="submit" style="width:100%;font-size:1.1rem;padding:16px;">START WORK</button>
           </form>
         `}
@@ -3814,27 +3692,23 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     }).join('') : `<tr><td colspan="7"><div class="empty-state">No submissions yet.</div></td></tr>`;
     return `
       <div class="view-header"><div><h1>My Submissions</h1></div></div>
-      <div class="table-wrap"><table class="data"><thead><tr><th>Date</th><th>Company / Block</th><th>Vehicle</th><th>Delivered</th><th>Failed</th><th>Success</th><th>Photo</th><th>Status</th></tr></thead><tbody>${body}</tbody></table></div>
+      <div class="table-wrap"><table class="data"><thead><tr><th>Date</th><th>Company / Block</th><th>Delivered</th><th>Failed</th><th>Success</th><th>Photo</th><th>Status</th></tr></thead><tbody>${body}</tbody></table></div>
     `;
   }
 
   const driverSubsUi = { status: 'Pending' };
   function viewDriverSubmissions() {
     let rows = state.driverSubmissions.slice();
-    if (state.session && state.session.role === 'staff') {
-      const assignedCompany = state.companies.find((c) => c.id === state.session.companyId);
-      rows = rows.filter((sub) => assignedCompany && sub.companyName === assignedCompany.name);
-    }
     if (driverSubsUi.status) rows = rows.filter((s) => s.status === driverSubsUi.status);
     rows.sort((a, b) => b.date.localeCompare(a.date));
     const cap = capRows(rows);
     rows = cap.shown;
-    const missing = state.session && state.session.role === 'staff' ? [] : missingSubmissionsToday();
+    const missing = missingSubmissionsToday();
     const missingBanner = missing.length ? `<div class="card" style="border-left:4px solid #dc2626;margin-bottom:16px;"><strong>${missing.length} assigned driver${missing.length === 1 ? '' : 's'}</strong> haven't started today's work yet: ${missing.map((a) => esc(a.driverName)).join(', ')}.</div>` : '';
     const body = rows.length ? rows.map((s) => {
       const attempted = submissionAttempted(s);
       return `<tr>
-      <td>${s.date}</td><td>${esc(s.driverName)}</td><td>${esc(s.companyName)}${s.blockName ? ' · ' + esc(s.blockName) : ''}</td><td>${esc(s.vehicleType || '—')}</td>
+      <td>${s.date}</td><td>${esc(s.driverName)}</td><td>${esc(s.companyName)}${s.blockName ? ' · ' + esc(s.blockName) : ''}</td>
       <td class="tnum">${s.delivered}</td><td class="tnum">${s.failed}</td><td class="tnum">${attempted}</td>
       <td class="tnum">${s.status === 'InProgress' ? '—' : successRatePct(s.delivered, attempted) + '%'}</td>
       <td>${esc(s.failureReason || '—')}</td>
@@ -3845,15 +3719,15 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         ? `<button class="btn btn-sm btn-primary" data-action="driver-sub-approve" data-id="${s.id}">Approve</button> <button class="btn btn-sm btn-danger" data-action="driver-sub-reject" data-id="${s.id}">Request correction</button>`
         : s.status === 'Rejected' ? `<span class="helptext">${esc(s.rejectionReason || '')}</span>` : s.status === 'InProgress' ? `<span class="helptext">Started ${fmtTimeHuman(s.startTime)}</span>` : '—'}</td>
     </tr>`;
-    }).join('') : `<tr><td colspan="13"><div class="empty-state">No submissions.</div></td></tr>`;
-    const recentAudit = state.session && state.session.role === 'staff' ? [] : state.auditLog.filter((a) => a.entityType === 'driverSubmission').slice(0, 15);
+    }).join('') : `<tr><td colspan="12"><div class="empty-state">No submissions.</div></td></tr>`;
+    const recentAudit = state.auditLog.filter((a) => a.entityType === 'driverSubmission').slice(0, 15);
     const auditHtml = recentAudit.length ? `
       <div class="section-title"><h2>Recent corrections</h2></div>
       <div class="table-wrap"><table class="data"><thead><tr><th>When</th><th>Field</th><th>Old</th><th>New</th><th>Reason</th></tr></thead><tbody>
         ${recentAudit.map((a) => `<tr><td>${new Date(a.changedAt).toLocaleString()}</td><td>${esc(a.field)}</td><td class="tnum">${esc(a.oldValue)}</td><td class="tnum">${esc(a.newValue)}</td><td class="wrap">${esc(a.reason)}</td></tr>`).join('')}
       </tbody></table></div>` : '';
     return `
-      <div class="view-header"><div><h1>Submission Approvals</h1><div class="sub">Review, approve or request corrections for driver delivery submissions</div></div></div>
+      <div class="view-header"><div><h1>Driver Submissions</h1><div class="sub">Start Work / Finish Work delivery counts drivers submit from their own phones</div></div></div>
       ${missingBanner}
       <div class="toolbar">
         <select data-onchange="driver-sub-filter">
@@ -3865,7 +3739,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         </select>
       </div>
       ${capNoticeHtml(cap)}
-      <div class="table-wrap"><table class="data"><thead><tr><th>Date</th><th>Driver</th><th>Company / Block</th><th>Vehicle</th><th>Delivered</th><th>Failed</th><th>Attempted</th><th>Success</th><th>Failure reason</th><th>Photo</th><th>Notes</th><th>Status</th><th>Actions</th></tr></thead><tbody>${body}</tbody></table></div>
+      <div class="table-wrap"><table class="data"><thead><tr><th>Date</th><th>Driver</th><th>Company / Block</th><th>Delivered</th><th>Failed</th><th>Attempted</th><th>Success</th><th>Failure reason</th><th>Photo</th><th>Notes</th><th>Status</th><th>Actions</th></tr></thead><tbody>${body}</tbody></table></div>
       <p class="helptext" style="margin-top:12px;">Approving a submission creates the matching driver payment record automatically (Deliveries completed → Parcels), using the same rate/prefix logic as Daily Entry — it will appear on Records, Payments and the Excel export. Requesting a correction sends it back to the driver; their resubmission is recorded in the audit log alongside the original values.</p>
       ${auditHtml}
     `;
@@ -3998,20 +3872,16 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
 
   function driverGrantLoginModal(driverId) {
     const driver = state.drivers.find((d) => d.id === driverId);
-    if (!driver) { toast('Driver record not found. Refresh and try again.', 'err'); return; }
-    const linked = state.staff.find((s) => s.driverId === driverId);
+    if (!driver) return;
     openModal(`
-      <div class="modal-head"><h3>${linked ? 'Manage driver portal login' : 'Create driver portal login'} — ${esc(driver.name)}</h3><button data-action="modal-close" aria-label="Close">✕</button></div>
-      <p class="helptext" style="margin-bottom:12px;">The driver signs in with this mobile number and a 4-digit PIN. ${linked ? 'Update the mobile number, reset the PIN, or re-enable this login.' : 'Create a unique login for this driver.'}</p>
-      <form data-onsubmit="driver-grant-login-save" data-driver="${driverId}" data-login="${linked ? linked.id : ''}">
-        <div class="field" style="margin-bottom:12px;"><label class="field-label">Driver name</label><input type="text" value="${esc(driver.name)}" disabled></div>
-        <div class="field" style="margin-bottom:12px;"><label class="field-label">Mobile number</label><input type="tel" inputmode="tel" name="mobile" value="${esc(linked ? linked.mobile : driver.mobile || '')}" required autocomplete="tel"></div>
-        <div class="field"><label class="field-label">${linked ? 'New 4-digit PIN (leave blank to keep current)' : '4-digit PIN'}</label><input type="password" name="pin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" ${linked ? '' : 'required'} autocomplete="new-password"></div>
-        ${linked ? `<div class="field" style="margin-top:12px;"><label><input type="checkbox" name="active" ${linked.active !== false ? 'checked' : ''}> Allow this driver to sign in</label></div>` : ''}
-        <p class="helptext" style="margin-top:10px;">Mobile numbers must be unique across all accounts. Use the driver's full mobile number including country code.</p>
+      <div class="modal-head"><h3>Grant portal login — ${esc(driver.name)}</h3><button data-action="modal-close" aria-label="Close">✕</button></div>
+      <p class="helptext" style="margin-bottom:12px;">Lets this driver sign in on their own phone (with their mobile number + PIN) to submit their daily delivery count — not secure authentication.</p>
+      <form data-onsubmit="driver-grant-login-save" data-driver="${driverId}">
+        <div class="field" style="margin-bottom:12px;"><label class="field-label">Mobile number</label><input type="tel" inputmode="numeric" name="mobile" required></div>
+        <div class="field"><label class="field-label">4-digit PIN</label><input type="password" name="pin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required></div>
         <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;">
           <button type="button" class="btn" data-action="modal-close">Cancel</button>
-          <button type="submit" class="btn btn-primary">${linked ? 'Save login' : 'Create login'}</button>
+          <button type="submit" class="btn btn-primary">Grant login</button>
         </div>
       </form>
     `);
@@ -4039,13 +3909,12 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         <img src="${sub.screenshotDataUrl}" style="width:100%;border-radius:8px;display:block;">
       `, { wide: true });
     },
-    'driver-sub-reject': (el) => { const sub = state.driverSubmissions.find((s) => s.id === el.dataset.id); const c = state.companies.find((x) => x.id === (state.session && state.session.companyId)); if (state.session && state.session.role === 'staff' && (!sub || !c || sub.companyName !== c.name)) { toast('This submission is outside your assigned company.', 'err'); return; } driverSubRejectModal(el.dataset.id); },
+    'driver-sub-reject': (el) => driverSubRejectModal(el.dataset.id),
     'driver-sub-approve': async (el) => {
       const sub = state.driverSubmissions.find((s) => s.id === el.dataset.id);
       if (!sub) return;
-      if (state.session && state.session.role === 'staff') { const c = state.companies.find((x) => x.id === state.session.companyId); if (!c || c.name !== sub.companyName) { toast('This submission is outside your assigned company.', 'err'); return; } }
       const driver = state.drivers.find((d) => d.id === sub.driverId) || driverByNameLoose(sub.driverName);
-      const vehicle = sub.vehicleType || (driver && driver.vehicleType) || 'Car';
+      const vehicle = (driver && driver.vehicleType) || 'Car';
       const summaryNotes = `Delivered ${sub.delivered}, Failed ${sub.failed}.${sub.notes ? ' ' + sub.notes : ''}`;
       const n = await commitEntryRows(sub.date, [{ id: genId(), driverName: sub.driverName, vehicle, companyName: sub.companyName, parcels: sub.delivered, bonus: 0, adjustment: 0, notes: summaryNotes }]);
       if (n < 0) return; // cancelled (e.g. the duplicate-record warning was declined)
@@ -4112,15 +3981,12 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const assignmentId = form.dataset.assignment || '';
       const assignment = assignmentId ? state.driverAssignments.find((a) => a.id === assignmentId) : null;
       let companyName = '', blockId = '', blockName = '';
-      const fd = new FormData(form);
       if (assignment) { companyName = assignment.companyName || ''; blockId = assignment.blockId || ''; blockName = assignment.blockName || ''; }
-      else { companyName = fd.get('companyName') || ''; }
-      const vehicleType = fd.get('vehicleType') || '';
+      else { const fd = new FormData(form); companyName = fd.get('companyName') || ''; }
       if (!companyName) { toast('Select a company to start work.', 'err'); return; }
-      if (!companyAllowedVehicles(companyName).includes(vehicleType)) { toast('Choose a vehicle allowed by the selected company.', 'err'); return; }
       await state.db.collection('driverSubmissions').add({
         driverId, driverName: driver ? driver.name : '', date: today,
-        assignmentId, blockId, blockName, companyName, vehicleType,
+        assignmentId, blockId, blockName, companyName,
         startTime: new Date().toISOString(), finishTime: null,
         delivered: 0, failed: 0, attempted: 0, failureReason: '', screenshotDataUrl: '', notes: '',
         status: 'InProgress', rejectionReason: '', submissionRef: '',
@@ -4173,29 +4039,13 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const fd = new FormData(form);
       const driverId = form.dataset.driver;
       const driver = state.drivers.find((d) => d.id === driverId);
-      const linkedId = form.dataset.login || '';
-      const linked = linkedId ? state.staff.find((s) => s.id === linkedId && s.driverId === driverId) : null;
       const mobile = normalizeMobile(fd.get('mobile'));
-      const pin = String(fd.get('pin') || '').trim();
-      if (!driver) { toast('Driver record not found. Refresh and try again.', 'err'); return; }
-      if (mobile.length < 8) { toast('Enter a valid mobile number including area/country code.', 'err'); return; }
-      if (mobileTaken(mobile, linked ? linked.id : null)) { toast('This mobile number is already assigned to another login. Use a different number.', 'err'); return; }
-      if (pin && !/^\d{4}$/.test(pin)) { toast('PIN must contain exactly 4 digits.', 'err'); return; }
-      if (linked) {
-        const update = { name: driver.name, mobile, role: 'driver', driverId, active: fd.has('active') ? fd.has('active') : linked.active !== false, updatedAt: new Date().toISOString() };
-        if (pin) update.pin = pin;
-        await state.db.doc('staff/' + linked.id).update(update);
-        toast('Driver login updated.', 'ok');
-      } else {
-        if (!pin) { toast('Set a 4-digit PIN for this driver.', 'err'); return; }
-        await state.db.collection('staff').add({ name: driver.name, mobile, pin, role: 'driver', driverId, active: true, createdAt: new Date().toISOString() });
-        toast('Driver login created. Share the mobile number and PIN privately with the driver.', 'ok');
-      }
-      await loadStaff(); closeModal(); renderView();
+      if (!mobile) { toast('Enter a mobile number.', 'err'); return; }
+      if (mobileTaken(mobile, null)) { toast('That mobile number is already used for another login.', 'err'); return; }
+      await state.db.collection('staff').add({ name: driver ? driver.name : 'Driver', mobile, pin: fd.get('pin'), role: 'driver', driverId, active: true, createdAt: new Date().toISOString() });
+      await loadStaff(); closeModal(); toast('Portal login granted.', 'ok'); renderView();
     },
     'driver-sub-reject-save': async (form) => {
-      const existingSub = state.driverSubmissions.find((s) => s.id === form.dataset.id);
-      if (state.session && state.session.role === 'staff') { const c = state.companies.find((x) => x.id === state.session.companyId); if (!existingSub || !c || existingSub.companyName !== c.name) { toast('This submission is outside your assigned company.', 'err'); return; } }
       const fd = new FormData(form);
       const id = form.dataset.id;
       await state.db.doc('driverSubmissions/' + id).update({ status: 'Rejected', rejectionReason: fd.get('reason'), updatedAt: new Date().toISOString() });

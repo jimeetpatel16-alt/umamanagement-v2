@@ -1,0 +1,6 @@
+Build provenance:
+- /web: full interface, bulk smart parser and Excel engine from the second ZIP.
+- /worker: Cloudflare Worker + D1 schema from the V2 source ZIP.
+- The V2 worker has intentionally not been wired to the localStorage document
+  shim because the V2 schema/API is not yet compatible with the legacy data
+  model. This avoids silently writing data to the wrong tables or losing data.
