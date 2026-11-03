@@ -1,3 +1,86 @@
+
+/* UMA MANAGEMENT V2 - MAIN DESIGN */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 24px;
+  background: #f4f6fa;
+  color: #172033;
+  font-family: Inter, Arial, sans-serif;
+  line-height: 1.5;
+}
+
+h1 {
+  font-size: 32px;
+  font-weight: 800;
+  letter-spacing: -1px;
+  margin: 20px 0 8px;
+}
+
+h2 {
+  font-size: 24px;
+  margin: 24px 0 16px;
+}
+
+h3 {
+  font-size: 18px;
+  margin: 20px 0 12px;
+}
+
+p {
+  color: #64748b;
+}
+
+button {
+  cursor: pointer;
+  padding: 11px 17px;
+  border: 0;
+  border-radius: 9px;
+  background: #142238;
+  color: white;
+  font-weight: 600;
+  margin: 3px;
+  transition: 0.2s;
+}
+
+button:hover {
+  background: #263e60;
+  transform: translateY(-1px);
+}
+
+input, select, textarea {
+  padding: 12px;
+  border: 1px solid #dce2eb;
+  border-radius: 8px;
+  background: white;
+  color: #172033;
+  font: inherit;
+  max-width: 100%;
+}
+
+input:focus, select:focus, textarea:focus {
+  outline: 2px solid #93b5ff;
+  border-color: #3867d6;
+}
+
+label {
+  color: #344256;
+}
+
+#content {
+  max-width: 1400px;
+  margin: 24px auto;
+  padding: 28px;
+  background: white;
+  border: 1px solid #e7ebf2;
+  border-radius: 16px;
+  box-shadow: 0 5px 24px rgba(20, 34, 56, 0.05);
+}
+
 #content label {
   display: block;
   margin: 14px 0;
@@ -9,34 +92,40 @@
 #content textarea {
   display: block;
   width: 100%;
-  padding: 12px;
   margin-top: 6px;
-  border: 1px solid #e8ebf0;
-  border-radius: 8px;
-  font: inherit;
-}
-
-#content textarea {
-  resize: vertical;
 }
 
 #content button {
-  cursor: pointer;
-  padding: 11px 17px;
-  border: 0;
-  border-radius: 8px;
-  background: #111c2e;
-  color: white;
-  font-weight: 600;
+  margin-top: 10px;
 }
 
-#content button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: white;
 }
 
-#content output,
-#bulkMessage {
-  display: block;
-  margin-top: 12px;
+th, td {
+  padding: 12px;
+  border-bottom: 1px solid #e8edf3;
+  text-align: left;
+}
+
+th {
+  background: #f3f6fa;
+  color: #344256;
+}
+
+@media (max-width: 700px) {
+  body {
+    padding: 12px;
+  }
+
+  #content {
+    padding: 16px;
+  }
+
+  button {
+    max-width: 100%;
+  }
 }
