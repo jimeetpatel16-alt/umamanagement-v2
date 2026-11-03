@@ -161,12 +161,60 @@ if (pinSetup && m === "POST") {
   if(!["admin","manager"].includes(u.role))return err("Forbidden",403);
   const q=await e.DB.prepare("SELECT id,name,email,mobile,role,company_id,driver_id,labour_id,active,created_at FROM users ORDER BY created_at DESC").all();return out(q.results);
  }
- if(p==="/api/users"&&m==="POST"){
-  if(u.role!=="admin")return err("Admin only",403);const b=await jsonBody(r);
-  if(!b?.name||!b?.email||!b?.password||b.password.length<14||!["admin","manager","staff","driver","labour"].includes(b.role))return err("Valid account details required");
-  if(u.role!=="admin"&&["admin","manager"].includes(b.role))return err("Forbidden",403);
-  const id=uid();await e.DB.prepare("INSERT INTO users(id,name,email,password_hash,role,company_id,driver_id,labour_id,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,1,?,?)").bind(id,b.name,b.email.toLowerCase(),await hashPass(b.password),b.role,b.companyId||null,b.driverId||null,b.labourId||null,now(),now()).run();await audit(e,u.id,"create","user",id);return out({id},201);
- }
+ if (p === "/api/users" && m === "POST") {
+  if (u.role !== "admin") return err("Admin only", 403);
+
+  const b = await jsonBody(r);
+
+  if (
+    !b?.name ||
+    !b?.email ||
+    !b?.password ||
+    b.password.length < 14 ||
+    !["admin", "manager", "staff", "driver", "labour"].includes(b.role)
+  ) {
+    return err("Valid account details required");
+  }
+
+  const mobile = normalizeMobile(String(b.mobile || ""));
+  const pin = String(b.pin || "");
+
+  if (!mobile) return err("Enter a valid mobile number");
+  if (!/^\d{4}$/.test(pin)) return err("PIN must contain exactly four digits");
+
+  const existing = await e.DB.prepare(
+    "SELECT id FROM users WHERE mobile=?"
+  ).bind(mobile).first<any>();
+
+  if (existing) return err("This mobile number is already assigned", 409);
+
+  const id = uid();
+  const pinHash = await makePinHash(pin);
+
+  await e.DB.prepare(`
+    INSERT INTO users(
+      id,name,email,password_hash,pin_hash,mobile,role,
+      company_id,driver_id,labour_id,active,created_at,updated_at
+    )
+    VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?)
+  `).bind(
+    id,
+    b.name,
+    b.email.toLowerCase(),
+    await hashPass(b.password),
+    pinHash,
+    mobile,
+    b.role,
+    b.companyId || null,
+    b.driverId || null,
+    b.labourId || null,
+    now(),
+    now()
+  ).run();
+
+  await audit(e, u.id, "create", "user", id);
+  return out({ id }, 201);
+}
  const action=p.match(/^\/api\/users\/([^/]+)\/(disable|enable|delete)$/);
  if(action&&m==="POST"){
   if(u.role!=="admin")return err("Admin only",403);const [,target,op]=action;
