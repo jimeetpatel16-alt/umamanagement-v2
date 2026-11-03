@@ -6,6 +6,72 @@ const err=(m:string,s=400)=>out({error:m},s);
 async function digest(v:string){const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(v));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("")}
 async function hashPass(p:string,salt=crypto.getRandomValues(new Uint8Array(16))){const k=await crypto.subtle.importKey("raw",new TextEncoder().encode(p),"PBKDF2",false,["deriveBits"]);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:100000,hash:"SHA-256"},k,256);const h=(a:Uint8Array)=>[...a].map(x=>x.toString(16).padStart(2,"0")).join("");return `pbkdf2$${h(salt)}$${h(new Uint8Array(bits))}`}
 async function checkPass(p:string,s:string){const a=s.split("$");if(a.length!==3||a[0]!=="pbkdf2")return false;const salt=new Uint8Array(a[1].match(/../g)!.map(x=>parseInt(x,16)));return await hashPass(p,salt)===s}
+
+function normalizeMobile(value: string) {
+  let n = String(value || "").replace(/[^\d+]/g, "");
+
+  // Convert Australian mobile formats to E.164.
+  if (/^04\d{8}$/.test(n)) n = "+61" + n.slice(1);
+  else if (/^614\d{8}$/.test(n)) n = "+" + n;
+  else if (/^61\d{9}$/.test(n)) n = "+" + n;
+
+  if (!/^\+[1-9]\d{7,14}$/.test(n)) {
+    return null;
+  }
+
+  return n;
+}
+
+async function makePinHash(pin: string) {
+  if (!/^\d{4}$/.test(pin)) {
+    throw new Error("PIN must contain exactly four digits");
+  }
+
+  return await hashPass(pin);
+}
+
+async function makeLoginKey(mobile: string) {
+  return await digest("UMA_LOGIN:" + mobile);
+}
+
+async function createLoginSession(
+  e: Env,
+  u: any
+) {
+  const t = crypto.randomUUID() + crypto.randomUUID();
+  const days = Math.min(
+    30,
+    Math.max(1, Number(e.SESSION_DAYS) || 7)
+  );
+
+  await e.DB.prepare(
+    "INSERT INTO sessions VALUES(?,?,?,?)"
+  ).bind(
+    await digest(t),
+    u.id,
+    new Date(Date.now() + days * 864e5).toISOString(),
+    now()
+  ).run();
+
+  const res = out({
+    user: {
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      role: u.role,
+      companyId: u.company_id,
+      driverId: u.driver_id,
+      labourId: u.labour_id
+    }
+  });
+
+  res.headers.append(
+    "set-cookie",
+    `uma=${encodeURIComponent(t)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${days * 86400}`
+  );
+
+  return res;
+}
 function token(req:Request){return (req.headers.get("cookie")||"").split(";").map(x=>x.trim()).find(x=>x.startsWith("uma="))?.slice(4)}
 async function current(req:Request,e:Env){const t=token(req);if(!t)return null;return await e.DB.prepare("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id_hash=? AND s.expires_at>? AND u.active=1").bind(await digest(decodeURIComponent(t)),now()).first<U>()}
 async function audit(e:Env,u:string,a:string,t:string,id:string|null){await e.DB.prepare("INSERT INTO audit_log VALUES(?,?,?,?,?,?,?)").bind(uid(),u,a,t,id,null,now()).run()}
