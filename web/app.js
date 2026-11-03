@@ -1036,7 +1036,7 @@ async function companiesPage() {
 /* MAIN RENDER */
 
 async function render() {
-    if (S.route === "companies") {
+  if (S.route === "companies") {
     return companiesPage();
   }
   if (S.route === "dashboard") {
