@@ -1,4 +1,4 @@
-name = "umamanagement-v2"
+name = "uma-management-v2"
 main = "src/index.ts"
 compatibility_date = "2026-11-03"
 [assets]
@@ -8,7 +8,7 @@ run_worker_first = ["/api/*"]
 [[d1_databases]]
 binding = "DB"
 database_name = "uma-management-v2"
-database_id = "ef8987bd-41c5-4a3f-9b66-c5d29ccd8c28"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
 migrations_dir = "migrations"
 [[r2_buckets]]
 binding = "EVIDENCE"
