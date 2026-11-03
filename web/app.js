@@ -14,6 +14,61 @@ $("#add").onclick=()=>{let name=prompt("Full name"),email=prompt("Email"),role=p
 $("#content").querySelectorAll("[data-op]").forEach(b=>b.onclick=()=>{if(!confirm("Confirm "+b.dataset.op+" login?"))return;api(`/users/${b.dataset.id}/${b.dataset.op}`,{method:"POST",body:"{}"}).then(()=>go("users")).catch(e=>alert(e.message))});return}
 if(S.route==="profile"){$("#content").innerHTML=`<div class="panel"><h3>My profile</h3><p>${esc(S.user.name)} · ${esc(S.user.email)}</p><p class="muted">Role: ${esc(S.user.role)}</p></div>`;return}
 let rows=await api("/"+endpoints[S.route]);let keys=rows.length?Object.keys(rows[0]).filter(k=>k!=="password_hash").slice(0,8):[];$("#content").innerHTML=`<div class="panel"><h3>${names[S.route]} <span class="muted">· ${rows.length} records</span></h3>${rows.length?`<div class="table"><table><thead><tr>${keys.map(k=>`<th>${esc(k.replaceAll("_"," "))}</th>`).join("")}</tr></thead><tbody>${rows.map(row=>`<tr>${keys.map(k=>`<td>${esc(row[k])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`:`<p class="muted">No records found yet.</p>`}</div>`}
-$("#loginForm").onsubmit=async e=>{e.preventDefault();$("#error").textContent="";let b=Object.fromEntries(new FormData(e.target));try{await api("/login",{method:"POST",body:JSON.stringify(b)});S.user=(await api("/me")).user;appView()}catch(x){$("#error").textContent=x.message}};
+let adminRecoveryMode = false;
+
+const pinFields = $("#pinLoginFields");
+const recoveryFields = $("#adminRecoveryFields");
+const recoveryToggle = $("#recoveryToggle");
+
+recoveryToggle.onclick = () => {
+  adminRecoveryMode = !adminRecoveryMode;
+
+  pinFields.hidden = adminRecoveryMode;
+  recoveryFields.hidden = !adminRecoveryMode;
+
+  pinFields.querySelectorAll("input").forEach(input => {
+    input.disabled = adminRecoveryMode;
+    input.required = !adminRecoveryMode;
+  });
+
+  recoveryFields.querySelectorAll("input").forEach(input => {
+    input.disabled = !adminRecoveryMode;
+    input.required = adminRecoveryMode;
+  });
+
+  recoveryToggle.textContent = adminRecoveryMode
+    ? "Back to mobile PIN login"
+    : "Admin recovery login";
+
+  $("#error").textContent = "";
+};
+
+$("#loginForm").onsubmit = async e => {
+  e.preventDefault();
+  $("#error").textContent = "";
+
+  const form = new FormData(e.target);
+  const b = adminRecoveryMode
+    ? {
+        email: form.get("email"),
+        password: form.get("password")
+      }
+    : {
+        mobile: form.get("mobile"),
+        pin: form.get("pin")
+      };
+
+  try {
+    await api("/login", {
+      method: "POST",
+      body: JSON.stringify(b)
+    });
+
+    S.user = (await api("/me")).user;
+    appView();
+  } catch (x) {
+    $("#error").textContent = x.message;
+  }
+};
 $("#logout").onclick=async()=>{await api("/logout",{method:"POST",body:"{}"}).catch(()=>{});S.user=null;loginView()};
 (async()=>{try{S.user=(await api("/me")).user;appView()}catch{loginView()}})();
