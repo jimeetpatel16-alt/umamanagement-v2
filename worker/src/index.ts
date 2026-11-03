@@ -85,15 +85,91 @@ async function route(r:Request,e:Env){
   const b=await jsonBody(r);if(!b?.name||!b?.email||!b?.password||b.password.length<14)return err("Name, email and 14+ character password required");
   const id=uid();await e.DB.prepare("INSERT INTO users(id,name,email,password_hash,role,active,created_at,updated_at) VALUES(?,?,?,?, 'admin',1,?,?)").bind(id,b.name,b.email.toLowerCase(),await hashPass(b.password),now(),now()).run();return out({ok:true},201);
  }
- if (p === "/api/login" && m === "POST"){
-  const b=await jsonBody(r);if(!b?.email||!b?.password)return err("Email and password required");
-  const u=await e.DB.prepare("SELECT * FROM users WHERE email=?").bind(b.email.toLowerCase()).first<any>();
-  if(!u||!u.active||!await checkPass(b.password,u.password_hash))return err("Invalid login details",401);
-  const t=crypto.randomUUID()+crypto.randomUUID(),days=Math.min(30,Math.max(1,Number(e.SESSION_DAYS)||7));
-  await e.DB.prepare("INSERT INTO sessions VALUES(?,?,?,?)").bind(await digest(t),u.id,new Date(Date.now()+days*864e5).toISOString(),now()).run();
-  const res=out({user:{id:u.id,name:u.name,email:u.email,role:u.role,companyId:u.company_id,driverId:u.driver_id,labourId:u.labour_id}});
-  res.headers.append("set-cookie",`uma=${encodeURIComponent(t)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${days*86400}`);return res;
- }
+ if (p === "/api/login" && m === "POST") {
+  const b = await jsonBody(r);
+  if (!b) return err("Invalid login details", 401);
+
+  // Admin recovery: email and password.
+  if (b.email && b.password) {
+    const u = await e.DB.prepare(
+      "SELECT * FROM users WHERE email=?"
+    ).bind(String(b.email).toLowerCase()).first<any>();
+
+    if (
+      !u ||
+      !u.active ||
+      u.role !== "admin" ||
+      !await checkPass(String(b.password), u.password_hash)
+    ) {
+      return err("Invalid login details", 401);
+    }
+
+    return await createLoginSession(e, u);
+  }
+
+  // Normal login: mobile and four-digit PIN.
+  const mobile = normalizeMobile(String(b.mobile || ""));
+  const pin = String(b.pin || "");
+
+  if (!mobile || !/^\d{4}$/.test(pin)) {
+    return err("Enter a valid mobile number and four-digit PIN", 400);
+  }
+
+  const mobileKey = await makeLoginKey(mobile);
+
+  const locked = await e.DB.prepare(`
+    SELECT mobile_key
+    FROM auth_login_attempts
+    WHERE mobile_key=?
+      AND locked_until IS NOT NULL
+      AND julianday(locked_until)>julianday('now')
+  `).bind(mobileKey).first<any>();
+
+  if (locked) {
+    return err("Invalid login details. Please try again later.", 401);
+  }
+
+  await e.DB.prepare(`
+    DELETE FROM auth_login_attempts
+    WHERE mobile_key=?
+      AND locked_until IS NOT NULL
+      AND julianday(locked_until)<=julianday('now')
+  `).bind(mobileKey).run();
+
+  const u = await e.DB.prepare(
+    "SELECT * FROM users WHERE mobile=?"
+  ).bind(mobile).first<any>();
+
+  const valid =
+    !!u &&
+    !!u.active &&
+    !!u.pin_hash &&
+    await checkPass(pin, u.pin_hash);
+
+  if (!valid) {
+    await e.DB.prepare(`
+      INSERT INTO auth_login_attempts
+        (mobile_key, failed_attempts, locked_until, updated_at)
+      VALUES (?, 1, NULL, ?)
+      ON CONFLICT(mobile_key) DO UPDATE SET
+        failed_attempts = auth_login_attempts.failed_attempts + 1,
+        locked_until = CASE
+          WHEN auth_login_attempts.failed_attempts + 1 >= 5
+          THEN datetime('now', '+15 minutes')
+          ELSE auth_login_attempts.locked_until
+        END,
+        updated_at = excluded.updated_at
+    `).bind(mobileKey, now()).run();
+
+    return err("Invalid login details", 401);
+  }
+
+  await e.DB.prepare(
+    "DELETE FROM auth_login_attempts WHERE mobile_key=?"
+  ).bind(mobileKey).run();
+
+  return await createLoginSession(e, u);
+}
  if(p==="/api/logout"&&m==="POST"){const t=token(r);if(t)await e.DB.prepare("DELETE FROM sessions WHERE id_hash=?").bind(await digest(decodeURIComponent(t))).run();const x=out({ok:true});x.headers.append("set-cookie","uma=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0");return x}
  const u=await current(r,e);
  if(p==="/api/me")return u?out({user:{id:u.id,name:u.name,email:u.email,role:u.role,companyId:u.company_id,driverId:u.driver_id,labourId:u.labour_id}}):err("Sign in required",401);
