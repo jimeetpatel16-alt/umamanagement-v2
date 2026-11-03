@@ -240,3 +240,27 @@ th {
   }
 }
 
+/* ADMIN RECOVERY BUTTON */
+#recoveryToggle {
+  display: block !important;
+  width: 100%;
+  margin: 12px 0 0;
+  padding: 13px;
+  background: #e9eef6;
+  color: #172033;
+  border: 1px solid #d8e0ec;
+  border-radius: 9px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+#recoveryToggle:hover {
+  background: #dce5f2;
+}
+
+#adminRecoveryFields[hidden],
+#pinLoginFields[hidden] {
+  display: none !important;
+}
+
+
