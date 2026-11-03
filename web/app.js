@@ -1,4 +1,4 @@
-
+x
 const $ = s => document.querySelector(s);
 
 const S = {
@@ -1224,16 +1224,32 @@ const pinFields = $("#pinLoginFields");
 const recoveryFields = $("#adminRecoveryFields");
 const recoveryToggle = $("#recoveryToggle");
 
-recoveryToggle.onclick = () => {
+
+recoveryToggle.addEventListener("click", function () {
   adminRecoveryMode = !adminRecoveryMode;
 
   pinFields.hidden = adminRecoveryMode;
   recoveryFields.hidden = !adminRecoveryMode;
 
+  pinFields.style.display = adminRecoveryMode ? "none" : "block";
+  recoveryFields.style.display = adminRecoveryMode ? "block" : "none";
+
   pinFields.querySelectorAll("input").forEach(input => {
     input.disabled = adminRecoveryMode;
     input.required = !adminRecoveryMode;
   });
+
+  recoveryFields.querySelectorAll("input").forEach(input => {
+    input.disabled = !adminRecoveryMode;
+    input.required = adminRecoveryMode;
+  });
+
+  recoveryToggle.textContent = adminRecoveryMode
+    ? "Back to mobile PIN login"
+    : "Admin recovery login";
+
+  $("#error").textContent = "";
+});
 
   recoveryFields.querySelectorAll("input").forEach(input => {
     input.disabled = !adminRecoveryMode;
