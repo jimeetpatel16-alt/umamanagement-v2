@@ -129,3 +129,114 @@ th {
     max-width: 100%;
   }
 }
+
+/* LOGIN AND DASHBOARD VISIBILITY */
+.hide {
+  display: none !important;
+}
+
+/* MAIN APPLICATION LAYOUT */
+.layout {
+  min-height: calc(100vh - 48px);
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr);
+  gap: 24px;
+}
+
+.layout aside {
+  background: #142238;
+  color: white;
+  padding: 24px 16px;
+  border-radius: 16px;
+}
+
+.layout aside p,
+.layout aside small {
+  color: #b9c5d6;
+}
+
+.layout .brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 32px;
+}
+
+.layout .brand i {
+  font-size: 28px;
+  font-weight: 800;
+}
+
+.layout .brand b small {
+  display: block;
+}
+
+.layout nav button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  margin: 5px 0;
+  background: transparent;
+  color: #dce5f2;
+}
+
+.layout nav button.active,
+.layout nav button:hover {
+  background: #304663;
+  color: white;
+}
+
+.layout aside footer {
+  margin-top: 30px;
+}
+
+.layout main {
+  min-width: 0;
+}
+
+.layout header {
+  margin-bottom: 24px;
+}
+
+.login {
+  min-height: calc(100vh - 48px);
+  display: grid;
+  place-items: center;
+}
+
+.loginbox {
+  width: min(100%, 520px);
+  background: white;
+  padding: 36px;
+  border-radius: 18px;
+  box-shadow: 0 8px 35px rgba(20, 34, 56, .08);
+}
+
+.loginbox form button {
+  margin-top: 16px;
+}
+
+.loginbox .mark {
+  font-size: 30px;
+  font-weight: 800;
+}
+
+@media (max-width: 850px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .layout aside {
+    padding: 16px;
+  }
+
+  .layout nav {
+    display: flex;
+    flex-wrap: wrap;
+  }
+
+  .layout nav button {
+    width: auto;
+  }
+}
+
