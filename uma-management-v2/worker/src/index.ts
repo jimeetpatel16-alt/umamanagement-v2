@@ -24,7 +24,7 @@ async function checkPass(p: string, s: string) {
   const toHex = (value: Uint8Array) =>
     [...value].map(x => x.toString(16).padStart(2, "0")).join("");
 
-  for (const iterations of [310000, 100000]) {
+  for (const iterations of [100000]) {
     const bits = await crypto.subtle.deriveBits(
       {
         name: "PBKDF2",
