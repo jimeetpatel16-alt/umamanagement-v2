@@ -14,7 +14,64 @@ if(S.route==="users"){if(S.user.role!=="admin")throw Error("Admin only");let row
 ${u.active?`<button data-op="disable" data-id="${u.id}">Disable</button>`:`<button data-op="enable" data-id="${u.id}">Enable</button>`}
 <button class="danger" data-op="delete" data-id="${u.id}">Delete login</button>
 </div></td></tr>`).join("")}</tbody></table></div></div><div class="notice">Deleting a login removes access only. Worker and payment history is retained. The last active Admin is protected.</div>`;
-$("#add").onclick=()=>{let name=prompt("Full name"),email=prompt("Email"),role=prompt("Role: staff, driver, labour, manager or admin","staff"),password=prompt("Temporary password (minimum 14 characters)");if(!name||!email||!role||!password)return;api("/users",{method:"POST",body:JSON.stringify({name,email,role,password})}).then(()=>go("users")).catch(e=>alert(e.message))};
+$("#add").onclick=async()=>{
+  const name=prompt("Full name");
+  if(!name)return;
+
+  const email=prompt("Email address (used for account records and Admin recovery)");
+  if(!email)return;
+
+  const role=prompt(
+    "Role: staff, driver, labour, manager or admin",
+    "staff"
+  );
+  if(!role)return;
+
+  if(!["staff","driver","labour","manager","admin"].includes(role)){
+    alert("Invalid role.");
+    return;
+  }
+
+  const mobile=prompt("Enter the user's mobile number");
+  if(!mobile)return;
+
+  const pin=prompt("Create a four-digit PIN for this user");
+  if(!pin)return;
+
+  if(!/^\d{4}$/.test(pin)){
+    alert("PIN must contain exactly four digits.");
+    return;
+  }
+
+  const password=prompt(
+    "Create an internal recovery password (minimum 14 characters). Do not share it with the user."
+  );
+  if(!password)return;
+
+  if(password.length<14){
+    alert("Password must contain at least 14 characters.");
+    return;
+  }
+
+  try{
+    await api("/users",{
+      method:"POST",
+      body:JSON.stringify({
+        name,
+        email,
+        role,
+        mobile,
+        pin,
+        password
+      })
+    });
+
+    alert("User account created successfully.");
+    go("users");
+  }catch(e){
+    alert(e.message);
+  }
+};
 $("#content").querySelectorAll("[data-pin]").forEach(b=>{
   b.onclick=async()=>{
     const mobile=prompt("Enter mobile number for "+b.dataset.name);
