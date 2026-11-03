@@ -159,7 +159,7 @@ if (pinSetup && m === "POST") {
  }
  if(p==="/api/users"&&m==="GET"){
   if(!["admin","manager"].includes(u.role))return err("Forbidden",403);
-  const q=await e.DB.prepare("SELECT id,name,email,role,company_id,driver_id,labour_id,active,created_at FROM users ORDER BY created_at DESC").all();return out(q.results);
+  const q=await e.DB.prepare("SELECT id,name,email,mobile,role,company_id,driver_id,labour_id,active,created_at FROM users ORDER BY created_at DESC").all();return out(q.results);
  }
  if(p==="/api/users"&&m==="POST"){
   if(u.role!=="admin")return err("Admin only",403);const b=await jsonBody(r);
