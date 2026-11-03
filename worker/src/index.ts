@@ -98,6 +98,58 @@ async function route(r:Request,e:Env){
  const u=await current(r,e);
  if(p==="/api/me")return u?out({user:{id:u.id,name:u.name,email:u.email,role:u.role,companyId:u.company_id,driverId:u.driver_id,labourId:u.labour_id}}):err("Sign in required",401);
  if(!u)return err("Sign in required",401);
+  // ADMIN ONLY: assign or update a user's mobile number and PIN.
+const pinSetup = p.match(/^\/api\/users\/([^/]+)\/pin$/);
+
+if (pinSetup && m === "POST") {
+  if (u.role !== "admin") {
+    return err("Admin access required", 403);
+  }
+
+  const b = await jsonBody(r);
+  if (!b) return err("Invalid request");
+
+  const mobile = normalizeMobile(String(b.mobile || ""));
+  const pin = String(b.pin || "");
+
+  if (!mobile) {
+    return err("Enter a valid mobile number");
+  }
+
+  if (!/^\d{4}$/.test(pin)) {
+    return err("PIN must contain exactly four digits");
+  }
+
+  const targetId = pinSetup[1];
+
+  const target = await e.DB.prepare(
+    "SELECT id FROM users WHERE id=?"
+  ).bind(targetId).first<any>();
+
+  if (!target) {
+    return err("User account not found", 404);
+  }
+
+  const existing = await e.DB.prepare(
+    "SELECT id FROM users WHERE mobile=? AND id<>?"
+  ).bind(mobile, targetId).first<any>();
+
+  if (existing) {
+    return err("This mobile number is already assigned to another user", 409);
+  }
+
+  const pinHash = await makePinHash(pin);
+
+  await e.DB.prepare(`
+    UPDATE users
+    SET mobile=?, pin_hash=?, updated_at=?
+    WHERE id=?
+  `).bind(mobile, pinHash, now(), targetId).run();
+
+  await audit(e, u.id, "USER_PIN_UPDATED", "users", targetId);
+
+  return out({ ok: true, message: "Mobile number and PIN updated" });
+}
  if(p==="/api/dashboard"){
   if(!["admin","manager","staff"].includes(u.role))return err("Forbidden",403);
   const scope=u.role==="admin"||u.role==="manager"?"":" WHERE company_id=?";
