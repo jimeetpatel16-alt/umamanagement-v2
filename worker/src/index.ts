@@ -85,7 +85,7 @@ async function route(r:Request,e:Env){
   const b=await jsonBody(r);if(!b?.name||!b?.email||!b?.password||b.password.length<14)return err("Name, email and 14+ character password required");
   const id=uid();await e.DB.prepare("INSERT INTO users(id,name,email,password_hash,role,active,created_at,updated_at) VALUES(?,?,?,?, 'admin',1,?,?)").bind(id,b.name,b.email.toLowerCase(),await hashPass(b.password),now(),now()).run();return out({ok:true},201);
  }
- if(p==="/api/login"&&m==="POST"){
+ if (p === "/api/login" && m === "POST"){
   const b=await jsonBody(r);if(!b?.email||!b?.password)return err("Email and password required");
   const u=await e.DB.prepare("SELECT * FROM users WHERE email=?").bind(b.email.toLowerCase()).first<any>();
   if(!u||!u.active||!await checkPass(b.password,u.password_hash))return err("Invalid login details",401);
