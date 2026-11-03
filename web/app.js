@@ -899,6 +899,140 @@ async function tablePage() {
   `;
 }
 
+/* COMPANY MANAGEMENT */
+
+async function companiesPage() {
+  const companies = await api("/companies");
+
+  $("#content").innerHTML = `
+    <div class="panel">
+      <h3>Add New Company</h3>
+      <p class="muted">Register a delivery or labour company and configure its rates.</p>
+
+      <form id="companyForm">
+
+        <label>Company Name
+          <input name="name" placeholder="Enter company name" required>
+        </label>
+
+        <label>Company Type
+          <select name="type" required>
+            <option value="delivery">Delivery</option>
+            <option value="labour">Labour Supply</option>
+            <option value="both">Both</option>
+          </select>
+        </label>
+
+        <label>ABN
+          <input name="abn" placeholder="Enter ABN">
+        </label>
+
+        <label>Contact Person
+          <input name="contact_name" placeholder="Contact person name">
+        </label>
+
+        <label>Email
+          <input name="email" type="email" placeholder="Company email">
+        </label>
+
+        <label>Phone
+          <input name="phone" type="tel" placeholder="Company phone">
+        </label>
+
+        <label>Business Address
+          <textarea name="address" rows="3" placeholder="Company address"></textarea>
+        </label>
+
+        <h3>Driver Payment Rates</h3>
+
+        <label>Car Rate ($)
+          <input name="car_rate" type="number" min="0" step="0.01" value="270">
+        </label>
+
+        <label>Van Rate ($)
+          <input name="van_rate" type="number" min="0" step="0.01" value="330">
+        </label>
+
+        <label>Other Vehicle Rate ($)
+          <input name="other_rate" type="number" min="0" step="0.01" value="0">
+        </label>
+
+        <label>Rate Type
+          <select name="rate_type">
+            <option value="fixed">Fixed Rate</option>
+            <option value="per_parcel">Per Parcel</option>
+          </select>
+        </label>
+
+        <button type="submit">Save Company</button>
+        <output id="companyMessage"></output>
+      </form>
+    </div>
+
+    <div class="panel">
+      <h3>Registered Companies (${companies.length})</h3>
+
+      ${companies.length ? `
+        <div class="table">
+          <table>
+            <thead>
+              <tr>
+                <th>Company</th>
+                <th>ABN</th>
+                <th>Contact</th>
+                <th>Phone</th>
+                <th>Car Rate</th>
+                <th>Van Rate</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${companies.map(c => `
+                <tr>
+                  <td>${esc(c.name)}</td>
+                  <td>${esc(c.abn)}</td>
+                  <td>${esc(c.contact_name)}</td>
+                  <td>${esc(c.phone)}</td>
+                  <td>$${esc(c.car_rate)}</td>
+                  <td>$${esc(c.van_rate)}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : `<p class="muted">No companies registered yet.</p>`}
+    </div>
+  `;
+
+  $("#companyForm").onsubmit = async event => {
+    event.preventDefault();
+
+    const form = new FormData(event.target);
+    const data = Object.fromEntries(form.entries());
+
+    ["car_rate", "van_rate", "other_rate"].forEach(key => {
+      data[key] = Number(data[key] || 0);
+    });
+
+    data.active = 1;
+
+    const message = $("#companyMessage");
+    message.textContent = "Saving company...";
+
+    try {
+      await api("/companies", {
+        method: "POST",
+        body: JSON.stringify(data)
+      });
+
+      message.textContent = "Company saved successfully.";
+      await companiesPage();
+
+    } catch (error) {
+      message.textContent = error.message;
+    }
+  };
+}
+
 /* MAIN RENDER */
 
 async function render() {
