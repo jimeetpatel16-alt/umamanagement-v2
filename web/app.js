@@ -152,7 +152,7 @@
     return {
       staffId: staffMember.id,
       name: staffMember.name || 'User',
-      role: VALID_ROLES.has(staffMember.role) ? staffMember.role : 'staff',
+      role: VALID_ROLES.has(String(staffMember.role || '').trim().toLowerCase()) ? String(staffMember.role).trim().toLowerCase() : 'staff',
       driverId: staffMember.driverId || null,
       labourId: staffMember.labourId || null,
     };
@@ -375,8 +375,11 @@
   // Existing stored values are not rewritten; comparison happens on the fly.
   function normalizeMobile(m) {
     let digits = String(m == null ? '' : m).replace(/\D/g, '');
+    // Accept common Australian input forms: 04..., 4..., +614..., 6104...
+    if (digits.startsWith('0011')) digits = digits.slice(4);
     if (digits.startsWith('0061')) digits = digits.slice(2);
-    if (digits.startsWith('61') && digits.length === 11) digits = '0' + digits.slice(2);
+    if (digits.startsWith('6104') && digits.length === 12) digits = '04' + digits.slice(4);
+    else if (digits.startsWith('61') && digits.length === 11) digits = '0' + digits.slice(2);
     if (digits.length === 9 && digits.startsWith('4')) digits = '0' + digits;
     return digits;
   }
@@ -1693,8 +1696,10 @@
   // ---------------------------------------------------------------
   let pinBuffer = '';
   let pinTargetStaffId = null;
+  let gateCandidateStaffIds = [];
   let gateStage = 'mobile';
   let gateMobileDraft = '';
+  let gateRoleDraft = '';
   let gateSubmitting = false;
   let switchingUser = false;
 
@@ -1708,9 +1713,11 @@
     state.recordsFilter = null;
     pinBuffer = '';
     pinTargetStaffId = null;
+    gateCandidateStaffIds = [];
     gateStage = 'mobile';
     gateSubmitting = false;
     if (options.clearMobile !== false) gateMobileDraft = '';
+    gateRoleDraft = '';
     clearPersistedSession();
 
     // Clear the previous role's URL hash so it is never restored for the
@@ -1758,14 +1765,37 @@
         </div>`;
       return;
     }
+    if (gateStage === 'account' && gateCandidateStaffIds.length) {
+      const candidates = gateCandidateStaffIds
+        .map((id) => state.staff.find((s) => s.id === id && s.active !== false))
+        .filter(Boolean);
+      if (!candidates.length) { gateStage = 'mobile'; gateCandidateStaffIds = []; }
+      else {
+        gate.innerHTML = `
+          <div class="gate-card card">
+            <div class="brand" style="padding:0 0 10px;"><div class="brand-mark">UM</div><div class="brand-text">${esc(state.settings.businessName || 'UMA Management')}<small>Select account</small></div></div>
+            <h2 style="margin-bottom:6px;">Choose your account</h2>
+            <p class="helptext" style="margin-bottom:16px;">More than one active account uses this mobile number. Select the correct role before entering your PIN.</p>
+            ${gateStorageNotice()}
+            <div class="gate-account-list">${candidates.map((account) => `
+              <button type="button" class="gate-account-option" data-action="gate-select-account" data-staff-id="${esc(account.id)}">
+                <span class="gate-account-avatar">${esc(String(account.name || 'U').slice(0, 2).toUpperCase())}</span>
+                <span class="gate-account-copy"><strong>${esc(account.name || 'User')}</strong><small>${esc(String(account.role || 'staff').toUpperCase())} account</small></span>
+                <span class="gate-account-arrow">›</span>
+              </button>`).join('')}</div>
+            <button type="button" class="btn gate-back-account" data-action="gate-back">Back</button>
+          </div>`;
+        return;
+      }
+    }
     if (gateStage === 'pin' && pinTargetStaffId) {
-      const staffMember = state.staff.find((s) => s.id === pinTargetStaffId);
+      const staffMember = state.staff.find((s) => s.id === pinTargetStaffId && s.active !== false);
       if (!staffMember) { gateStage = 'mobile'; pinTargetStaffId = null; }
       else {
         const dots = [0, 1, 2, 3].map((i) => `<div class="pin-dot ${i < pinBuffer.length ? 'filled' : ''}"></div>`).join('');
         gate.innerHTML = `
           <div class="gate-card card">
-            <div style="text-align:center;margin-bottom:6px;"><div class="avatar" style="margin:0 auto 10px;">${esc(staffMember.name.slice(0, 2).toUpperCase())}</div><h3>${esc(staffMember.name)}</h3><p class="helptext">${esc((staffMember.role || 'staff').charAt(0).toUpperCase() + (staffMember.role || 'staff').slice(1))} account · Enter your 4-digit PIN</p></div>
+            <div style="text-align:center;margin-bottom:6px;"><div class="avatar" style="margin:0 auto 10px;">${esc(staffMember.name.slice(0, 2).toUpperCase())}</div><h3>${esc(staffMember.name)}</h3><p class="helptext">${esc(String(staffMember.role || 'staff').charAt(0).toUpperCase() + String(staffMember.role || 'staff').slice(1))} account · Enter your 4-digit PIN</p>${state.usingFallback ? '<p class="gate-account-warning">This role is loaded from this device only. If you expected Labour but see Admin, this phone does not have the same account data as your laptop yet.</p>' : ''}</div>
             <div class="pin-dots" aria-label="${pinBuffer.length} of 4 PIN digits entered">${dots}</div>
             <div class="keypad" aria-label="PIN keypad">
               ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `<button type="button" data-action="gate-key" data-key="${n}" aria-label="${n}">${n}</button>`).join('')}
@@ -1785,6 +1815,7 @@
         ${gateStorageNotice()}
         <form data-onsubmit="gate-mobile-continue" novalidate>
           <div class="field" style="margin-bottom:12px;"><label class="field-label" for="gate-mobile-input">Mobile number</label><input id="gate-mobile-input" type="tel" inputmode="tel" autocomplete="tel" enterkeyhint="go" autocapitalize="off" spellcheck="false" name="mobile" value="${esc(gateMobileDraft)}" required></div>
+          <div class="field" style="margin-bottom:12px;"><label class="field-label" for="gate-role-input">Account type</label><select id="gate-role-input" name="role" class="gate-role-select"><option value="">Automatically detect account</option><option value="admin" ${gateRoleDraft === 'admin' ? 'selected' : ''}>Admin</option><option value="manager" ${gateRoleDraft === 'manager' ? 'selected' : ''}>Manager</option><option value="staff" ${gateRoleDraft === 'staff' ? 'selected' : ''}>Staff</option><option value="driver" ${gateRoleDraft === 'driver' ? 'selected' : ''}>Driver</option><option value="labour" ${gateRoleDraft === 'labour' ? 'selected' : ''}>Labour</option></select></div>
           <button class="btn btn-primary gate-submit" type="submit" style="width:100%;">Continue</button>
         </form>
       </div>`;
@@ -1798,7 +1829,7 @@
     if (pinBuffer === String(staffMember.pin)) {
       state.session = sessionFromStaff(staffMember);
       persistSession(state.session);
-      pinBuffer = ''; pinTargetStaffId = null; gateStage = 'mobile'; gateMobileDraft = '';
+      pinBuffer = ''; pinTargetStaffId = null; gateCandidateStaffIds = []; gateStage = 'mobile'; gateMobileDraft = '';
       document.getElementById('gate').innerHTML = ''; document.getElementById('gate').classList.add('hidden');
       gateSubmitting = false;
       state.route = 'dashboard';
@@ -1969,7 +2000,15 @@
     'confirm-no': () => window.__confirmResolve && window.__confirmResolve(false),
 
     // Gate
-    'gate-back': () => { pinTargetStaffId = null; pinBuffer = ''; gateStage = 'mobile'; renderGate(); },
+    'gate-back': () => { pinTargetStaffId = null; gateCandidateStaffIds = []; pinBuffer = ''; gateStage = 'mobile'; renderGate(); },
+    'gate-select-account': (el) => {
+      const chosen = state.staff.find((s) => s.id === el.dataset.staffId && s.active !== false);
+      if (!chosen || !gateCandidateStaffIds.includes(chosen.id)) { toast('That account is no longer available. Please try again.', 'err'); gateStage = 'mobile'; renderGate(); return; }
+      pinTargetStaffId = chosen.id;
+      pinBuffer = '';
+      gateStage = 'pin';
+      renderGate();
+    },
     'gate-key': (el) => {
       if (gateSubmitting || pinBuffer.length >= 4 || !/^[0-9]$/.test(el.dataset.key || '')) return;
       pinBuffer += el.dataset.key;
@@ -2358,13 +2397,32 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const fd = new FormData(form);
       const rawMobile = String(fd.get('mobile') || '').trim();
       const mobile = normalizeMobile(rawMobile);
+      const selectedRole = String(fd.get('role') || '').trim().toLowerCase();
       gateMobileDraft = rawMobile;
+      gateRoleDraft = selectedRole;
       if (mobile.length < 8 || mobile.length > 15) { toast('Enter a valid mobile number.', 'err'); return; }
-      const staffMember = state.staff.find((s) => s.active !== false && normalizeMobile(s.mobile) === mobile);
-      if (!staffMember) { toast('No active account found for that mobile number. Check the number and try again.', 'err'); return; }
-      pinTargetStaffId = staffMember.id;
+      // Refresh account records before lookup. In local preview mode this only
+      // refreshes this browser's local store; it cannot fetch another device's data.
+      await loadStaff();
+      const matches = state.staff.filter((s) => s.active !== false
+        && normalizeMobile(s.mobile) === mobile
+        && (!selectedRole || String(s.role || 'staff').trim().toLowerCase() === selectedRole));
+      if (!matches.length) {
+        const roleLabel = selectedRole ? selectedRole.charAt(0).toUpperCase() + selectedRole.slice(1) : 'active';
+        toast(state.usingFallback
+          ? `No ${roleLabel} account for this mobile number is stored on this device. Accounts created on your laptop will not appear here until the shared D1 connection is completed.`
+          : `No active ${roleLabel} account found for that mobile number. Check the number and account type.`, 'err');
+        return;
+      }
+      gateCandidateStaffIds = matches.map((s) => s.id);
       pinBuffer = '';
-      gateStage = 'pin';
+      if (matches.length > 1) {
+        pinTargetStaffId = null;
+        gateStage = 'account';
+      } else {
+        pinTargetStaffId = matches[0].id;
+        gateStage = 'pin';
+      }
       renderGate();
     },
     'rec-save-edit': async (form) => {

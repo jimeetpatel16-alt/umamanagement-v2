@@ -685,3 +685,59 @@ table.data { min-width: 620px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+
+/* ============================================================
+   UMA theme consistency fix — retain premium navy/champagne brand,
+   but keep dashboard surfaces light and all text high-contrast.
+   This deliberately overrides OS dark-mode preference for this app.
+   ============================================================ */
+html { color-scheme: light !important; }
+:root,
+:root[data-theme="light"],
+:root[data-theme="dark"] {
+  color-scheme: light !important;
+  --bg: #f4f5f7 !important;
+  --surface: #ffffff !important;
+  --surface-2: #f7f8fa !important;
+  --surface-3: #edf0f4 !important;
+  --border: #dce2ea !important;
+  --ink: #172033 !important;
+  --ink-muted: #59677b !important;
+  --ink-faint: #738096 !important;
+  --accent: #b58a45 !important;
+  --accent-hover: #967039 !important;
+  --accent-ink: #ffffff !important;
+  --accent-soft: #f5eddf !important;
+  --good: #23845b !important;
+  --good-soft: #e1f2e9 !important;
+  --warn: #8a651d !important;
+  --warn-soft: #fbf1dc !important;
+  --danger: #bd4a4a !important;
+  --danger-soft: #fae8e8 !important;
+  --info: #3f6f9f !important;
+  --info-soft: #e7eff8 !important;
+  --shadow: 0 2px 8px rgba(19, 29, 48, .045), 0 10px 28px rgba(19, 29, 48, .055) !important;
+  --shadow-lift: 0 8px 24px rgba(19, 29, 48, .10) !important;
+}
+body { background: #f4f5f7; color: #172033; }
+.card, .stat-tile, .table-wrap { background-color: #ffffff; color: #172033; }
+.stat-tile .stat-value, table.data td, table.data tfoot td,
+.section-title h2, .view-header h1 { color: #172033; }
+.stat-tile .stat-label, .helptext, .view-header .sub,
+.section-title .helptext, .bars .bar-label { color: #59677b; }
+.date-section { background: #ffffff; color: #172033; }
+table.data th { background: #eef2f7; color: #3d4b60; }
+table.data tfoot td { background: #f1f3f6; }
+.gate-account-list { display: grid; gap: 9px; margin: 14px 0; }
+.gate-account-option { width: 100%; display: flex; align-items: center; gap: 12px; text-align: left; padding: 12px; border: 1px solid #dce2ea; border-radius: 11px; background: #fff; color: #172033; cursor: pointer; }
+.gate-account-option:hover, .gate-account-option:focus-visible { background: #f7f8fa; border-color: #b58a45; outline: 2px solid rgba(181,138,69,.18); }
+.gate-account-avatar { width: 38px; height: 38px; flex: 0 0 38px; border-radius: 50%; display: grid; place-items: center; background: #f5eddf; color: #775a2c; font-weight: 700; }
+.gate-account-copy { min-width: 0; display: grid; gap: 2px; }
+.gate-account-copy strong { font-size: .9rem; }
+.gate-account-copy small { color: #59677b; font-size: .72rem; letter-spacing: .06em; }
+.gate-account-arrow { margin-left: auto; font-size: 1.4rem; color: #967039; }
+.gate-back-account { width: 100%; }
+.gate-account-warning { margin-top: 8px; padding: 9px 10px; border-radius: 8px; background: #fff5df; color: #694e19; font-size: .73rem; line-height: 1.4; }
+
+#gate .gate-role-select { width: 100%; min-height: 46px; padding: 10px 12px; border: 1px solid #dce2ea; border-radius: 9px; background: #fff; color: #172033; font: inherit; }

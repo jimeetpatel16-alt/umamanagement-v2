@@ -85,3 +85,32 @@ does not by itself make records synchronise between devices. The D1 Worker
 source remains preserved and must be mapped to the existing production schema
 before it can be enabled safely. Do not deploy its placeholder D1 binding or
 run migrations against production as part of this frontend-only update.
+
+
+2026-11-04 MOBILE LABOUR LOGIN / THEME DIAGNOSTIC UPDATE
+-------------------------------------------------------
+- Mobile account lookup now refreshes its current staff list before matching.
+- If the same mobile number belongs to multiple active accounts on this device,
+  the login gate asks the user to select the intended role/account instead of
+  silently selecting the first record (which could be Admin instead of Labour).
+- Role names are normalised case-insensitively and Australian mobile formats
+  include +61 04... handling.
+- If no account exists on this device while local fallback mode is active, the
+  login message explains that accounts from another device are not available.
+- Dashboard surfaces are locked to the premium light palette, irrespective of
+  the phone or laptop OS dark-mode preference. Navy sidebar and gold accents
+  remain; cards and dashboard text use high-contrast light styling.
+
+IMPORTANT: the supplied Worker is still not connected to the legacy frontend's
+collection API and uses a different email/password schema. The app still uses
+browser localStorage when its host database adapter is absent. Therefore this
+frontend update can disambiguate duplicate local accounts and expose device
+mismatch, but cannot make a Labour account created on the laptop appear on a
+phone. Real cross-device parity requires completing the shared D1 integration
+and migrating the existing data safely. Do not run the placeholder Worker
+migration against production or overwrite the live D1 database.
+
+- The login screen now includes an optional Account type selector. Choosing
+  Labour prevents an Admin record with the same mobile number from being
+  selected. If the Labour account is missing on that device, the login gives a
+  clear device-local data warning instead of silently signing into Admin.
