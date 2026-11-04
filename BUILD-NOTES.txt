@@ -1,27 +1,41 @@
-Build provenance:
-- /web: full interface, bulk smart parser and Excel engine from the second ZIP.
-- /worker: Cloudflare Worker + D1 schema from the V2 source ZIP.
-- The V2 worker has intentionally not been wired to the localStorage document
-  shim because the V2 schema/API is not yet compatible with the legacy data
-  model. This avoids silently writing data to the wrong tables or losing data.
+UMA MANAGEMENT — SHARED D1 INTEGRATION BUILD NOTES
+===================================================
 
+Frontend:
+- Preserves the existing operations UI and premium light theme.
+- Replaces the device-local database fallback with a Cloudflare Worker D1
+  document adapter when /api/health reports the shared D1 service.
+- Keeps mobile number + 4-digit PIN login and role selection only when a
+  mobile number matches multiple accounts.
+- Uses server-side PIN verification in shared mode; PIN values are not
+  returned as part of staff profile documents.
 
-Frontend update 2026-11-04: fixed Australian phone-number canonicalisation,
-added async submit guards/error feedback, improved PIN keypad interaction,
-corrected HTML head/body structure, and added responsive/safe-area CSS. No D1
-schema or live database settings were changed. Multi-device synchronisation is
-still pending a reviewed adapter to the user's existing production D1 schema.
+Worker:
+- Adds D1 JSON document storage plus mobile/PIN auth and sessions.
+- Adds role-aware data reads and writes.
+- Preserves the existing D1 tables and creates additional tables via migration
+  0002_shared_documents.sql.
 
-Frontend update 2026-11-04 (role-switch reliability):
-- Replaced full-page reload during Switch User with an explicit in-page sign-out
-  and login-gate transition.
-- Clears the previous session, PIN buffer, draft mobile number, modal state,
-  mobile drawer, and previous route hash before showing login.
-- Refreshes the staff/account list after sign-out without restoring the prior
-  Admin route if the refresh succeeds.
-- Rebuilds restored sessions from the current staff record, so an old cached
-  role cannot continue to grant the previous dashboard after a role change.
-- Applies a role change immediately when the currently signed-in account is
-  changed, and ends the session if that account is deactivated.
-- Added cross-tab sign-out handling and visible role label on the PIN screen.
-- No D1 migration, schema, database ID, or production binding was changed.
+Local migration:
+- worker/scripts/import-backup-to-d1.mjs reads a UMA full backup from the
+  owner's Mac, strips PINs from profile docs, hashes PINs and imports records
+  with INSERT OR IGNORE.
+- It displays the target database name and ID and requires typing IMPORT.
+- It does not upload the backup to this chat.
+
+Validation performed in this preparation environment:
+- web/app.js JavaScript syntax check passed.
+- import-backup-to-d1.mjs JavaScript syntax check passed.
+- Worker TypeScript strict type check passed against Cloudflare D1/Worker
+  interface stubs; actual Cloudflare package build remains to be run.
+- New D1 migration SQL executed successfully against an in-memory SQLite DB.
+- Importer preview with a synthetic test backup passed; answering NO cancelled
+  before any D1 command. The owner's actual backup was not imported here.
+
+Not yet verified:
+- No D1 migration/import has been run against the owner's live Cloudflare DB.
+- No Cloudflare deployment has been run from this package.
+- No physical iPhone or Android browser regression test has been completed.
+- Reconcile all financial totals and test evidence uploads before live payroll.
+
+See SHARED-D1-SETUP.md for the safe installation and cutover sequence.

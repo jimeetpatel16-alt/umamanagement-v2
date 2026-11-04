@@ -109,6 +109,8 @@
     downloads: null,
     sample: null,
     usingFallback: true,
+    remoteDb: false,
+    accountSetupRequired: false,
     staff: [],
     drivers: [],
     companies: [],
@@ -255,13 +257,87 @@
     return state.drivers.find((d) => d.name.trim().toLowerCase() === n) || null;
   }
 
+  // Remote Cloudflare D1 adapter. It preserves the Firestore-like db surface
+  // used by the existing application, while storing documents centrally.
+  function makeRemoteDbShim() {
+    async function request(path, options) {
+      const response = await fetch(path, Object.assign({
+        credentials: 'same-origin', cache: 'no-store',
+        headers: { 'content-type': 'application/json' }
+      }, options || {}));
+      let body = {};
+      try { body = await response.json(); } catch (e) {}
+      if (!response.ok) throw new Error(body.error || `Cloud database request failed (${response.status}).`);
+      return body;
+    }
+    function makeDocRef(path) {
+      const parts = path.split('/');
+      const collection = parts[0], id = parts.slice(1).join('/');
+      const url = `/api/data/${encodeURIComponent(collection)}/${encodeURIComponent(id)}`;
+      return {
+        id, path,
+        async get() {
+          const result = await request(url);
+          return { id, exists: !!result.exists, data: () => result.data };
+        },
+        async set(data) { await request(url, { method: 'PUT', body: JSON.stringify(data) }); },
+        async update(data) { await request(url, { method: 'PATCH', body: JSON.stringify(data) }); },
+        async delete() { await request(url, { method: 'DELETE' }); },
+        collection(sub) { return makeCollRef(`${path}/${sub}`); }
+      };
+    }
+    function makeCollRef(path) {
+      const collection = path.split('/')[0];
+      const url = `/api/data/${encodeURIComponent(collection)}`;
+      return {
+        path,
+        doc(id) { return makeDocRef(`${collection}/${id || genId()}`); },
+        async add(data) {
+          const result = await request(url, { method: 'POST', body: JSON.stringify(data) });
+          return makeDocRef(`${collection}/${result.id}`);
+        },
+        async get() {
+          const result = await request(url);
+          return { docs: (result.docs || []).map((row) => ({ id: row.id, exists: true, data: () => row.data })) };
+        },
+        where() { return this; }, orderBy() { return this; }, limit() { return this; }
+      };
+    }
+    return {
+      doc: makeDocRef,
+      collection: makeCollRef,
+      async authStatus() { return request('/api/auth/status'); },
+      async lookupStaff(mobile) { return (await request('/api/auth/lookup', { method: 'POST', body: JSON.stringify({ mobile }) })).accounts || []; },
+      async verifyPin(staffId, pin) { return request('/api/auth/verify', { method: 'POST', body: JSON.stringify({ staffId, pin }) }); },
+      async authMe() { return request('/api/auth/me'); },
+      async authLogout() { return request('/api/auth/logout', { method: 'POST', body: '{}' }); },
+      async authSignup(name, mobile, pin) { return request('/api/auth/signup', { method: 'POST', body: JSON.stringify({ name, mobile, pin }) }); }
+    };
+  }
+
   // ---------------------------------------------------------------
   // DB access
   // ---------------------------------------------------------------
   async function initDb() {
     let db = null, dl = null, sm = null;
-    try { db = window.claude && window.claude.use ? await window.claude.use('db') : null; } catch (e) { db = null; }
-    if (!db) { db = makeLocalDbShim(); state.usingFallback = true; } else { state.usingFallback = false; }
+    // Prefer the shared Cloudflare Worker whenever it is available. Never
+    // silently fall back if its health check advertises D1 but subsequently fails.
+    try {
+      const response = await fetch('/api/health', { credentials: 'same-origin', cache: 'no-store' });
+      if (response.ok) {
+        const health = await response.json();
+        if (health && health.storage === 'd1' && health.service === 'UMA Management Shared D1') {
+          db = makeRemoteDbShim();
+          state.remoteDb = true;
+          state.usingFallback = false;
+        }
+      }
+    } catch (e) { /* local preview / offline */ }
+    if (!db) {
+      try { db = window.claude && window.claude.use ? await window.claude.use('db') : null; } catch (e) { db = null; }
+      if (!db) { db = makeLocalDbShim(); state.usingFallback = true; state.remoteDb = false; }
+      else { state.usingFallback = false; state.remoteDb = false; }
+    }
     try { dl = window.claude && window.claude.use ? await window.claude.use('downloads') : null; } catch (e) { dl = null; }
     try { sm = window.claude && window.claude.use ? await window.claude.use('sample') : null; } catch (e) { sm = null; }
     state.db = db;
@@ -271,7 +347,7 @@
   async function loadSettings() {
     const snap = await state.db.doc('settings/config').get();
     state.settings = snap.exists ? Object.assign({}, DEFAULT_SETTINGS, snap.data()) : Object.assign({}, DEFAULT_SETTINGS);
-    if (!snap.exists) await state.db.doc('settings/config').set(state.settings);
+    if (!snap.exists && (!state.remoteDb || (state.session && state.session.role === 'admin'))) await state.db.doc('settings/config').set(state.settings);
   }
   async function loadStaff() {
     const q = await state.db.collection('staff').get();
@@ -1717,6 +1793,7 @@
     gateSubmitting = false;
     if (options.clearMobile !== false) gateMobileDraft = '';
     clearPersistedSession();
+    if (state.remoteDb && state.db && state.db.authLogout) state.db.authLogout().catch((error) => console.warn('UMA remote logout:', error));
 
     // Clear the previous role's URL hash so it is never restored for the
     // next person signing in on this device.
@@ -1763,7 +1840,7 @@
 
   function renderGate() {
     const gate = document.getElementById('gate');
-    if (state.staff.length === 0) {
+    if (state.staff.length === 0 && (!state.remoteDb || state.accountSetupRequired)) {
       gate.innerHTML = `
         <div class="gate-card card">
           <div class="brand" style="padding:0 0 10px;"><div class="brand-mark">UM</div><div class="brand-text">${esc(state.settings.businessName || 'UMA Management')}<small>Sign up — first admin account</small></div></div>
@@ -1841,17 +1918,33 @@
     const staffMember = state.staff.find((s) => s.id === pinTargetStaffId && s.active !== false);
     if (!staffMember || pinBuffer.length !== 4) return;
     gateSubmitting = true;
-    if (pinBuffer === String(staffMember.pin)) {
-      state.session = sessionFromStaff(staffMember);
-      persistSession(state.session);
-      pinBuffer = ''; pinTargetStaffId = null; gateCandidateStaffIds = []; gateStage = 'mobile'; gateMobileDraft = '';
-      document.getElementById('gate').innerHTML = ''; document.getElementById('gate').classList.add('hidden');
-      gateSubmitting = false;
-      state.route = 'dashboard';
-      try { history.replaceState(null, '', location.pathname + location.search + '#dashboard'); } catch (e) { location.hash = 'dashboard'; }
-      boot2();
-    } else {
-      toast('Incorrect PIN', 'err');
+    try {
+      let authenticated = null;
+      if (state.remoteDb) {
+        const result = await state.db.verifyPin(staffMember.id, pinBuffer);
+        authenticated = result.user;
+      } else if (pinBuffer === String(staffMember.pin)) {
+        authenticated = staffMember;
+      }
+      if (authenticated) {
+        state.session = sessionFromStaff(authenticated);
+        if (!state.remoteDb) persistSession(state.session);
+        pinBuffer = ''; pinTargetStaffId = null; gateCandidateStaffIds = []; gateStage = 'mobile'; gateMobileDraft = '';
+        await loadAll();
+        document.getElementById('gate').innerHTML = ''; document.getElementById('gate').classList.add('hidden');
+        gateSubmitting = false;
+        state.route = 'dashboard';
+        try { history.replaceState(null, '', location.pathname + location.search + '#dashboard'); } catch (e) { location.hash = 'dashboard'; }
+        boot2();
+      } else {
+        toast('Incorrect PIN', 'err');
+        pinBuffer = '';
+        gateSubmitting = false;
+        renderGate();
+      }
+    } catch (error) {
+      console.error('UMA PIN verification failed:', error);
+      toast(error && error.message ? error.message : 'PIN verification failed. Please try again.', 'err');
       pinBuffer = '';
       gateSubmitting = false;
       renderGate();
@@ -2297,7 +2390,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         const updatedSelf = state.staff.find((x) => x.id === s.id);
         if (updatedSelf && updatedSelf.active !== false) {
           state.session = sessionFromStaff(updatedSelf);
-          persistSession(state.session);
+          if (!state.remoteDb) persistSession(state.session);
           if (!roleAllowed(state.route, state.session.role)) state.route = 'dashboard';
           history.replaceState(null, '', location.pathname + location.search + '#' + state.route);
           renderSidebar();
@@ -2424,10 +2517,16 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       if (!name) { toast('Enter your name.', 'err'); return; }
       if (mobile.length < 8 || mobile.length > 15) { toast('Enter a valid mobile number.', 'err'); return; }
       if (!/^[0-9]{4}$/.test(pin)) { toast('Your PIN must be exactly 4 digits.', 'err'); return; }
-      const ref = await state.db.collection('staff').add({ name, mobile, pin, role: 'admin', active: true, createdAt: new Date().toISOString() });
-      await loadStaff();
-      state.session = { staffId: ref.id, name, role: 'admin' };
-      try { localStorage.setItem('driverpay_session', JSON.stringify(state.session)); } catch (e) {}
+      if (state.remoteDb) {
+        const result = await state.db.authSignup(name, mobile, pin);
+        state.session = sessionFromStaff(result.user);
+        await loadAll();
+      } else {
+        const ref = await state.db.collection('staff').add({ name, mobile, pin, role: 'admin', active: true, createdAt: new Date().toISOString() });
+        await loadStaff();
+        state.session = { staffId: ref.id, name, role: 'admin' };
+        persistSession(state.session);
+      }
       document.getElementById('gate').innerHTML = ''; document.getElementById('gate').classList.add('hidden');
       boot2();
     },
@@ -2445,11 +2544,17 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
           return;
         }
 
-        // Refresh the local staff roster before checking. This cannot retrieve
-        // accounts from another device while this build is in device-only mode.
-        await loadStaff();
-        const matches = state.staff.filter((account) => account.active !== false
-          && normalizeMobile(account.mobile) === mobile);
+        // In shared mode, look up only accounts matching this mobile number.
+        // In local preview mode, retain the original per-device lookup.
+        let matches;
+        if (state.remoteDb) {
+          matches = await state.db.lookupStaff(mobile);
+          state.staff = matches;
+        } else {
+          await loadStaff();
+          matches = state.staff.filter((account) => account.active !== false
+            && normalizeMobile(account.mobile) === mobile);
+        }
 
         if (!matches.length) {
           showGateError(state.usingFallback
@@ -2666,23 +2771,49 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
 
   async function boot() {
     await initDb();
-    await loadAll();
-    let restored = null;
-    try { restored = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch (e) {}
-    const savedStaff = restored && state.staff.find((s) => s.id === restored.staffId && s.active !== false);
-    if (savedStaff) {
-      // The staff collection is authoritative. A role changed by an Admin
-      // must take effect on the next page load instead of trusting cached role.
-      state.session = sessionFromStaff(savedStaff);
-      persistSession(state.session);
-      document.getElementById('gate').innerHTML = '';
-      document.getElementById('gate').classList.add('hidden');
-      boot2();
+    if (state.remoteDb) {
+      try {
+        const status = await state.db.authStatus();
+        state.accountSetupRequired = !status.hasAccounts;
+        const result = await state.db.authMe();
+        state.session = sessionFromStaff(result.user);
+        await loadAll();
+        document.getElementById('gate').innerHTML = '';
+        document.getElementById('gate').classList.add('hidden');
+        boot2();
+      } catch (error) {
+        // A 401 is the normal signed-out state. Other errors are surfaced and
+        // must never cause this browser to create a second local database.
+        if (error && /Sign in required|401/i.test(error.message || '')) {
+          state.session = null;
+          state.staff = [];
+          document.getElementById('shell').classList.add('hidden');
+          document.getElementById('gate').classList.remove('hidden');
+          renderGate();
+        } else {
+          console.error('UMA shared database startup failed:', error);
+          document.getElementById('shell').classList.add('hidden');
+          document.getElementById('gate').classList.remove('hidden');
+          document.getElementById('gate').innerHTML = `<div class="gate-card card"><h2>Shared database unavailable</h2><p class="helptext">UMA Management could not connect to the shared Cloudflare database. Your existing device data has not been changed. Please contact the administrator or try again later.</p><button class="btn btn-primary gate-submit" type="button" onclick="location.reload()">Retry connection</button></div>`;
+        }
+      }
     } else {
-      clearPersistedSession();
-      document.getElementById('shell').classList.add('hidden');
-      document.getElementById('gate').classList.remove('hidden');
-      renderGate();
+      await loadAll();
+      let restored = null;
+      try { restored = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch (e) {}
+      const savedStaff = restored && state.staff.find((s) => s.id === restored.staffId && s.active !== false);
+      if (savedStaff) {
+        state.session = sessionFromStaff(savedStaff);
+        persistSession(state.session);
+        document.getElementById('gate').innerHTML = '';
+        document.getElementById('gate').classList.add('hidden');
+        boot2();
+      } else {
+        clearPersistedSession();
+        document.getElementById('shell').classList.add('hidden');
+        document.getElementById('gate').classList.remove('hidden');
+        renderGate();
+      }
     }
     // hot-reload support for the artifact host (state carried across republish, best-effort)
     if (window.claude && window.claude.hot) {
@@ -4417,6 +4548,10 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   }
 
   async function restoreFullBackup() {
+    if (state.remoteDb) {
+      toast('Direct backup restore is disabled in shared mode to protect existing cloud records. Use the reviewed local D1 importer instead.', 'err');
+      return;
+    }
     const input = document.getElementById('backupFileInput');
     const file = input && input.files && input.files[0];
     if (!file) { toast('Choose a JSON backup file first.', 'err'); return; }
