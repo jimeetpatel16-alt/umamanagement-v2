@@ -587,3 +587,101 @@ h1, h2, h3, h4 { letter-spacing: -.025em; }
   #sidebar { box-shadow: 12px 0 32px rgba(0,0,0,.18); }
   #content { padding: 18px 16px 72px; }
 }
+
+
+/* ============================================================
+   UMA cross-device and login reliability improvements
+   ============================================================ */
+html, body { min-height: 100%; width: 100%; }
+body { overflow-x: hidden; -webkit-text-size-adjust: 100%; }
+#shell, #main, #content { min-width: 0; }
+#content { width: 100%; }
+button, .btn, input, select, textarea { touch-action: manipulation; }
+button, .btn { -webkit-tap-highlight-color: transparent; }
+.field input, .field select, .field textarea,
+#gate input { min-width: 0; max-width: 100%; }
+
+#gate {
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-top: max(20px, env(safe-area-inset-top));
+  padding-right: max(16px, env(safe-area-inset-right));
+  padding-bottom: max(20px, env(safe-area-inset-bottom));
+  padding-left: max(16px, env(safe-area-inset-left));
+  -webkit-overflow-scrolling: touch;
+}
+.gate-card {
+  flex: 0 1 420px;
+  width: min(100%, 420px);
+  max-width: 420px;
+  margin: auto;
+  padding: clamp(18px, 4vw, 28px);
+  overflow: visible;
+}
+#gate .field { min-width: 0; }
+#gate .field input {
+  width: 100%;
+  min-height: 48px;
+  padding: 12px 14px;
+  font-size: 16px; /* prevents iOS Safari zooming the login form */
+  line-height: 1.35;
+}
+#gate .gate-submit { min-height: 48px; font-size: 0.95rem; }
+#gate .gate-submit:disabled { opacity: .72; cursor: wait; }
+#gate .keypad { gap: clamp(8px, 2.5vw, 12px); }
+#gate .keypad button { min-height: 54px; font-size: 1.15rem; touch-action: manipulation; }
+.gate-storage-notice {
+  display: grid;
+  gap: 4px;
+  margin: 0 0 16px;
+  padding: 11px 12px;
+  border: 1px solid var(--warn, #a97920);
+  border-radius: 10px;
+  background: var(--warn-soft, #fbf1dc);
+  color: var(--ink, #172033);
+  font-size: .78rem;
+  line-height: 1.45;
+}
+.gate-storage-notice strong { font-size: .8rem; }
+.gate-storage-notice span { color: var(--ink-muted, #687386); }
+
+/* Tables and large forms stay usable without forcing the whole page wider. */
+.table-wrap, .table-responsive, .mapping-table-wrap { max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table.data { min-width: 620px; }
+.modal-backdrop { overflow-y: auto; -webkit-overflow-scrolling: touch; padding: max(14px, env(safe-area-inset-top)) 12px max(14px, env(safe-area-inset-bottom)); }
+.modal { max-width: min(720px, 100%); max-height: calc(100dvh - 28px); overflow-y: auto; }
+
+@media (max-width: 860px) {
+  #content { max-width: none; padding: 16px 14px calc(88px + env(safe-area-inset-bottom)); }
+  #topbar { padding-top: max(10px, env(safe-area-inset-top)); }
+  #mobilenav { width: min(310px, 86vw); padding-top: max(18px, env(safe-area-inset-top)); padding-bottom: max(18px, env(safe-area-inset-bottom)); }
+  .view-header { align-items: flex-start; }
+  .view-header > div:last-child { max-width: 100%; }
+  .view-header .btn, .view-header button { max-width: 100%; }
+  .stat-grid, .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .modal { width: 100%; }
+}
+@media (max-width: 560px) {
+  body { font-size: 14px; }
+  h1 { font-size: 1.3rem; }
+  #content { padding-left: 12px; padding-right: 12px; }
+  .gate-card { padding: 20px 17px; }
+  .view-header { gap: 10px; margin-bottom: 16px; }
+  .view-header > * { min-width: 0; }
+  .view-header .btn, .view-header button { white-space: normal; }
+  .card { max-width: 100%; }
+  .stat-grid, .stats-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat-tile { min-width: 0; padding: 12px; }
+  .form-row, .form-grid { grid-template-columns: 1fr !important; }
+  .modal-backdrop { align-items: flex-start; }
+  .modal { margin: auto 0; padding: 16px; }
+}
+@media (max-height: 620px) and (max-width: 860px) {
+  #gate { align-items: flex-start; }
+  .gate-card { margin-top: 8px; margin-bottom: 8px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}

@@ -345,7 +345,16 @@
   // labour) lives in the `staff` collection and logs in with its mobile
   // number + PIN, so a mobile number must be unique across every role.
   // ---------------------------------------------------------------
-  function normalizeMobile(m) { return String(m || '').replace(/\D/g, ''); }
+  // Canonicalise Australian mobile numbers so the same account is found
+  // whether a user types 04xx xxx xxx, +61 4xx xxx xxx, or 4xx xxx xxx.
+  // Existing stored values are not rewritten; comparison happens on the fly.
+  function normalizeMobile(m) {
+    let digits = String(m == null ? '' : m).replace(/\D/g, '');
+    if (digits.startsWith('0061')) digits = digits.slice(2);
+    if (digits.startsWith('61') && digits.length === 11) digits = '0' + digits.slice(2);
+    if (digits.length === 9 && digits.startsWith('4')) digits = '0' + digits;
+    return digits;
+  }
   function mobileTaken(mobile, excludeStaffId) {
     const norm = normalizeMobile(mobile);
     if (!norm) return false;
@@ -1656,6 +1665,12 @@
   let pinTargetStaffId = null;
   let gateStage = 'mobile';
   let gateMobileDraft = '';
+  let gateSubmitting = false;
+
+  function gateStorageNotice() {
+    if (!state.usingFallback) return '';
+    return `<div class="gate-storage-notice" role="status"><strong>Device-only storage</strong><span>This build is not connected to your shared Cloudflare D1 data yet. Changes made here may not appear on other devices.</span></div>`;
+  }
 
   function renderGate() {
     const gate = document.getElementById('gate');
@@ -1664,12 +1679,13 @@
         <div class="gate-card card">
           <div class="brand" style="padding:0 0 10px;"><div class="brand-mark">UM</div><div class="brand-text">${esc(state.settings.businessName || 'UMA Management')}<small>Sign up — first admin account</small></div></div>
           <h2 style="margin-bottom:6px;">Create the first admin account</h2>
-          <p class="helptext" style="margin-bottom:16px;">Your mobile number becomes your login ID, with a 4-digit PIN. It's a convenience, not secure authentication.</p>
-          <form data-onsubmit="gate-signup-admin">
-            <div class="field" style="margin-bottom:12px;"><label class="field-label">Your name</label><input type="text" name="name" required autofocus></div>
-            <div class="field" style="margin-bottom:12px;"><label class="field-label">Mobile number</label><input type="tel" inputmode="numeric" name="mobile" required></div>
-            <div class="field" style="margin-bottom:12px;"><label class="field-label">Choose a 4-digit PIN</label><input type="password" name="pin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required></div>
-            <button class="btn btn-primary" type="submit" style="width:100%;">Sign up & continue</button>
+          <p class="helptext" style="margin-bottom:16px;">Your mobile number becomes your login ID, with a 4-digit PIN.</p>
+          ${gateStorageNotice()}
+          <form data-onsubmit="gate-signup-admin" novalidate>
+            <div class="field" style="margin-bottom:12px;"><label class="field-label" for="gate-name">Your name</label><input id="gate-name" type="text" name="name" autocomplete="name" required></div>
+            <div class="field" style="margin-bottom:12px;"><label class="field-label" for="gate-signup-mobile">Mobile number</label><input id="gate-signup-mobile" type="tel" inputmode="tel" autocomplete="tel" name="mobile" required></div>
+            <div class="field" style="margin-bottom:12px;"><label class="field-label" for="gate-signup-pin">Choose a 4-digit PIN</label><input id="gate-signup-pin" type="password" inputmode="numeric" pattern="[0-9]{4}" minlength="4" maxlength="4" name="pin" autocomplete="new-password" required></div>
+            <button class="btn btn-primary gate-submit" type="submit" style="width:100%;">Sign up & continue</button>
           </form>
         </div>`;
       return;
@@ -1681,13 +1697,13 @@
         const dots = [0, 1, 2, 3].map((i) => `<div class="pin-dot ${i < pinBuffer.length ? 'filled' : ''}"></div>`).join('');
         gate.innerHTML = `
           <div class="gate-card card">
-            <div style="text-align:center;margin-bottom:6px;"><div class="avatar" style="margin:0 auto 10px;">${esc(staffMember.name.slice(0, 2).toUpperCase())}</div><h3>${esc(staffMember.name)}</h3><p class="helptext">Enter PIN</p></div>
-            <div class="pin-dots">${dots}</div>
-            <div class="keypad">
-              ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `<button data-action="gate-key" data-key="${n}">${n}</button>`).join('')}
-              <button data-action="gate-back">Back</button>
-              <button data-action="gate-key" data-key="0">0</button>
-              <button data-action="gate-backspace">⌫</button>
+            <div style="text-align:center;margin-bottom:6px;"><div class="avatar" style="margin:0 auto 10px;">${esc(staffMember.name.slice(0, 2).toUpperCase())}</div><h3>${esc(staffMember.name)}</h3><p class="helptext">Enter your 4-digit PIN</p></div>
+            <div class="pin-dots" aria-label="${pinBuffer.length} of 4 PIN digits entered">${dots}</div>
+            <div class="keypad" aria-label="PIN keypad">
+              ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `<button type="button" data-action="gate-key" data-key="${n}" aria-label="${n}">${n}</button>`).join('')}
+              <button type="button" data-action="gate-back">Back</button>
+              <button type="button" data-action="gate-key" data-key="0" aria-label="0">0</button>
+              <button type="button" data-action="gate-backspace" aria-label="Delete last digit">⌫</button>
             </div>
           </div>`;
         return;
@@ -1697,26 +1713,31 @@
       <div class="gate-card card">
         <div class="brand" style="padding:0 0 10px;"><div class="brand-mark">UM</div><div class="brand-text">${esc(state.settings.businessName || 'UMA Management')}<small>Log in</small></div></div>
         <h2 style="margin-bottom:6px;">Log in</h2>
-        <p class="helptext" style="margin-bottom:16px;">Enter the mobile number your login was set up with.</p>
-        <form data-onsubmit="gate-mobile-continue">
-          <div class="field" style="margin-bottom:12px;"><label class="field-label">Mobile number</label><input type="tel" inputmode="numeric" name="mobile" value="${esc(gateMobileDraft)}" required autofocus></div>
-          <button class="btn btn-primary" type="submit" style="width:100%;">Continue</button>
+        <p class="helptext" style="margin-bottom:16px;">Enter the mobile number linked to your account. Australian numbers work with 04 or +61 format.</p>
+        ${gateStorageNotice()}
+        <form data-onsubmit="gate-mobile-continue" novalidate>
+          <div class="field" style="margin-bottom:12px;"><label class="field-label" for="gate-mobile-input">Mobile number</label><input id="gate-mobile-input" type="tel" inputmode="tel" autocomplete="tel" enterkeyhint="go" autocapitalize="off" spellcheck="false" name="mobile" value="${esc(gateMobileDraft)}" required></div>
+          <button class="btn btn-primary gate-submit" type="submit" style="width:100%;">Continue</button>
         </form>
       </div>`;
   }
 
   async function checkPin() {
-    const staffMember = state.staff.find((s) => s.id === pinTargetStaffId);
-    if (!staffMember) return;
+    if (gateSubmitting) return;
+    const staffMember = state.staff.find((s) => s.id === pinTargetStaffId && s.active !== false);
+    if (!staffMember || pinBuffer.length !== 4) return;
+    gateSubmitting = true;
     if (pinBuffer === String(staffMember.pin)) {
       state.session = { staffId: staffMember.id, name: staffMember.name, role: staffMember.role, driverId: staffMember.driverId || null, labourId: staffMember.labourId || null };
       try { localStorage.setItem('driverpay_session', JSON.stringify(state.session)); } catch (e) {}
       pinBuffer = ''; pinTargetStaffId = null; gateStage = 'mobile'; gateMobileDraft = '';
       document.getElementById('gate').innerHTML = ''; document.getElementById('gate').classList.add('hidden');
+      gateSubmitting = false;
       boot2();
     } else {
       toast('Incorrect PIN', 'err');
       pinBuffer = '';
+      gateSubmitting = false;
       renderGate();
     }
   }
@@ -1860,7 +1881,12 @@
 
     // Gate
     'gate-back': () => { pinTargetStaffId = null; pinBuffer = ''; gateStage = 'mobile'; renderGate(); },
-    'gate-key': (el) => { if (pinBuffer.length < 4) pinBuffer += el.dataset.key; renderGate(); if (pinBuffer.length === 4) checkPin(); },
+    'gate-key': (el) => {
+      if (gateSubmitting || pinBuffer.length >= 4 || !/^[0-9]$/.test(el.dataset.key || '')) return;
+      pinBuffer += el.dataset.key;
+      renderGate();
+      if (pinBuffer.length === 4) checkPin();
+    },
     'gate-backspace': () => { pinBuffer = pinBuffer.slice(0, -1); renderGate(); },
 
     // Entry
@@ -2208,22 +2234,31 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   const SUBMIT_HANDLERS = {
     'gate-signup-admin': async (form) => {
       const fd = new FormData(form);
-      const mobile = normalizeMobile(fd.get('mobile'));
-      if (!mobile) { toast('Enter a mobile number.', 'err'); return; }
-      const ref = await state.db.collection('staff').add({ name: fd.get('name').trim(), mobile, pin: fd.get('pin'), role: 'admin', active: true, createdAt: new Date().toISOString() });
+      const name = String(fd.get('name') || '').trim();
+      const mobileInput = String(fd.get('mobile') || '').trim();
+      const mobile = normalizeMobile(mobileInput);
+      const pin = String(fd.get('pin') || '').trim();
+      if (!name) { toast('Enter your name.', 'err'); return; }
+      if (mobile.length < 8 || mobile.length > 15) { toast('Enter a valid mobile number.', 'err'); return; }
+      if (!/^[0-9]{4}$/.test(pin)) { toast('Your PIN must be exactly 4 digits.', 'err'); return; }
+      const ref = await state.db.collection('staff').add({ name, mobile, pin, role: 'admin', active: true, createdAt: new Date().toISOString() });
       await loadStaff();
-      state.session = { staffId: ref.id, name: fd.get('name').trim(), role: 'admin' };
+      state.session = { staffId: ref.id, name, role: 'admin' };
       try { localStorage.setItem('driverpay_session', JSON.stringify(state.session)); } catch (e) {}
       document.getElementById('gate').innerHTML = ''; document.getElementById('gate').classList.add('hidden');
       boot2();
     },
     'gate-mobile-continue': async (form) => {
       const fd = new FormData(form);
-      const mobile = normalizeMobile(fd.get('mobile'));
-      gateMobileDraft = fd.get('mobile') || '';
-      const staffMember = state.staff.find((s) => s.active !== false && normalizeMobile(s.mobile) === mobile && mobile);
-      if (!staffMember) { toast('No account found for that mobile number.', 'err'); renderGate(); return; }
-      pinTargetStaffId = staffMember.id; pinBuffer = ''; gateStage = 'pin';
+      const rawMobile = String(fd.get('mobile') || '').trim();
+      const mobile = normalizeMobile(rawMobile);
+      gateMobileDraft = rawMobile;
+      if (mobile.length < 8 || mobile.length > 15) { toast('Enter a valid mobile number.', 'err'); return; }
+      const staffMember = state.staff.find((s) => s.active !== false && normalizeMobile(s.mobile) === mobile);
+      if (!staffMember) { toast('No active account found for that mobile number. Check the number and try again.', 'err'); return; }
+      pinTargetStaffId = staffMember.id;
+      pinBuffer = '';
+      gateStage = 'pin';
       renderGate();
     },
     'rec-save-edit': async (form) => {
@@ -2351,12 +2386,36 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     const fn = CHANGE_HANDLERS[el.dataset.onchange];
     if (fn) fn(el, e);
   });
-  document.addEventListener('submit', (e) => {
-    const form = e.target.closest('[data-onsubmit]');
+  document.addEventListener('submit', async (e) => {
+    const form = e.target && e.target.closest ? e.target.closest('[data-onsubmit]') : null;
     if (!form) return;
     e.preventDefault();
     const fn = SUBMIT_HANDLERS[form.dataset.onsubmit];
-    if (fn) fn(form);
+    if (!fn || form.dataset.submitting === 'true') return;
+    form.dataset.submitting = 'true';
+    const submitButton = form.querySelector('button[type="submit"]');
+    if (submitButton) {
+      submitButton.disabled = true;
+      submitButton.setAttribute('aria-busy', 'true');
+      submitButton.dataset.originalLabel = submitButton.textContent;
+      submitButton.textContent = 'Please wait…';
+    }
+    try {
+      await fn(form);
+    } catch (err) {
+      console.error('UMA form submission failed:', err);
+      toast((err && err.message) ? err.message : 'Unable to complete this action. Please try again.', 'err');
+    } finally {
+      if (form.isConnected) {
+        delete form.dataset.submitting;
+        if (submitButton && submitButton.isConnected) {
+          submitButton.disabled = false;
+          submitButton.removeAttribute('aria-busy');
+          if (submitButton.dataset.originalLabel) submitButton.textContent = submitButton.dataset.originalLabel;
+          delete submitButton.dataset.originalLabel;
+        }
+      }
+    }
   });
   document.getElementById('hamburgerBtn') && document.getElementById('hamburgerBtn').addEventListener('click', () => {
     document.getElementById('mobilenav').classList.remove('hidden');

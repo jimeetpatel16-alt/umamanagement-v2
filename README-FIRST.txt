@@ -63,3 +63,25 @@ PRODUCTION COMPLETION REQUIRED
 
 Never overwrite an existing production D1 database or deploy a migration against
 production without a verified backup and a staging test.
+
+
+2026-11-04 FRONTEND UPDATE
+-------------------------
+- Repaired Australian mobile-number matching: 04xx, +614xx and 4xx forms are
+  normalised to the same comparison value without rewriting stored accounts.
+- Hardened delegated form submission against double taps and surfaced errors.
+- Improved login/PIN keypad accessibility and small-screen touch targets.
+- Corrected HTML document structure, mobile viewport handling and safe-area
+  spacing for iOS/Android.
+- Added responsive layout improvements for narrow screens, tables and modals.
+- Added an explicit device-only storage warning when the Cloudflare shared-data
+  connection is unavailable.
+
+IMPORTANT: These frontend fixes do not complete the Cloudflare D1 integration.
+The legacy data adapter still falls back to localStorage when the hosting
+environment does not provide the legacy `window.claude.use('db')` interface.
+This package therefore improves device compatibility and login matching, but
+does not by itself make records synchronise between devices. The D1 Worker
+source remains preserved and must be mapped to the existing production schema
+before it can be enabled safely. Do not deploy its placeholder D1 binding or
+run migrations against production as part of this frontend-only update.

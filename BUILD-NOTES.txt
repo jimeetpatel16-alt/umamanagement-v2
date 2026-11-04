@@ -4,3 +4,10 @@ Build provenance:
 - The V2 worker has intentionally not been wired to the localStorage document
   shim because the V2 schema/API is not yet compatible with the legacy data
   model. This avoids silently writing data to the wrong tables or losing data.
+
+
+Frontend update 2026-11-04: fixed Australian phone-number canonicalisation,
+added async submit guards/error feedback, improved PIN keypad interaction,
+corrected HTML head/body structure, and added responsive/safe-area CSS. No D1
+schema or live database settings were changed. Multi-device synchronisation is
+still pending a reviewed adapter to the user's existing production D1 schema.
