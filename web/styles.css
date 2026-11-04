@@ -740,4 +740,20 @@ table.data tfoot td { background: #f1f3f6; }
 .gate-back-account { width: 100%; }
 .gate-account-warning { margin-top: 8px; padding: 9px 10px; border-radius: 8px; background: #fff5df; color: #694e19; font-size: .73rem; line-height: 1.4; }
 
-#gate .gate-role-select { width: 100%; min-height: 46px; padding: 10px 12px; border: 1px solid #dce2ea; border-radius: 9px; background: #fff; color: #172033; font: inherit; }
+
+
+/* Mobile login feedback: visible inline status instead of relying on transient toasts. */
+#gate .gate-inline-error {
+  margin: 0 0 12px;
+  padding: 11px 12px;
+  border: 1px solid #c45b50;
+  border-radius: 9px;
+  background: #fff0ee;
+  color: #8a3028;
+  font-size: .82rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+#gate .gate-inline-error[hidden] { display: none !important; }
+#gate .gate-submit { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+#gate .gate-submit:focus-visible { outline: 3px solid rgba(181,138,69,.35); outline-offset: 2px; }

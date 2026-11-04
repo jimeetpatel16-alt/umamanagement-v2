@@ -1699,7 +1699,6 @@
   let gateCandidateStaffIds = [];
   let gateStage = 'mobile';
   let gateMobileDraft = '';
-  let gateRoleDraft = '';
   let gateSubmitting = false;
   let switchingUser = false;
 
@@ -1717,7 +1716,6 @@
     gateStage = 'mobile';
     gateSubmitting = false;
     if (options.clearMobile !== false) gateMobileDraft = '';
-    gateRoleDraft = '';
     clearPersistedSession();
 
     // Clear the previous role's URL hash so it is never restored for the
@@ -1745,6 +1743,22 @@
   function gateStorageNotice() {
     if (!state.usingFallback) return '';
     return `<div class="gate-storage-notice" role="status"><strong>Device-only storage</strong><span>This build is not connected to your shared Cloudflare D1 data yet. Changes made here may not appear on other devices.</span></div>`;
+  }
+
+  function showGateError(message) {
+    const error = document.getElementById('gate-mobile-error');
+    if (error) {
+      error.textContent = String(message || 'Unable to continue. Please try again.');
+      error.hidden = false;
+      error.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    } else {
+      toast(message || 'Unable to continue. Please try again.', 'err');
+    }
+  }
+
+  function clearGateError() {
+    const error = document.getElementById('gate-mobile-error');
+    if (error) { error.textContent = ''; error.hidden = true; }
   }
 
   function renderGate() {
@@ -1813,10 +1827,11 @@
         <h2 style="margin-bottom:6px;">Log in</h2>
         <p class="helptext" style="margin-bottom:16px;">Enter the mobile number linked to your account. Australian numbers work with 04 or +61 format.</p>
         ${gateStorageNotice()}
-        <form data-onsubmit="gate-mobile-continue" novalidate>
-          <div class="field" style="margin-bottom:12px;"><label class="field-label" for="gate-mobile-input">Mobile number</label><input id="gate-mobile-input" type="tel" inputmode="tel" autocomplete="tel" enterkeyhint="go" autocapitalize="off" spellcheck="false" name="mobile" value="${esc(gateMobileDraft)}" required></div>
-          <div class="field" style="margin-bottom:12px;"><label class="field-label" for="gate-role-input">Account type</label><select id="gate-role-input" name="role" class="gate-role-select"><option value="">Automatically detect account</option><option value="admin" ${gateRoleDraft === 'admin' ? 'selected' : ''}>Admin</option><option value="manager" ${gateRoleDraft === 'manager' ? 'selected' : ''}>Manager</option><option value="staff" ${gateRoleDraft === 'staff' ? 'selected' : ''}>Staff</option><option value="driver" ${gateRoleDraft === 'driver' ? 'selected' : ''}>Driver</option><option value="labour" ${gateRoleDraft === 'labour' ? 'selected' : ''}>Labour</option></select></div>
-          <button class="btn btn-primary gate-submit" type="submit" style="width:100%;">Continue</button>
+        <form id="gate-mobile-form" data-onsubmit="gate-mobile-continue" novalidate>
+          <div class="field" style="margin-bottom:12px;"><label class="field-label" for="gate-mobile-input">Mobile number</label><input id="gate-mobile-input" type="tel" inputmode="tel" autocomplete="tel" enterkeyhint="go" autocapitalize="off" spellcheck="false" name="mobile" value="${esc(gateMobileDraft)}" aria-describedby="gate-mobile-help gate-mobile-error" required></div>
+          <p id="gate-mobile-help" class="helptext" style="margin:-4px 0 12px;font-size:.76rem;">Use the mobile number registered to your account.</p>
+          <p id="gate-mobile-error" class="gate-inline-error" role="alert" aria-live="polite" hidden></p>
+          <button class="btn btn-primary gate-submit" type="button" data-action="gate-mobile-continue" style="width:100%;">Continue</button>
         </form>
       </div>`;
   }
@@ -2000,6 +2015,29 @@
     'confirm-no': () => window.__confirmResolve && window.__confirmResolve(false),
 
     // Gate
+    'gate-mobile-continue': async (el) => {
+      const form = el.closest('form[data-onsubmit="gate-mobile-continue"]');
+      if (!form || gateSubmitting || form.dataset.submitting === 'true') return;
+      form.dataset.submitting = 'true';
+      const button = el;
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.setAttribute('aria-busy', 'true');
+      button.textContent = 'Please wait…';
+      try {
+        await SUBMIT_HANDLERS['gate-mobile-continue'](form);
+      } catch (err) {
+        console.error('UMA mobile login failed:', err);
+        showGateError(err && err.message ? err.message : 'Unable to check this mobile number. Please try again.');
+      } finally {
+        if (button.isConnected) {
+          button.disabled = false;
+          button.removeAttribute('aria-busy');
+          button.textContent = originalText || 'Continue';
+        }
+        if (form.isConnected) delete form.dataset.submitting;
+      }
+    },
     'gate-back': () => { pinTargetStaffId = null; gateCandidateStaffIds = []; pinBuffer = ''; gateStage = 'mobile'; renderGate(); },
     'gate-select-account': (el) => {
       const chosen = state.staff.find((s) => s.id === el.dataset.staffId && s.active !== false);
@@ -2394,36 +2432,45 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       boot2();
     },
     'gate-mobile-continue': async (form) => {
-      const fd = new FormData(form);
-      const rawMobile = String(fd.get('mobile') || '').trim();
-      const mobile = normalizeMobile(rawMobile);
-      const selectedRole = String(fd.get('role') || '').trim().toLowerCase();
-      gateMobileDraft = rawMobile;
-      gateRoleDraft = selectedRole;
-      if (mobile.length < 8 || mobile.length > 15) { toast('Enter a valid mobile number.', 'err'); return; }
-      // Refresh account records before lookup. In local preview mode this only
-      // refreshes this browser's local store; it cannot fetch another device's data.
-      await loadStaff();
-      const matches = state.staff.filter((s) => s.active !== false
-        && normalizeMobile(s.mobile) === mobile
-        && (!selectedRole || String(s.role || 'staff').trim().toLowerCase() === selectedRole));
-      if (!matches.length) {
-        const roleLabel = selectedRole ? selectedRole.charAt(0).toUpperCase() + selectedRole.slice(1) : 'active';
-        toast(state.usingFallback
-          ? `No ${roleLabel} account for this mobile number is stored on this device. Accounts created on your laptop will not appear here until the shared D1 connection is completed.`
-          : `No active ${roleLabel} account found for that mobile number. Check the number and account type.`, 'err');
-        return;
+      if (gateSubmitting) return;
+      gateSubmitting = true;
+      clearGateError();
+      try {
+        const fd = new FormData(form);
+        const rawMobile = String(fd.get('mobile') || '').trim();
+        const mobile = normalizeMobile(rawMobile);
+        gateMobileDraft = rawMobile;
+        if (mobile.length < 8 || mobile.length > 15) {
+          showGateError('Please enter a valid mobile number.');
+          return;
+        }
+
+        // Refresh the local staff roster before checking. This cannot retrieve
+        // accounts from another device while this build is in device-only mode.
+        await loadStaff();
+        const matches = state.staff.filter((account) => account.active !== false
+          && normalizeMobile(account.mobile) === mobile);
+
+        if (!matches.length) {
+          showGateError(state.usingFallback
+            ? 'No account with this mobile number is saved on this phone. Your Labour account may be saved on your laptop only. Shared Cloudflare D1 login is not connected yet, so this phone cannot retrieve that account. Do not create a duplicate account; connect the existing D1 database first.'
+            : 'No active account was found for this mobile number. Check the number with your administrator.');
+          return;
+        }
+
+        gateCandidateStaffIds = matches.map((account) => account.id);
+        pinBuffer = '';
+        if (matches.length > 1) {
+          pinTargetStaffId = null;
+          gateStage = 'account';
+        } else {
+          pinTargetStaffId = matches[0].id;
+          gateStage = 'pin';
+        }
+        renderGate();
+      } finally {
+        gateSubmitting = false;
       }
-      gateCandidateStaffIds = matches.map((s) => s.id);
-      pinBuffer = '';
-      if (matches.length > 1) {
-        pinTargetStaffId = null;
-        gateStage = 'account';
-      } else {
-        pinTargetStaffId = matches[0].id;
-        gateStage = 'pin';
-      }
-      renderGate();
     },
     'rec-save-edit': async (form) => {
       const fd = new FormData(form);
@@ -2552,6 +2599,9 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     if (!el) return;
     const fn = CHANGE_HANDLERS[el.dataset.onchange];
     if (fn) fn(el, e);
+  });
+  document.addEventListener('input', (e) => {
+    if (e.target && e.target.id === 'gate-mobile-input') clearGateError();
   });
   document.addEventListener('submit', async (e) => {
     const form = e.target && e.target.closest ? e.target.closest('[data-onsubmit]') : null;

@@ -1,0 +1,23 @@
+UMA MANAGEMENT — MOBILE LOGIN CONTINUE FIX
+
+Included changes
+- Removed the Account type dropdown from the first login screen.
+- Continue is now an explicit tap action (type=button + delegated click handler), not dependent on iOS/Safari native form-submit synthesis.
+- Keyboard Enter remains supported through the form submit handler.
+- Prevented duplicate submissions and restored the button state if a lookup fails.
+- Added persistent inline error messaging inside the login card.
+- Preserved Australian mobile number normalisation and duplicate-account selection.
+- Preserved the current premium light theme and all existing app modules.
+
+Important limitation
+The visible Device-only storage notice means the frontend is still using browser-local data. A Labour account stored on the laptop is not automatically available on the phone. This patch will advance to PIN when the matching account exists in the phone's local records, and will clearly explain the problem when it does not. It intentionally does not bypass PIN verification or create an account automatically.
+
+Deployment blocker
+The last Cloudflare deployment log reports: binding DB of type d1 must have a valid database_id specified (error 10021). The worker/wrangler.toml still contains REPLACE_WITH_D1_DATABASE_ID. This patch does not invent or replace your production D1 ID. You must insert the real existing D1 database ID before Cloudflare can deploy these web changes. Do not run migrations or replace the database.
+
+Install
+Replace these files in the existing repository with the matching files from this ZIP:
+  web/app.js
+  web/styles.css
+  web/index.html (unchanged, included for reference)
+Then commit and push. Once the existing D1 database_id is configured correctly, Cloudflare can deploy.
