@@ -11,3 +11,17 @@ added async submit guards/error feedback, improved PIN keypad interaction,
 corrected HTML head/body structure, and added responsive/safe-area CSS. No D1
 schema or live database settings were changed. Multi-device synchronisation is
 still pending a reviewed adapter to the user's existing production D1 schema.
+
+Frontend update 2026-11-04 (role-switch reliability):
+- Replaced full-page reload during Switch User with an explicit in-page sign-out
+  and login-gate transition.
+- Clears the previous session, PIN buffer, draft mobile number, modal state,
+  mobile drawer, and previous route hash before showing login.
+- Refreshes the staff/account list after sign-out without restoring the prior
+  Admin route if the refresh succeeds.
+- Rebuilds restored sessions from the current staff record, so an old cached
+  role cannot continue to grant the previous dashboard after a role change.
+- Applies a role change immediately when the currently signed-in account is
+  changed, and ends the session if that account is deactivated.
+- Added cross-tab sign-out handling and visible role label on the PIN screen.
+- No D1 migration, schema, database ID, or production binding was changed.

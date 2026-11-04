@@ -145,6 +145,31 @@
     driverAssignments: [],
   };
 
+  const SESSION_KEY = 'driverpay_session';
+  const VALID_ROLES = new Set(['admin', 'manager', 'staff', 'driver', 'labour']);
+
+  function sessionFromStaff(staffMember) {
+    return {
+      staffId: staffMember.id,
+      name: staffMember.name || 'User',
+      role: VALID_ROLES.has(staffMember.role) ? staffMember.role : 'staff',
+      driverId: staffMember.driverId || null,
+      labourId: staffMember.labourId || null,
+    };
+  }
+
+  function persistSession(session) {
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify(session)); } catch (e) {
+      console.warn('UMA could not persist the current session in this browser.', e);
+    }
+  }
+
+  function clearPersistedSession() {
+    try { localStorage.removeItem(SESSION_KEY); } catch (e) {
+      console.warn('UMA could not clear the saved session in this browser.', e);
+    }
+  }
+
   // ---------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------
@@ -389,7 +414,12 @@
           <button class="btn ${opts.danger ? 'btn-danger' : 'btn-primary'}" data-action="confirm-yes">${esc(opts.okLabel || 'Confirm')}</button>
         </div>
       `);
-      window.__confirmResolve = (v) => { closeModal(); resolve(v); };
+      window.__confirmResolve = (v) => {
+        if (!window.__confirmResolve) return;
+        window.__confirmResolve = null;
+        closeModal();
+        resolve(Boolean(v));
+      };
     });
   }
 
@@ -1666,6 +1696,44 @@
   let gateStage = 'mobile';
   let gateMobileDraft = '';
   let gateSubmitting = false;
+  let switchingUser = false;
+
+  // Return to the login gate without a full page reload. This avoids stale
+  // admin hashes, browser reload races, and leftover PIN/session state when
+  // switching between Admin, Manager, Staff, Driver, and Labour accounts.
+  function showLoginGate(options) {
+    options = options || {};
+    state.session = null;
+    state.route = 'dashboard';
+    state.recordsFilter = null;
+    pinBuffer = '';
+    pinTargetStaffId = null;
+    gateStage = 'mobile';
+    gateSubmitting = false;
+    if (options.clearMobile !== false) gateMobileDraft = '';
+    clearPersistedSession();
+
+    // Clear the previous role's URL hash so it is never restored for the
+    // next person signing in on this device.
+    try {
+      if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+    } catch (e) {
+      location.hash = '';
+    }
+
+    closeModal();
+    window.__confirmResolve = null;
+    document.getElementById('mobilenav').classList.add('hidden');
+    document.getElementById('drawer-backdrop').classList.add('hidden');
+    document.getElementById('shell').classList.add('hidden');
+    const gate = document.getElementById('gate');
+    gate.classList.remove('hidden');
+    renderGate();
+    const mobileInput = gate.querySelector('input[name="mobile"]');
+    if (mobileInput) {
+      try { mobileInput.focus({ preventScroll: true }); } catch (e) { mobileInput.focus(); }
+    }
+  }
 
   function gateStorageNotice() {
     if (!state.usingFallback) return '';
@@ -1697,7 +1765,7 @@
         const dots = [0, 1, 2, 3].map((i) => `<div class="pin-dot ${i < pinBuffer.length ? 'filled' : ''}"></div>`).join('');
         gate.innerHTML = `
           <div class="gate-card card">
-            <div style="text-align:center;margin-bottom:6px;"><div class="avatar" style="margin:0 auto 10px;">${esc(staffMember.name.slice(0, 2).toUpperCase())}</div><h3>${esc(staffMember.name)}</h3><p class="helptext">Enter your 4-digit PIN</p></div>
+            <div style="text-align:center;margin-bottom:6px;"><div class="avatar" style="margin:0 auto 10px;">${esc(staffMember.name.slice(0, 2).toUpperCase())}</div><h3>${esc(staffMember.name)}</h3><p class="helptext">${esc((staffMember.role || 'staff').charAt(0).toUpperCase() + (staffMember.role || 'staff').slice(1))} account · Enter your 4-digit PIN</p></div>
             <div class="pin-dots" aria-label="${pinBuffer.length} of 4 PIN digits entered">${dots}</div>
             <div class="keypad" aria-label="PIN keypad">
               ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `<button type="button" data-action="gate-key" data-key="${n}" aria-label="${n}">${n}</button>`).join('')}
@@ -1728,11 +1796,13 @@
     if (!staffMember || pinBuffer.length !== 4) return;
     gateSubmitting = true;
     if (pinBuffer === String(staffMember.pin)) {
-      state.session = { staffId: staffMember.id, name: staffMember.name, role: staffMember.role, driverId: staffMember.driverId || null, labourId: staffMember.labourId || null };
-      try { localStorage.setItem('driverpay_session', JSON.stringify(state.session)); } catch (e) {}
+      state.session = sessionFromStaff(staffMember);
+      persistSession(state.session);
       pinBuffer = ''; pinTargetStaffId = null; gateStage = 'mobile'; gateMobileDraft = '';
       document.getElementById('gate').innerHTML = ''; document.getElementById('gate').classList.add('hidden');
       gateSubmitting = false;
+      state.route = 'dashboard';
+      try { history.replaceState(null, '', location.pathname + location.search + '#dashboard'); } catch (e) { location.hash = 'dashboard'; }
       boot2();
     } else {
       toast('Incorrect PIN', 'err');
@@ -1868,11 +1938,30 @@
   const ACTIONS = {
     'nav': (el) => setRoute(el.dataset.route),
     'switch-user': async () => {
-      const ok = await confirmDialog('Switch to a different staff member?', { okLabel: 'Switch' });
-      if (!ok) return;
-      state.session = null;
-      try { localStorage.removeItem('driverpay_session'); } catch (e) {}
-      location.reload();
+      if (switchingUser) return;
+      switchingUser = true;
+      try {
+        const ok = await confirmDialog('Switch to a different account? Your current session will be closed.', { okLabel: 'Switch account' });
+        if (!ok) return;
+        // Close the current role immediately, even if a data refresh later
+        // encounters a network error. Then refresh account/role data in place.
+        // Do not reload: reloads can restore an old hash or cached role.
+        showLoginGate();
+        try {
+          await loadAll();
+          renderGate();
+          const mobileInput = document.querySelector('#gate input[name="mobile"]');
+          if (mobileInput) mobileInput.focus();
+        } catch (refreshError) {
+          console.warn('UMA could not refresh data while switching accounts:', refreshError);
+          toast('You are signed out. The account list could not be refreshed; check your connection and reload.', 'err');
+        }
+      } catch (err) {
+        console.error('UMA account switch failed:', err);
+        toast('Could not switch accounts. Please try again.', 'err');
+      } finally {
+        switchingUser = false;
+      }
     },
     'modal-backdrop': (el, e) => { if (e.target === el) closeModal(); },
     'modal-close': () => closeModal(),
@@ -2121,13 +2210,30 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       // a 'labour' role here — those are only created via the Labour page
       // and stay tied to their labourId.
       const s = state.staff.find((x) => x.id === el.dataset.id);
+      if (!s) { toast('Account not found. Refresh and try again.', 'err'); return; }
       if (s.role === 'labour') { toast('This is a labour portal login — manage it from the Labour page.', 'err'); return; }
       if (s.role === 'driver') { toast('This is a driver portal login — manage it from the Drivers page.', 'err'); return; }
       const next = s.role === 'admin' ? 'manager' : s.role === 'manager' ? 'staff' : 'admin';
       await state.db.doc('staff/' + el.dataset.id).update({ role: next });
-      await loadStaff(); renderView();
+      await loadStaff();
+      if (state.session && state.session.staffId === s.id) {
+        const updatedSelf = state.staff.find((x) => x.id === s.id);
+        if (updatedSelf && updatedSelf.active !== false) {
+          state.session = sessionFromStaff(updatedSelf);
+          persistSession(state.session);
+          if (!roleAllowed(state.route, state.session.role)) state.route = 'dashboard';
+          history.replaceState(null, '', location.pathname + location.search + '#' + state.route);
+          renderSidebar();
+        }
+      }
+      renderView();
     },
-    'staff-deactivate': async (el) => { await state.db.doc('staff/' + el.dataset.id).update({ active: false }); await loadStaff(); renderView(); },
+    'staff-deactivate': async (el) => {
+      await state.db.doc('staff/' + el.dataset.id).update({ active: false });
+      await loadStaff();
+      if (state.session && state.session.staffId === el.dataset.id) { showLoginGate(); toast('This account has been deactivated.', 'err'); return; }
+      renderView();
+    },
     'staff-reactivate': async (el) => { await state.db.doc('staff/' + el.dataset.id).update({ active: true }); await loadStaff(); renderView(); },
     'settings-add-holiday': async () => {
       const input = document.getElementById('newPublicHoliday');
@@ -2367,18 +2473,21 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     },
   };
 
-  document.addEventListener('click', (e) => {
-    const el = e.target.closest('[data-action]');
+  document.addEventListener('click', async (e) => {
+    const target = e.target;
+    const el = target && target.closest ? target.closest('[data-action]') : null;
     if (!el) return;
-    // The modal backdrop wraps every modal's contents and only wants to react
-    // when the backdrop itself is the click target (click-outside-to-close).
-    // Without this guard, closest() would match the backdrop for ANY click
-    // inside a modal (e.g. a submit button with no data-action of its own),
-    // and the preventDefault() below would silently cancel native form
-    // submission for every modal's Save/Add button.
-    if (el.dataset.action === 'modal-backdrop' && e.target !== el) return;
+    // The modal backdrop only reacts when the backdrop itself is clicked.
+    if (el.dataset.action === 'modal-backdrop' && target !== el) return;
     const fn = ACTIONS[el.dataset.action];
-    if (fn) { e.preventDefault(); fn(el, e); }
+    if (!fn) return;
+    e.preventDefault();
+    try {
+      await fn(el, e);
+    } catch (err) {
+      console.error('UMA action failed:', err);
+      toast((err && err.message) ? err.message : 'That action could not be completed. Please try again.', 'err');
+    }
   });
   document.addEventListener('change', (e) => {
     const el = e.target.closest('[data-onchange]');
@@ -2430,6 +2539,12 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     if (r) { state.route = r; renderSidebar(); renderView(); }
   });
 
+  // A switch/logout in another tab should not leave this tab showing the
+  // previous account's dashboard.
+  window.addEventListener('storage', (event) => {
+    if (event.key === SESSION_KEY && !event.newValue && state.session) showLoginGate();
+  });
+
   // ---------------------------------------------------------------
   // Boot
   // ---------------------------------------------------------------
@@ -2445,12 +2560,20 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     await initDb();
     await loadAll();
     let restored = null;
-    try { restored = JSON.parse(localStorage.getItem('driverpay_session') || 'null'); } catch (e) {}
-    if (restored && state.staff.find((s) => s.id === restored.staffId && s.active !== false)) {
-      state.session = restored;
-      document.getElementById('gate').innerHTML = ''; document.getElementById('gate').classList.add('hidden');
+    try { restored = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch (e) {}
+    const savedStaff = restored && state.staff.find((s) => s.id === restored.staffId && s.active !== false);
+    if (savedStaff) {
+      // The staff collection is authoritative. A role changed by an Admin
+      // must take effect on the next page load instead of trusting cached role.
+      state.session = sessionFromStaff(savedStaff);
+      persistSession(state.session);
+      document.getElementById('gate').innerHTML = '';
+      document.getElementById('gate').classList.add('hidden');
       boot2();
     } else {
+      clearPersistedSession();
+      document.getElementById('shell').classList.add('hidden');
+      document.getElementById('gate').classList.remove('hidden');
       renderGate();
     }
     // hot-reload support for the artifact host (state carried across republish, best-effort)
