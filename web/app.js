@@ -3581,77 +3581,78 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         <div class="card empty-state"><p>No company assigned yet — ask your admin to assign one before clocking in.</p></div>
       `;
     }
+
     const types = l.labourTypes && l.labourTypes.length ? l.labourTypes : ['warehouse'];
     const today = todayStr();
-    const existing = state.labourLogs.find((g) => g.labourId === labourId && g.date === today);
-    const shift = todaysMatchedShift(labourId, today);
+    const todayLogs = state.labourLogs
+      .filter((g) => g.labourId === labourId && g.date === today)
+      .sort((a, b) => (b.clockInAt || b.createdAt || '').localeCompare(a.clockInAt || a.createdAt || ''));
+    const activeLog = todayLogs.find((g) => g.status === 'InProgress' && g.clockInAt && !g.clockOutAt) || null;
 
-    if (existing && existing.status === 'Approved') {
-      return `
-        <div class="view-header"><div><h1>Hi, ${esc(l.name)}</h1><div class="sub">${fmtDateHuman(today)}</div></div></div>
-        <div class="card" style="text-align:center;padding:36px 20px;">
-          <p style="font-size:1.15rem;">✓ Today's log is approved</p>
-          <p class="helptext" style="margin-top:10px;">${esc(LABOUR_TYPE_LABEL[existing.workType] || existing.workType)} — ${existing.hours} hrs at ${esc(company.name)} (${fmtMoney(existing.payAmount)})</p>
-        </div>
-      `;
-    }
+    // A rostered shift can be used once. After it is clocked, the Labour
+    // person can select another unused rostered shift or choose other work.
+    const usedShiftIds = new Set(todayLogs.map((g) => g.shiftId).filter(Boolean));
+    const availableShifts = state.labourShifts
+      .filter((s) => s.labourId === labourId && s.date === today && s.published && !usedShiftIds.has(s.id))
+      .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
 
-    const rejectedBanner = existing && existing.status === 'Rejected'
-      ? `<div class="card" style="border-left:4px solid #dc2626;margin-bottom:16px;"><strong>Correction needed:</strong> ${esc(existing.rejectionReason || 'Please review and clock in again.')}</div>` : '';
-
-    const shiftCard = shift ? `
-      <div class="card" style="margin-bottom:16px;">
-        <p class="helptext" style="margin:0;">Today's rostered shift</p>
-        <p style="margin:6px 0 0;font-weight:700;">${esc(company.name)} — ${esc(LABOUR_TYPE_LABEL[shift.workType] || shift.workType)}</p>
-        <p class="helptext" style="margin:4px 0 0;">${esc(shift.startTime)}–${esc(shift.endTime)} · est. ${shift.estHours} hrs · ${fmtMoney(shift.estPayCost)}</p>
+    const todayHistory = todayLogs.length ? `
+      <div class="card" style="margin-top:16px;">
+        <h3 style="margin:0 0 12px;">Today's work entries (${todayLogs.length})</h3>
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th>Work</th><th>Clocked</th><th>Hours</th><th>Status</th></tr></thead>
+          <tbody>${todayLogs.map((g) => `<tr>
+            <td>${esc(LABOUR_TYPE_LABEL[g.workType] || g.workType || 'Work')}${g.shiftId ? '<div class="helptext">Rostered shift</div>' : ''}</td>
+            <td style="white-space:nowrap;">${g.clockInAt ? fmtTimeHuman(g.clockInAt) + (g.clockOutAt ? '–' + fmtTimeHuman(g.clockOutAt) : '– In progress') : '—'}</td>
+            <td class="tnum">${Number(g.hours || 0).toFixed(2)}</td>
+            <td>${g.status === 'Approved' ? '<span class="pill pill-paid">Approved</span>' : g.status === 'Rejected' ? '<span class="pill pill-cancelled">Rejected</span>' : g.status === 'InProgress' ? '<span class="pill pill-other">In progress</span>' : '<span class="pill pill-pending">Pending</span>'}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>
       </div>
-    ` : `<p class="helptext" style="margin-bottom:16px;">No shift rostered for today — you can still clock in.</p>`;
+    ` : '';
 
-    // Not yet clocked in for a fresh cycle today: no doc at all, or the previous
-    // cycle was rejected (has a clockOutAt already) and they need to restart.
-    const needsFreshClockIn = !existing || (existing.status === 'Rejected' && existing.clockOutAt);
-    if (needsFreshClockIn) {
-      const needsTypePick = !shift && types.length > 1;
-      return `
-        <div class="view-header"><div><h1>Hi, ${esc(l.name)}</h1><div class="sub">${fmtDateHuman(today)}</div></div></div>
-        ${rejectedBanner}
-        ${shiftCard}
-        <div class="card">
-          <form data-onsubmit="labour-clock-in" data-shift-id="${shift ? shift.id : ''}">
-            ${needsTypePick
-              ? `<div class="field" style="margin-bottom:16px;"><label class="field-label">What are you doing today?</label><select name="workType" required>${types.map((t) => `<option value="${t}">${esc(LABOUR_TYPE_LABEL[t])}</option>`).join('')}</select></div>`
-              : `<input type="hidden" name="workType" value="${shift ? shift.workType : types[0]}">`}
-            <button class="btn btn-primary" type="submit" style="width:100%;font-size:1.2rem;padding:18px;">CLOCK IN</button>
-          </form>
-        </div>
-      `;
-    }
+    const header = `<div class="view-header"><div><h1>Hi, ${esc(l.name)}</h1><div class="sub">${fmtDateHuman(today)}</div></div></div>`;
 
-    // Clocked in, not yet out.
-    if (existing.clockInAt && !existing.clockOutAt) {
+    if (activeLog) {
       return `
-        <div class="view-header"><div><h1>Hi, ${esc(l.name)}</h1><div class="sub">${fmtDateHuman(today)}</div></div></div>
-        ${shiftCard}
+        ${header}
         <div class="card" style="text-align:center;padding:28px 20px;">
-          <p class="helptext" style="margin:0;">Clocked in at</p>
-          <p style="font-size:1.4rem;font-weight:700;margin:6px 0 20px;">${fmtTimeHuman(existing.clockInAt)}</p>
-          <form data-onsubmit="labour-clock-out" data-id="${existing.id}">
-            <div class="field" style="margin-bottom:16px;text-align:left;"><label class="field-label">Notes (optional)</label><textarea name="notes" rows="2" placeholder="Anything the manager should know">${esc(existing.notes || '')}</textarea></div>
+          <p class="helptext" style="margin:0;">Current work — clocked in at</p>
+          <p style="font-size:1.4rem;font-weight:700;margin:6px 0 20px;">${fmtTimeHuman(activeLog.clockInAt)}</p>
+          <p class="helptext">${esc(LABOUR_TYPE_LABEL[activeLog.workType] || activeLog.workType)}${activeLog.shiftId ? ' · rostered shift' : ''}</p>
+          <form data-onsubmit="labour-clock-out" data-id="${activeLog.id}">
+            <div class="field" style="margin-bottom:16px;text-align:left;"><label class="field-label">Notes (optional)</label><textarea name="notes" rows="2" placeholder="Anything the manager should know">${esc(activeLog.notes || '')}</textarea></div>
             <button class="btn btn-primary" type="submit" style="width:100%;font-size:1.2rem;padding:18px;">CLOCK OUT</button>
           </form>
         </div>
+        ${todayHistory}
       `;
     }
 
-    // Clocked out — submitted, awaiting approval (or previously rejected but not yet re-clocked-in, handled above).
+    const shiftOptions = availableShifts.map((s) =>
+      `<option value="${s.id}">${esc(company.name)} — ${esc(LABOUR_TYPE_LABEL[s.workType] || s.workType)} · ${esc(s.startTime)}–${esc(s.endTime)}</option>`
+    ).join('');
+    const shiftPicker = availableShifts.length
+      ? `<div class="field" style="margin-bottom:16px;"><label class="field-label">Rostered shift (optional)</label><select name="shiftId"><option value="">Other / unrostered work</option>${shiftOptions}</select></div>`
+      : `<input type="hidden" name="shiftId" value="">`;
+
+    const needsTypePick = types.length > 1;
+    const workTypePicker = needsTypePick
+      ? `<div class="field" style="margin-bottom:16px;"><label class="field-label">Type of work (for other / unrostered work)</label><select name="workType" required>${types.map((t) => `<option value="${t}">${esc(LABOUR_TYPE_LABEL[t] || t)}</option>`).join('')}</select></div>`
+      : `<input type="hidden" name="workType" value="${types[0]}">`;
+
     return `
-      <div class="view-header"><div><h1>Hi, ${esc(l.name)}</h1><div class="sub">${fmtDateHuman(today)}</div></div></div>
-      ${rejectedBanner}
-      <div class="card" style="text-align:center;padding:28px 20px;">
-        <p class="helptext" style="margin:0;">Clocked ${fmtTimeHuman(existing.clockInAt)} – ${fmtTimeHuman(existing.clockOutAt)}</p>
-        <p style="font-size:1.3rem;font-weight:700;margin:10px 0;">${existing.hours} hrs — ${fmtMoney(existing.payAmount)}</p>
-        <p class="helptext">Submitted — waiting for manager approval.</p>
+      ${header}
+      <div class="card">
+        <h3 style="margin:0 0 8px;">${todayLogs.length ? 'Start another work entry' : "Today's work"}</h3>
+        <p class="helptext" style="margin:0 0 16px;">You can record multiple separate work periods today. Clock out of the current one before starting another. Each entry is sent separately for approval.</p>
+        <form data-onsubmit="labour-clock-in">
+          ${shiftPicker}
+          ${workTypePicker}
+          <button class="btn btn-primary" type="submit" style="width:100%;font-size:1.2rem;padding:18px;">CLOCK IN</button>
+        </form>
       </div>
+      ${todayHistory}
     `;
   }
   function viewLabourMyShifts() {
@@ -3943,28 +3944,54 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const labourId = currentLabourId();
       const l = state.labour.find((x) => x.id === labourId);
       if (!l) return;
-      const company = state.companies.find((c) => c.id === l.companyId);
+
       const today = todayStr();
-      const shiftId = form.dataset.shiftId || '';
-      const shift = shiftId ? state.labourShifts.find((s) => s.id === shiftId) : null;
-      const workType = shift ? shift.workType : fd.get('workType');
+      const currentActive = state.labourLogs.find((g) =>
+        g.labourId === labourId && g.date === today &&
+        g.status === 'InProgress' && g.clockInAt && !g.clockOutAt
+      );
+      if (currentActive) {
+        toast('Please clock out of your current work before starting another.', 'err');
+        return;
+      }
+
+      const company = state.companies.find((c) => c.id === l.companyId);
+      const shiftId = String(fd.get('shiftId') || form.dataset.shiftId || '');
+      const shift = shiftId ? state.labourShifts.find((s) =>
+        s.id === shiftId && s.labourId === labourId && s.date === today && s.published
+      ) : null;
+      if (shiftId && !shift) {
+        toast('That rostered shift is no longer available. Refresh and try again.', 'err');
+        return;
+      }
+      if (shift && state.labourLogs.some((g) => g.labourId === labourId && g.shiftId === shift.id)) {
+        toast('This rostered shift already has a work entry.', 'err');
+        return;
+      }
+
+      const types = l.labourTypes && l.labourTypes.length ? l.labourTypes : ['warehouse'];
+      const requestedType = String(fd.get('workType') || types[0]);
+      const workType = shift ? shift.workType : requestedType;
+      if (!types.includes(workType)) {
+        toast('Select a valid type of work.', 'err');
+        return;
+      }
       const category = shift ? (shift.category || 'Standard') : 'Standard';
-      const existing = state.labourLogs.find((g) => g.labourId === labourId && g.date === today);
+      const nowIso = new Date().toISOString();
       const data = {
         labourId, labourName: l.name, companyId: l.companyId, companyName: company ? company.name : '',
         shiftId: shift ? shift.id : '', date: today, workType, category,
         scheduledStart: shift ? shift.startTime : '', scheduledFinish: shift ? shift.endTime : '',
-        clockInAt: new Date().toISOString(), clockOutAt: '', hours: 0,
-        rate: 0, amount: 0,
-        payRate: 0, payAmount: 0,
+        clockInAt: nowIso, clockOutAt: '', hours: 0,
+        rate: 0, amount: 0, payRate: 0, payAmount: 0,
         tierLines: null, overridden: false,
         notes: '', status: 'InProgress', rejectionReason: '', invoiceId: null,
-        updatedAt: new Date().toISOString(),
+        submittedAt: '', createdAt: nowIso, updatedAt: nowIso,
+        approvedBy: null, approvedAt: null,
       };
-      if (existing) await state.db.doc('labourLogs/' + existing.id).update(data);
-      else await state.db.collection('labourLogs').add(Object.assign({ submittedAt: '', createdAt: new Date().toISOString(), approvedBy: null, approvedAt: null }, data));
+      await state.db.collection('labourLogs').add(data);
       await loadLabourLogs();
-      toast('Clocked in.', 'ok');
+      toast('Clocked in — this work is a separate entry.', 'ok');
       renderView();
     },
     'labour-clock-out': async (form) => {
@@ -4184,62 +4211,66 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     const driverId = currentDriverId();
     const driver = state.drivers.find((d) => d.id === driverId);
     const today = todayStr();
-    const assignment = todaysDriverAssignment(driverId, today);
-    const existing = state.driverSubmissions.find((s) => s.driverId === driverId && s.date === today);
+    const assignments = state.driverAssignments
+      .filter((a) => a.driverId === driverId && a.date === today)
+      .sort((a, b) => (a.blockName || a.companyName || '').localeCompare(b.blockName || b.companyName || ''));
+    const todaySubs = state.driverSubmissions
+      .filter((s) => s.driverId === driverId && s.date === today)
+      .sort((a, b) => (b.startTime || b.createdAt || '').localeCompare(a.startTime || a.createdAt || ''));
+    const active = todaySubs.find((s) => s.status === 'InProgress') || null;
+    const rejected = todaySubs.filter((s) => s.status === 'Rejected');
     const header = `<div class="view-header"><div><h1>Hi, ${esc(driver ? driver.name : '')}</h1><div class="sub">${fmtDateHuman(today)}</div></div></div>`;
 
-    if (existing && existing.status === 'Approved') {
-      const attempted = submissionAttempted(existing);
+    const todayHistory = todaySubs.length ? `
+      <div class="card" style="margin-top:16px;">
+        <h3 style="margin:0 0 12px;">Today's work entries (${todaySubs.length})</h3>
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th>Started</th><th>Company / Block</th><th>Vehicle</th><th>Delivered</th><th>Failed</th><th>Status</th></tr></thead>
+          <tbody>${todaySubs.map((s) => `<tr>
+            <td style="white-space:nowrap;">${s.startTime ? fmtTimeHuman(s.startTime) : '—'}</td>
+            <td>${esc(s.companyName || '—')}${s.blockName ? ' · ' + esc(s.blockName) : ''}</td>
+            <td>${esc(s.vehicle || '—')}</td>
+            <td class="tnum">${Number(s.delivered || 0)}</td>
+            <td class="tnum">${Number(s.failed || 0)}</td>
+            <td>${submissionStatusPill(s.status)}${s.submissionRef ? `<div class="helptext">${esc(s.submissionRef)}</div>` : ''}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>
+      </div>
+    ` : '';
+
+    if (active) {
       return `
         ${header}
-        <div class="card" style="text-align:center;padding:36px 20px;">
-          <p style="font-size:1.15rem;">✓ Today's submission is approved</p>
-          <p class="helptext" style="margin-top:10px;">${esc(existing.companyName)}${existing.blockName ? ' · ' + esc(existing.blockName) : ''} — Delivered ${existing.delivered}, Failed ${existing.failed} (${successRatePct(existing.delivered, attempted)}% success)</p>
-          ${existing.submissionRef ? `<p class="helptext" style="margin-top:4px;">${esc(existing.submissionRef)}</p>` : ''}
-        </div>
+        <p class="helptext" style="margin-bottom:12px;">Current work started at ${fmtTimeHuman(active.startTime)}${active.companyName ? ' — ' + esc(active.companyName) : ''}${active.blockName ? ' · ' + esc(active.blockName) : ''}. Finish this entry before starting another.</p>
+        ${finishWorkFormHtml(active, false)}
+        ${todayHistory}
       `;
     }
-    if (existing && existing.status === 'Pending') {
-      return `
-        ${header}
-        <div class="card" style="text-align:center;padding:36px 20px;">
-          <p style="font-size:1.15rem;">⏳ Submitted — waiting for manager review</p>
-          <p class="helptext" style="margin-top:10px;">${esc(existing.companyName)}${existing.blockName ? ' · ' + esc(existing.blockName) : ''} — Delivered ${existing.delivered}, Failed ${existing.failed}${existing.submissionRef ? ' · ' + esc(existing.submissionRef) : ''}</p>
-        </div>
-      `;
-    }
-    if (existing && existing.status === 'Rejected') {
-      return `
-        ${header}
-        <div class="card" style="border-left:4px solid #dc2626;margin-bottom:16px;"><strong>Correction needed:</strong> ${esc(existing.rejectionReason || 'Please review and resubmit.')}</div>
-        <p class="helptext" style="margin-bottom:12px;">${esc(existing.companyName)}${existing.blockName ? ' · ' + esc(existing.blockName) : ''} — update what's needed and resubmit. Your original numbers stay in the audit log.</p>
-        ${finishWorkFormHtml(existing, true)}
-      `;
-    }
-    if (existing && existing.status === 'InProgress') {
-      return `
-        ${header}
-        <p class="helptext" style="margin-bottom:12px;">Started at ${fmtTimeHuman(existing.startTime)}${existing.companyName ? ' — ' + esc(existing.companyName) : ''}${existing.blockName ? ' · ' + esc(existing.blockName) : ''}</p>
-        ${finishWorkFormHtml(existing, false)}
-      `;
-    }
+
+    const correctionForms = rejected.map((s) => `
+      <div class="card" style="border-left:4px solid #dc2626;margin-bottom:12px;">
+        <strong>Correction needed — ${esc(s.companyName || 'Work entry')}</strong>
+        <p class="helptext" style="margin:6px 0 12px;">${esc(s.rejectionReason || 'Please review and resubmit this entry.')}</p>
+        ${finishWorkFormHtml(s, true)}
+      </div>
+    `).join('');
+
+    const assignmentPicker = assignments.length
+      ? `<div class="field" style="margin-bottom:16px;"><label class="field-label">Today's assigned work</label><select name="assignmentId" required><option value="">Choose an assignment</option>${assignments.map((a) => `<option value="${a.id}">${esc(a.companyName || 'Company')}${a.blockName ? ' — ' + esc(a.blockName) : ''}</option>`).join('')}</select></div>`
+      : `<div class="field" style="margin-bottom:16px;"><label class="field-label">Company</label><select name="companyName" required>${companyOptions('')}</select></div>`;
+
     return `
       ${header}
+      ${correctionForms}
       <div class="card">
-        ${assignment ? `
-          <p class="field-label" style="margin-bottom:4px;">Today's assignment</p>
-          <p style="font-size:1.1rem;margin-bottom:16px;">${esc(assignment.companyName || '—')}${assignment.blockName ? ' — ' + esc(assignment.blockName) : ''}</p>
-          <form data-onsubmit="driver-start-work" data-assignment="${assignment.id}">
-            <button class="btn btn-primary" type="submit" style="width:100%;font-size:1.1rem;padding:16px;">START WORK</button>
-          </form>
-        ` : `
-          <p class="helptext" style="margin-bottom:12px;">No block assigned to you today — pick who you're working for to start.</p>
-          <form data-onsubmit="driver-start-work">
-            <div class="field" style="margin-bottom:16px;"><label class="field-label">Which company are you working for today?</label><select name="companyName" required>${companyOptions('')}</select></div>
-            <button class="btn btn-primary" type="submit" style="width:100%;font-size:1.1rem;padding:16px;">START WORK</button>
-          </form>
-        `}
+        <h3 style="margin:0 0 8px;">${todaySubs.length ? 'Start another work entry' : 'Start work'}</h3>
+        <p class="helptext" style="margin:0 0 16px;">You can submit multiple separate work entries in one day. Finish the current entry before starting the next one. Each company or block is recorded separately for review and payment.</p>
+        <form data-onsubmit="driver-start-work">
+          ${assignmentPicker}
+          <button class="btn btn-primary" type="submit" style="width:100%;font-size:1.1rem;padding:16px;">${todaySubs.length ? 'START ANOTHER WORK' : 'START WORK'}</button>
+        </form>
       </div>
+      ${todayHistory}
     `;
   }
   function viewDriverMyHistory() {
@@ -4541,25 +4572,49 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const driverId = currentDriverId();
       const driver = state.drivers.find((d) => d.id === driverId);
       const today = todayStr();
-      const existing = state.driverSubmissions.find((s) => s.driverId === driverId && s.date === today);
-      if (existing) { toast("You've already started work today.", 'err'); return; }
-      const assignmentId = form.dataset.assignment || '';
-      const assignment = assignmentId ? state.driverAssignments.find((a) => a.id === assignmentId) : null;
+      const currentActive = state.driverSubmissions.find((s) =>
+        s.driverId === driverId && s.date === today && s.status === 'InProgress'
+      );
+      if (currentActive) {
+        toast('Please finish your current work before starting another.', 'err');
+        return;
+      }
+
+      const fd = new FormData(form);
+      const assignmentId = String(fd.get('assignmentId') || form.dataset.assignment || '');
+      const assignment = assignmentId ? state.driverAssignments.find((a) =>
+        a.id === assignmentId && a.driverId === driverId && a.date === today
+      ) : null;
+      if (assignmentId && !assignment) {
+        toast('That assignment is not valid for your account or today. Refresh and try again.', 'err');
+        return;
+      }
+
       let companyName = '', blockId = '', blockName = '';
-      if (assignment) { companyName = assignment.companyName || ''; blockId = assignment.blockId || ''; blockName = assignment.blockName || ''; }
-      else { const fd = new FormData(form); companyName = fd.get('companyName') || ''; }
-      if (!companyName) { toast('Select a company to start work.', 'err'); return; }
+      if (assignment) {
+        companyName = assignment.companyName || '';
+        blockId = assignment.blockId || '';
+        blockName = assignment.blockName || '';
+      } else {
+        companyName = String(fd.get('companyName') || '');
+      }
+      if (!companyName) {
+        toast('Select a company or assigned work before starting.', 'err');
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
       await state.db.collection('driverSubmissions').add({
         driverId, driverName: driver ? driver.name : '', date: today,
         assignmentId, blockId, blockName, companyName,
-        startTime: new Date().toISOString(), finishTime: null,
+        startTime: nowIso, finishTime: null,
         delivered: 0, failed: 0, attempted: 0, failureReason: '', screenshotDataUrl: '', notes: '',
-        status: 'InProgress', rejectionReason: '', submissionRef: '',
-        submittedAt: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+        vehicle: '', status: 'InProgress', rejectionReason: '', submissionRef: '',
+        submittedAt: null, createdAt: nowIso, updatedAt: nowIso,
         approvedBy: null, approvedAt: null,
       });
       await loadDriverSubmissions();
-      toast('Work started — good luck out there!', 'ok');
+      toast('Work started — you can start another entry after finishing this one.', 'ok');
       renderView();
     },
     'driver-finish-work': async (form) => {
