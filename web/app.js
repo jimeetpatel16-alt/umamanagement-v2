@@ -429,11 +429,18 @@
     await saveSettings({ nextInvoiceNumber: num + 1 });
     return ref;
   }
-  async function claimSubmissionRef() {
-    const num = state.settings.nextSubmissionNumber || 1;
-    const ref = formatPrefix(state.settings.submissionPrefixFormat, num, '');
-    await saveSettings({ nextSubmissionNumber: num + 1 });
-    return ref;
+  // Driver submission references must not update shared Admin settings.
+  // Use the already-created submission document ID to make a stable unique
+  // reference, while still respecting the Admin-configured prefix/date tokens.
+  async function claimSubmissionRef(submissionId, dateStr) {
+    const token = String(submissionId || genId())
+      .replace(/[^a-z0-9]/gi, '')
+      .slice(-8)
+      .toUpperCase();
+    const format = state.settings.submissionPrefixFormat || 'SUB-{NUMBER}';
+    return String(format)
+      .replace('{NUMBER}', token)
+      .replace('{DATE}', String(dateStr || '').replace(/-/g, ''));
   }
   async function claimBlockRef() {
     const num = state.settings.nextBlockNumber || 1;
@@ -4586,7 +4593,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
           if (String(oldV) !== String(newV)) await writeAuditEntry('driverSubmission', existing.id, field, oldV, newV, 'Driver correction resubmit');
         }
       }
-      const ref = existing.submissionRef || await claimSubmissionRef();
+      const ref = existing.submissionRef || await claimSubmissionRef(existing.id, existing.date);
       await state.db.doc('driverSubmissions/' + id).update({
         delivered, failed, attempted, failureReason, screenshotDataUrl, notes, vehicle,
         finishTime: new Date().toISOString(), status: 'Pending', rejectionReason: '',
