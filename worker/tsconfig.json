@@ -5,13 +5,13 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "lib": [
-      "ES2022",
-      "WebWorker"
+      "ES2022"
     ],
     "types": [
       "@cloudflare/workers-types"
     ],
-    "noEmit": true
+    "noEmit": true,
+    "skipLibCheck": true
   },
   "include": [
     "src/**/*.ts"

@@ -44,7 +44,7 @@ async function digest(value: string) {
 }
 async function verifyPin(pin: string, saltHex: string, expectedHex: string) {
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveBits']);
-  const derived = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: hexToBytes(saltHex), iterations: 310000, hash: 'SHA-256' }, key, 256);
+  const derived = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: hexToBytes(saltHex), iterations: 100000, hash: 'SHA-256' }, key, 256);
   const actual = new Uint8Array(derived);
   const expected = hexToBytes(expectedHex);
   if (actual.length !== expected.length) return false;
@@ -55,7 +55,7 @@ async function verifyPin(pin: string, saltHex: string, expectedHex: string) {
 async function hashPin(pin: string) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveBits']);
-  const derived = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 310000, hash: 'SHA-256' }, key, 256);
+  const derived = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, key, 256);
   return { salt: bytesToHex(salt), hash: bytesToHex(new Uint8Array(derived)) };
 }
 function getCookie(request: Request, name: string) {
