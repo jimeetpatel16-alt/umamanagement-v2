@@ -1,30 +1,22 @@
 #!/usr/bin/env node
 /**
- * Additive import of a UMA Management full backup into the already-prepared
- * shared-document tables in remote Cloudflare D1.
+ * UMA Management remote D1 importer (command-batched edition).
+ * Reads the JSON backup locally. Uses INSERT OR IGNORE, keeps legacy relational
+ * tables untouched, removes plaintext PINs from staff documents, and stores
+ * PBKDF2-SHA256 PIN hashes in app_auth_accounts.
  *
- * IMPORTANT: This script DOES NOT run or apply any migrations. It verifies
- * that app_documents, app_auth_accounts and app_auth_sessions already exist.
- * It uses INSERT OR IGNORE so it never replaces existing app documents or
- * authentication rows. It strips plaintext PINs from staff documents and
- * stores PBKDF2-SHA256 PIN hashes in app_auth_accounts.
- *
- * Run from the worker directory:
- *   node scripts/import-backup-to-d1.mjs "$HOME/Downloads/uma-management-backup-2026-11-04.json"
+ * Run from worker/: node scripts/import-backup-to-d1.mjs "/path/to/backup.json"
  */
 import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 
 const backupPath = process.argv[2];
 if (!backupPath) {
   console.error('Usage: node scripts/import-backup-to-d1.mjs "/path/to/uma-management-backup.json"');
   process.exit(2);
 }
-const configPath = path.resolve('wrangler.toml');
-if (!fs.existsSync(configPath)) {
+if (!fs.existsSync('wrangler.toml')) {
   console.error('Run this script from the worker directory (the folder containing wrangler.toml).');
   process.exit(2);
 }
@@ -33,17 +25,17 @@ if (!fs.existsSync(backupPath)) {
   process.exit(2);
 }
 
-const config = fs.readFileSync(configPath, 'utf8');
+const config = fs.readFileSync('wrangler.toml', 'utf8');
 const dbName = config.match(/database_name\s*=\s*["']([^"']+)["']/)?.[1];
 const dbId = config.match(/database_id\s*=\s*["']([^"']+)["']/)?.[1];
 if (!dbName || !dbId || /REPLACE_WITH|YOUR_DATABASE/i.test(dbId)) {
-  console.error('wrangler.toml must contain the real D1 database_name and database_id.');
+  console.error('wrangler.toml must contain your real D1 database name and ID.');
   process.exit(2);
 }
 
 let backup;
 try { backup = JSON.parse(fs.readFileSync(backupPath, 'utf8')); }
-catch (error) { console.error(`Could not parse backup JSON: ${error.message}`); process.exit(2); }
+catch (e) { console.error(`Could not parse backup JSON: ${e.message}`); process.exit(2); }
 if (backup?.format !== 'uma-management-backup' || !backup.collections || typeof backup.collections !== 'object') {
   console.error('Unsupported backup. Expected format: uma-management-backup.');
   process.exit(2);
@@ -54,19 +46,18 @@ const allowed = new Set([
   'labour', 'labourShifts', 'labourLogs', 'invoices', 'rateCards', 'auditLog',
   'deliveryBlocks', 'driverAssignments'
 ]);
-const sql = (value) => `'${String(value).replace(/'/g, "''")}'`;
+const quote = (v) => `'${String(v).replace(/'/g, "''")}'`;
 const now = new Date().toISOString();
-const statements = [];
+const docRows = [];
+const authRows = [];
 const report = {};
-let totalDocs = 0;
-let authReady = 0;
-let authSkipped = 0;
 let malformed = 0;
+let authSkipped = 0;
 
 function normalizeMobile(value) {
   let digits = String(value || '').replace(/\D/g, '');
-  if (digits.startsWith('0061')) digits = digits.slice(2);
-  if (digits.startsWith('61')) digits = `0${digits.slice(2)}`;
+  if (digits.startsWith('0061')) digits = `0${digits.slice(4)}`;
+  else if (digits.startsWith('61')) digits = `0${digits.slice(2)}`;
   else if (digits.length === 9) digits = `0${digits}`;
   return digits;
 }
@@ -92,61 +83,77 @@ for (const [collection, rows] of Object.entries(backup.collections)) {
       const pin = String(data.pin || '');
       const mobile = normalizeMobile(data.mobile);
       delete data.pin;
-      if (pin && /^\d{4}$/.test(pin) && mobile.length >= 8 && mobile.length <= 15) {
+      if (/^\d{4}$/.test(pin) && mobile.length >= 8 && mobile.length <= 15) {
         const { salt, hash } = hashPin(pin);
-        statements.push(`INSERT OR IGNORE INTO app_auth_accounts (staff_id,mobile_norm,pin_salt_hex,pin_hash_hex,active,failed_attempts,locked_until,created_at,updated_at) VALUES (${sql(row.id)},${sql(mobile)},${sql(salt)},${sql(hash)},${data.active === false || data.active === 0 ? 0 : 1},0,NULL,${sql(createdAt)},${sql(updatedAt)});`);
-        authReady++;
-      } else {
-        authSkipped++;
-      }
+        authRows.push([row.id, mobile, salt, hash, data.active === false || data.active === 0 ? 0 : 1, 0, null, createdAt, updatedAt]);
+      } else authSkipped++;
     }
 
-    statements.push(`INSERT OR IGNORE INTO app_documents (collection,doc_id,data_json,created_at,updated_at) VALUES (${sql(collection)},${sql(row.id)},${sql(JSON.stringify(data))},${sql(createdAt)},${sql(updatedAt)});`);
-    totalDocs++;
+    docRows.push([collection, row.id, JSON.stringify(data), createdAt, updatedAt]);
   }
 }
-if (!totalDocs) {
+if (!docRows.length) {
   console.error('No supported records found. No D1 changes were made.');
   process.exit(2);
 }
 
-function runWrangler(args, options = {}) {
+function runWrangler(args) {
   return spawnSync('npx', ['wrangler', ...args], {
     encoding: 'utf8',
-    stdio: options.inherit ? 'inherit' : ['ignore', 'pipe', 'pipe'],
-    shell: process.platform === 'win32'
+    shell: process.platform === 'win32',
+    maxBuffer: 10 * 1024 * 1024
   });
+}
+function runCommand(sql, label) {
+  const result = runWrangler(['d1', 'execute', dbName, '--remote', '--command', sql]);
+  if (result.status !== 0) {
+    console.error(`\nFailed during ${label}.`);
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    throw new Error(`Wrangler exited with status ${result.status ?? 'unknown'}.`);
+  }
+  return result.stdout || '';
+}
+function makeInsertBatches(table, columns, rows, maxRows = 4, maxChars = 12000) {
+  const batches = [];
+  let current = [];
+  for (const row of rows) {
+    const tuple = `(${row.map((v) => v === null ? 'NULL' : typeof v === 'number' ? String(v) : quote(v)).join(',')})`;
+    const next = current.concat(tuple);
+    const sql = `INSERT OR IGNORE INTO ${table} (${columns.join(',')}) VALUES ${next.join(',')};`;
+    if (current.length && (next.length > maxRows || sql.length > maxChars)) {
+      batches.push(`INSERT OR IGNORE INTO ${table} (${columns.join(',')}) VALUES ${current.join(',')};`);
+      current = [tuple];
+    } else current = next;
+  }
+  if (current.length) batches.push(`INSERT OR IGNORE INTO ${table} (${columns.join(',')}) VALUES ${current.join(',')};`);
+  return batches;
 }
 
 console.log('\nUMA Management shared-D1 import preview');
 console.log(`Target database: ${dbName}`);
 console.log(`Configured D1 database ID: ${dbId}`);
 console.log(`Backup exported: ${backup.exportedAt || 'not recorded'}`);
-console.log(`Documents to insert if not already present: ${totalDocs}`);
-console.log(`Staff PIN hashes to create if not already present: ${authReady}`);
-if (authSkipped) console.log(`Staff rows requiring PIN/mobile review: ${authSkipped}`);
+console.log(`Documents prepared: ${docRows.length}`);
+console.log(`Secure staff PIN hashes prepared: ${authRows.length}`);
+if (authSkipped) console.log(`Staff rows needing PIN/mobile review: ${authSkipped}`);
 if (malformed) console.log(`Malformed rows skipped: ${malformed}`);
 for (const [name, count] of Object.entries(report)) console.log(`  ${name}: ${count}`);
-console.log('\nSafety: no migrations are run. The import uses INSERT OR IGNORE and does not delete or overwrite existing app_documents or auth rows. Plaintext PINs are not stored.');
-console.log('Note: existing legacy relational tables (for example companies/users) remain untouched.');
+console.log('\nSafety: no migrations are run; existing app_documents/auth rows are never overwritten; legacy relational tables are untouched; plaintext PINs are not stored.');
 
-// Read-only preflight: do not attempt import if the manually-created shared tables are missing.
-const preflight = runWrangler(['d1', 'execute', dbName, '--remote', '--command', "SELECT (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_documents') AS docs, (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_auth_accounts') AS auth, (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_auth_sessions') AS sessions;"]);
-if (preflight.status !== 0) {
-  process.stderr.write(preflight.stderr || preflight.stdout || 'D1 preflight failed.');
-  console.error('\nImport cancelled. Confirm that the shared-table SQL file was applied.');
-  process.exit(2);
-}
-const preflightText = `${preflight.stdout || ''}\n${preflight.stderr || ''}`;
-const missingTables = ['app_documents', 'app_auth_accounts', 'app_auth_sessions'].filter((name) => !preflightText.includes(name));
-if (missingTables.length) {
-  console.error(`\nMissing shared table(s): ${missingTables.join(', ')}. Import cancelled; no D1 data was written.`);
-  console.error(preflightText.trim());
+// Simple read-only table check (avoids compound scalar SELECT and file-upload APIs).
+const tableOutput = runCommand(
+  "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('app_documents','app_auth_accounts','app_auth_sessions') ORDER BY name;",
+  'read-only shared-table check'
+);
+const missing = ['app_documents', 'app_auth_accounts', 'app_auth_sessions'].filter((name) => !tableOutput.includes(name));
+if (missing.length) {
+  console.error(`Missing required shared table(s): ${missing.join(', ')}. No backup rows were written.`);
   process.exit(2);
 }
 
 const answer = await new Promise((resolve) => {
-  process.stdout.write('\nCompare the database ID above with Cloudflare. Type IMPORT to insert the backup into REMOTE D1: ');
+  process.stdout.write('\nCompare the database ID above with Cloudflare. Type IMPORT to write this backup to REMOTE D1: ');
   let input = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (chunk) => {
@@ -155,22 +162,23 @@ const answer = await new Promise((resolve) => {
   });
 });
 if (answer !== 'IMPORT') {
-  console.log('Cancelled. No D1 data was written.');
+  console.log('Cancelled. No backup rows were written.');
   process.exit(0);
 }
 
-const tempSql = path.join(os.tmpdir(), `uma-d1-import-${process.pid}-${Date.now()}.sql`);
-fs.writeFileSync(tempSql, statements.join('\n') + '\n', { mode: 0o600 });
 try {
-  console.log('\nImporting records into remote D1 (no migrations)...');
-  const result = spawnSync('npx', ['wrangler', 'd1', 'execute', dbName, '--remote', '--file', tempSql], {
-    stdio: 'inherit', shell: process.platform === 'win32'
-  });
-  if (result.status !== 0) throw new Error(`D1 import failed (exit ${result.status ?? 'unknown'}).`);
-  console.log('\nImport command completed. Next, verify record counts and test mobile/PIN login on the deployed Worker.');
-} catch (error) {
-  console.error(`\nImport stopped: ${error.message}`);
+  const docBatches = makeInsertBatches('app_documents', ['collection','doc_id','data_json','created_at','updated_at'], docRows);
+  const authBatches = makeInsertBatches('app_auth_accounts', ['staff_id','mobile_norm','pin_salt_hex','pin_hash_hex','active','failed_attempts','locked_until','created_at','updated_at'], authRows);
+  const batches = [...docBatches, ...authBatches];
+  console.log(`\nWriting ${docBatches.length} document batch(es) and ${authBatches.length} PIN-auth batch(es)...`);
+  for (let i = 0; i < batches.length; i++) {
+    runCommand(batches[i], `batch ${i + 1}/${batches.length}`);
+    console.log(`Completed batch ${i + 1}/${batches.length}`);
+  }
+  console.log('\nImport commands completed. Run the verification counts before deploying the updated Worker/frontend.');
+  console.log('If any batch fails, rerunning is safe: INSERT OR IGNORE skips rows already imported.');
+} catch (e) {
+  console.error(`\nImport stopped: ${e.message}`);
+  console.error('Some earlier batches may have completed. Check counts, then rerun this same script if required; INSERT OR IGNORE makes it resumable.');
   process.exitCode = 1;
-} finally {
-  try { fs.unlinkSync(tempSql); } catch {}
 }
