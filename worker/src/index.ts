@@ -62,7 +62,7 @@ function getCookie(request: Request, name: string) {
   return (request.headers.get('cookie') || '').split(';').map((part) => part.trim()).find((part) => part.startsWith(`${name}=`))?.slice(name.length + 1);
 }
 function safeAccount(id: string, data: any): Account {
-  return { id, name: String(data.name || 'User'), mobile: String(data.mobile || ''), role: String(data.role || 'staff').toLowerCase(), active: data.active !== false && data.active !== 0, driverId: data.driverId || null, labourId: data.labourId || null, companyId: data.companyId || null };
+  return { id, name: String(data.name || 'User'), mobile: String(data.mobile || ''), role: String(data.role || 'staff').trim().toLowerCase(), active: data.active !== false && data.active !== 0, driverId: data.driverId || null, labourId: data.labourId || null, companyId: data.companyId || null };
 }
 async function readDoc(env: Env, collection: string, id: string) {
   const row = await env.DB.prepare('SELECT data_json FROM app_documents WHERE collection=? AND doc_id=?').bind(collection, id).first<{ data_json: string }>();
@@ -130,11 +130,15 @@ function visibleToAccount(collection: string, row: { id: string; data: any }, ac
   return false;
 }
 function canWrite(account: Account, collection: string, method: string) {
-  if (account.role === 'admin') return true;
-  if (account.role === 'manager') return collection !== 'staff' && collection !== 'auditLog';
-  if (account.role === 'staff') return !['staff', 'auditLog', 'settings'].includes(collection);
-  if (account.role === 'driver') return collection === 'driverSubmissions' && ['POST', 'PATCH'].includes(method);
-  if (account.role === 'labour') return ['labourLogs', 'labourShifts'].includes(collection) && ['POST', 'PATCH'].includes(method);
+  const role = String(account.role || '').trim().toLowerCase();
+  const target = String(collection || '').trim();
+  const verb = String(method || '').trim().toUpperCase();
+
+  if (role === 'admin') return true;
+  if (role === 'manager') return target !== 'staff' && target !== 'auditLog';
+  if (role === 'staff') return !['staff', 'auditLog', 'settings'].includes(target);
+  if (role === 'driver') return target === 'driverSubmissions' && ['POST', 'PATCH'].includes(verb);
+  if (role === 'labour') return ['labourLogs', 'labourShifts'].includes(target) && ['POST', 'PATCH'].includes(verb);
   return false;
 }
 async function saveDocument(env: Env, collection: string, id: string, data: any, mode: 'set' | 'update', account?: Account) {
@@ -274,15 +278,16 @@ async function api(request: Request, env: Env): Promise<Response> {
     if (!canWrite(account, collection, method)) return fail('You do not have permission to update this record.', 403);
     if (collection === 'staff' && account.role !== 'admin') return fail('Only Admin can update accounts.', 403);
     const body = await jsonBody(request);
-    if (account.role === 'driver' && collection === 'driverSubmissions') {
+    if (String(account.role).trim().toLowerCase() === 'driver' && collection === 'driverSubmissions') {
       const existing = await readDoc(env, collection, id);
-      if (existing && existing.driverId !== account.driverId) return fail('Submission does not belong to this Driver account.', 403);
+      if (!existing || existing.driverId !== account.driverId) return fail('Submission does not belong to this Driver account.', 403);
+      if (body?.driverId && body.driverId !== account.driverId) return fail('Submission does not belong to this Driver account.', 403);
     }
-    if (account.role === 'labour') {
+    if (String(account.role).trim().toLowerCase() === 'labour') {
       if (!['labourLogs', 'labourShifts'].includes(collection)) return fail('Forbidden.', 403);
       const existing = await readDoc(env, collection, id);
-      if (existing && existing.labourId !== account.labourId) return fail('Record does not belong to this Labour account.', 403);
-      if (body?.labourId !== account.labourId) return fail('Record does not belong to this Labour account.', 403);
+      if (!existing || existing.labourId !== account.labourId) return fail('Record does not belong to this Labour account.', 403);
+      if (body?.labourId && body.labourId !== account.labourId) return fail('Record does not belong to this Labour account.', 403);
     }
     try { await saveDocument(env, collection, id, body, method === 'PATCH' ? 'update' : 'set', account); }
     catch (error) { return fail(error instanceof Error ? error.message : 'Could not save record.'); }
