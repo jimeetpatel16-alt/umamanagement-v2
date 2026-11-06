@@ -131,14 +131,16 @@ function visibleToAccount(collection: string, row: { id: string; data: any }, ac
 }
 function canWrite(account: Account, collection: string, method: string) {
   const role = String(account.role || '').trim().toLowerCase();
-  const target = String(collection || '').trim();
+  const target = String(collection || '').trim().toLowerCase();
   const verb = String(method || '').trim().toUpperCase();
 
   if (role === 'admin') return true;
-  if (role === 'manager') return target !== 'staff' && target !== 'auditLog';
-  if (role === 'staff') return !['staff', 'auditLog', 'settings'].includes(target);
-  if (role === 'driver') return target === 'driverSubmissions' && ['POST', 'PATCH'].includes(verb);
-  if (role === 'labour') return ['labourLogs', 'labourShifts'].includes(target) && ['POST', 'PATCH'].includes(verb);
+  if (role === 'manager') return !['staff', 'auditlog'].includes(target);
+  if (role === 'staff') return !['staff', 'auditlog', 'settings'].includes(target);
+  // Driver/Labour updates are permitted only for their own records; record
+  // ownership is checked in the update route below.
+  if (role === 'driver') return target === 'driversubmissions' && ['POST', 'PATCH', 'PUT'].includes(verb);
+  if (role === 'labour') return ['labourlogs', 'labourshifts'].includes(target) && ['POST', 'PATCH', 'PUT'].includes(verb);
   return false;
 }
 async function saveDocument(env: Env, collection: string, id: string, data: any, mode: 'set' | 'update', account?: Account) {
@@ -275,7 +277,12 @@ async function api(request: Request, env: Env): Promise<Response> {
     return json({ id: newId }, 201);
   }
   if ((method === 'PUT' || method === 'PATCH') && id) {
-    if (!canWrite(account, collection, method)) return fail('You do not have permission to update this record.', 403);
+    if (!canWrite(account, collection, method)) {
+      console.warn('UMA write permission denied', {
+        staffId: account.id, role: account.role, collection, method, recordId: id
+      });
+      return fail('You do not have permission to update this record.', 403);
+    }
     if (collection === 'staff' && account.role !== 'admin') return fail('Only Admin can update accounts.', 403);
     const body = await jsonBody(request);
     if (String(account.role).trim().toLowerCase() === 'driver' && collection === 'driverSubmissions') {
@@ -289,13 +296,78 @@ async function api(request: Request, env: Env): Promise<Response> {
       if (!existing || existing.labourId !== account.labourId) return fail('Record does not belong to this Labour account.', 403);
       if (body?.labourId && body.labourId !== account.labourId) return fail('Record does not belong to this Labour account.', 403);
     }
-    try { await saveDocument(env, collection, id, body, method === 'PATCH' ? 'update' : 'set', account); }
+    // PATCH is always partial. Some legacy Driver/Labour clients submit PUT
+    // with partial fields too, so merge those safely while preserving PUT/set
+    // behaviour for Admin/Manager/Staff document replacement flows.
+    const role = String(account.role || '').trim().toLowerCase();
+    const writeMode: 'set' | 'update' =
+      method === 'PATCH' || (method === 'PUT' && ['driver', 'labour'].includes(role))
+        ? 'update'
+        : 'set';
+    try { await saveDocument(env, collection, id, body, writeMode, account); }
     catch (error) { return fail(error instanceof Error ? error.message : 'Could not save record.'); }
     return json({ ok: true });
   }
   if (method === 'DELETE' && id) {
     if (!canWrite(account, collection, method)) return fail('You do not have permission to delete this record.', 403);
-    if (collection === 'staff' && account.role !== 'admin') return fail('Only Admin can delete accounts.', 403);
+
+    if (collection === 'staff') {
+      if (account.role !== 'admin') return fail('Only Admin can delete login accounts.', 403);
+      if (id === account.id) return fail('You cannot delete your own login.', 409);
+      const victim = await readDoc(env, 'staff', id);
+      if (!victim) return fail('Account not found.', 404);
+      if (String(victim.role || '').trim().toLowerCase() === 'admin' && victim.active !== false && victim.active !== 0) {
+        const staffRows = await listDocs(env, 'staff');
+        const activeAdmins = staffRows.filter((row) =>
+          String(row.data?.role || '').trim().toLowerCase() === 'admin' &&
+          row.data?.active !== false && row.data?.active !== 0
+        );
+        if (activeAdmins.length <= 1) return fail('Cannot delete the last active Admin account.', 409);
+      }
+    }
+
+    if (collection === 'drivers') {
+      if (account.role !== 'admin') return fail('Only Admin can delete Driver accounts.', 403);
+      const profile = await readDoc(env, 'drivers', id);
+      if (!profile) return fail('Driver account not found.', 404);
+      const staffRows = await listDocs(env, 'staff');
+      const linkedStaff = staffRows.filter((row) => String(row.data?.driverId || '') === id);
+      const statements = [
+        env.DB.prepare('DELETE FROM app_documents WHERE collection=? AND doc_id=?').bind('drivers', id),
+        env.DB.prepare("DELETE FROM app_documents WHERE collection='driverAssignments' AND json_extract(data_json, '$.driverId')=? AND json_extract(data_json, '$.date')>=?").bind(id, now().slice(0, 10))
+      ];
+      for (const staff of linkedStaff) {
+        statements.push(
+          env.DB.prepare('DELETE FROM app_documents WHERE collection=? AND doc_id=?').bind('staff', staff.id),
+          env.DB.prepare('DELETE FROM app_auth_accounts WHERE staff_id=?').bind(staff.id),
+          env.DB.prepare('DELETE FROM app_auth_sessions WHERE staff_id=?').bind(staff.id)
+        );
+      }
+      await env.DB.batch(statements);
+      return json({ ok: true, revokedLogins: linkedStaff.length, historicalSubmissionsRetained: true });
+    }
+
+    if (collection === 'labour') {
+      if (account.role !== 'admin') return fail('Only Admin can delete Labour accounts.', 403);
+      const profile = await readDoc(env, 'labour', id);
+      if (!profile) return fail('Labour account not found.', 404);
+      const staffRows = await listDocs(env, 'staff');
+      const linkedStaff = staffRows.filter((row) => String(row.data?.labourId || '') === id);
+      const statements = [
+        env.DB.prepare('DELETE FROM app_documents WHERE collection=? AND doc_id=?').bind('labour', id),
+        env.DB.prepare("DELETE FROM app_documents WHERE collection='labourShifts' AND json_extract(data_json, '$.labourId')=? AND json_extract(data_json, '$.date')>=?").bind(id, now().slice(0, 10))
+      ];
+      for (const staff of linkedStaff) {
+        statements.push(
+          env.DB.prepare('DELETE FROM app_documents WHERE collection=? AND doc_id=?').bind('staff', staff.id),
+          env.DB.prepare('DELETE FROM app_auth_accounts WHERE staff_id=?').bind(staff.id),
+          env.DB.prepare('DELETE FROM app_auth_sessions WHERE staff_id=?').bind(staff.id)
+        );
+      }
+      await env.DB.batch(statements);
+      return json({ ok: true, revokedLogins: linkedStaff.length, historicalLogsRetained: true });
+    }
+
     await env.DB.prepare('DELETE FROM app_documents WHERE collection=? AND doc_id=?').bind(collection, id).run();
     if (collection === 'staff') {
       await env.DB.prepare('DELETE FROM app_auth_accounts WHERE staff_id=?').bind(id).run();

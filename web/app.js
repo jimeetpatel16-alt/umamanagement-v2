@@ -1187,6 +1187,7 @@
           ${d.active !== false
             ? `<button class="btn btn-sm btn-danger" data-action="driver-deactivate" data-id="${d.id}">Deactivate</button>`
             : `<button class="btn btn-sm" data-action="driver-reactivate" data-id="${d.id}">Reactivate</button>`}
+          ${isAdmin() ? `<button class="btn btn-sm btn-danger" data-action="driver-delete-account" data-id="${d.id}">Delete account</button>` : ''}
         </td>
       </tr>`;
     }).join('') : `<tr><td colspan="7"><div class="empty-state">No ${driversUi.tab} drivers found.</div></td></tr>`;
@@ -1635,6 +1636,7 @@
           <button class="btn btn-sm" data-action="staff-reset-pin" data-id="${st.id}">Reset PIN</button>
           ${st.role === 'labour' || st.role === 'driver' ? '' : `<button class="btn btn-sm" data-action="staff-toggle-role" data-id="${st.id}">Cycle role</button>`}
           ${st.active !== false ? `<button class="btn btn-sm btn-danger" data-action="staff-deactivate" data-id="${st.id}">Deactivate</button>` : `<button class="btn btn-sm" data-action="staff-reactivate" data-id="${st.id}">Reactivate</button>`}
+          ${isAdmin() && (!state.session || st.id !== state.session.staffId) ? `<button class="btn btn-sm btn-danger" data-action="staff-delete-account" data-id="${st.id}">Delete login</button>` : ''}
         </td>
       </tr>
     `).join('');
@@ -2327,6 +2329,21 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       await state.db.doc('drivers/' + el.dataset.id).update({ active: true });
       await loadDrivers(); toast('Driver reactivated.', 'ok'); renderView();
     },
+    'driver-delete-account': async (el) => {
+      if (!isAdmin()) { toast('Only Admin can delete Driver accounts.', 'err'); return; }
+      const id = el.dataset.id;
+      const driver = state.drivers.find((item) => item.id === id);
+      if (!driver) return;
+      const ok = await confirmDialog(
+        `Delete ${driver.name}'s Driver profile and linked login? Historical delivery submissions and payment records will be retained; future assignments and the linked login will be removed. This cannot be undone.`,
+        { okLabel: 'Delete account', danger: true }
+      );
+      if (!ok) return;
+      await state.db.doc('drivers/' + id).delete();
+      await loadDrivers(); await loadStaff(); await loadDriverAssignments();
+      toast('Driver profile deleted; historical submissions and payments were retained.', 'ok');
+      renderView();
+    },
     'driver-tab': (el) => { driversUi.tab = el.dataset.tab; renderView(); },
 
     // Companies
@@ -2405,6 +2422,21 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       renderView();
     },
     'staff-reactivate': async (el) => { await state.db.doc('staff/' + el.dataset.id).update({ active: true }); await loadStaff(); renderView(); },
+    'staff-delete-account': async (el) => {
+      if (!isAdmin()) { toast('Only Admin can delete login accounts.', 'err'); return; }
+      const id = el.dataset.id;
+      const staff = state.staff.find((item) => item.id === id);
+      if (!staff || (state.session && state.session.staffId === id)) return;
+      const ok = await confirmDialog(
+        `Delete the ${staff.role} login for ${staff.name}? This revokes the login and all active sessions. The Driver/Labour profile and historical operations remain unless you delete that profile from its own page.`,
+        { okLabel: 'Delete login', danger: true }
+      );
+      if (!ok) return;
+      await state.db.doc('staff/' + id).delete();
+      await loadStaff();
+      toast('Login deleted and sessions revoked.', 'ok');
+      renderView();
+    },
     'settings-add-holiday': async () => {
       const input = document.getElementById('newPublicHoliday');
       const date = input ? input.value : '';
@@ -2994,6 +3026,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
           ${l.active !== false
             ? `<button class="btn btn-sm btn-danger" data-action="labour-deactivate" data-id="${l.id}">Deactivate</button>`
             : `<button class="btn btn-sm" data-action="labour-reactivate" data-id="${l.id}">Reactivate</button>`}
+          ${isAdmin() ? `<button class="btn btn-sm btn-danger" data-action="labour-delete-account" data-id="${l.id}">Delete account</button>` : ''}
         </td>
       </tr>
     `).join('') : `<tr><td colspan="9"><div class="empty-state">No ${labourUi.tab} labour found.</div></td></tr>`;
@@ -3078,6 +3111,21 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const linked = state.staff.find((s) => s.labourId === el.dataset.id);
       if (linked) await state.db.doc('staff/' + linked.id).update({ active: true });
       await loadLabour(); await loadStaff(); toast('Labour reactivated.', 'ok'); renderView();
+    },
+    'labour-delete-account': async (el) => {
+      if (!isAdmin()) { toast('Only Admin can delete Labour accounts.', 'err'); return; }
+      const id = el.dataset.id;
+      const labour = state.labour.find((item) => item.id === id);
+      if (!labour) return;
+      const ok = await confirmDialog(
+        `Delete ${labour.name}'s Labour profile and linked login? Historical Labour Logs and invoices will be retained; future rostered shifts and the linked login will be removed. This cannot be undone.`,
+        { okLabel: 'Delete account', danger: true }
+      );
+      if (!ok) return;
+      await state.db.doc('labour/' + id).delete();
+      await loadLabour(); await loadStaff(); await loadLabourShifts();
+      toast('Labour profile deleted; historical logs and invoices were retained.', 'ok');
+      renderView();
     },
   });
   Object.assign(CHANGE_HANDLERS, {
@@ -3644,6 +3692,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       <td>${g.date}</td><td>${esc(g.labourName)}</td><td>${esc(g.companyName)}</td><td>${esc(LABOUR_TYPE_LABEL[g.workType] || g.workType)}</td>
       <td>${esc(g.category || 'Standard')}<br>${tierHtml}</td>
       <td class="tnum">${scheduledHours != null ? scheduledHours : '—'}</td>
+      <td class="tnum" style="white-space:nowrap;">${g.clockInAt ? `${fmtTimeHuman(g.clockInAt)} – ${g.clockOutAt ? fmtTimeHuman(g.clockOutAt) : 'In progress'}` : '—'}</td>
       <td class="tnum">${g.hours}</td>
       <td>${varianceHtml}</td>
       <td class="tnum" style="font-weight:700;">${fmtMoney(g.amount)}</td>
@@ -3651,11 +3700,13 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       <td class="tnum">${fmtMoney(margin)}</td>
       <td class="wrap">${esc(g.notes || '')}${g.overridden ? ' <span class="pill pill-other">Overridden</span>' : ''}</td>
       <td>${g.status === 'Approved' ? '<span class="pill pill-paid">Approved</span>' : g.status === 'Rejected' ? '<span class="pill pill-cancelled">Rejected</span>' : '<span class="pill pill-pending">Pending</span>'}</td>
-      <td style="white-space:nowrap;">${g.status === 'Pending'
+      <td style="white-space:nowrap;">
+        ${isAdmin() && !g.invoiceId ? `<button class="btn btn-sm" data-action="labour-log-edit-times" data-id="${g.id}">Edit times</button><br>` : ''}
+        ${g.status === 'Pending'
         ? `<button class="btn btn-sm btn-primary" data-action="labour-log-approve" data-id="${g.id}">Approve</button> <button class="btn btn-sm btn-danger" data-action="labour-log-reject" data-id="${g.id}">Reject</button><br><button class="btn btn-sm" style="margin-top:4px;" data-action="labour-log-override" data-id="${g.id}">Override rate</button>`
-        : g.status === 'Rejected' ? `<span class="helptext">${esc(g.rejectionReason || '')}</span>` : (g.invoiceId ? '<span class="helptext">Invoiced</span>' : `<span class="helptext">Ready to invoice</span><br><button class="btn btn-sm" style="margin-top:4px;" data-action="labour-log-override" data-id="${g.id}">Override rate</button>`)}</td>
+        : g.status === 'Rejected' ? `<span class="helptext">${esc(g.rejectionReason || '')}</span>` : (g.invoiceId ? '<span class="helptext">Invoiced — time edits locked</span>' : `<span class="helptext">Ready to invoice</span><br><button class="btn btn-sm" style="margin-top:4px;" data-action="labour-log-override" data-id="${g.id}">Override rate</button>`)}</td>
     </tr>`;
-    }).join('') : `<tr><td colspan="14"><div class="empty-state">No logs.</div></td></tr>`;
+    }).join('') : `<tr><td colspan="15"><div class="empty-state">No logs.</div></td></tr>`;
     const recentAudit = state.auditLog.filter((a) => a.entityType === 'labourLog').slice(0, 15);
     const auditHtml = recentAudit.length ? `
       <div class="section-title"><h2>Recent rate overrides</h2></div>
@@ -3673,7 +3724,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         </select>
       </div>
       ${capNoticeHtml(cap)}
-      <div class="table-wrap"><table class="data"><thead><tr><th>Date</th><th>Labour</th><th>Company</th><th>Type</th><th>Category / Tiers</th><th>Scheduled</th><th>Actual</th><th>Variance</th><th>Bill Amount</th><th>Pay Amount</th><th>Margin</th><th>Notes</th><th>Status</th><th>Actions</th></tr></thead><tbody>${body}</tbody></table></div>
+      <div class="table-wrap"><table class="data"><thead><tr><th>Date</th><th>Labour</th><th>Company</th><th>Type</th><th>Category / Tiers</th><th>Scheduled</th><th>Clock times</th><th>Actual hours</th><th>Variance</th><th>Bill Amount</th><th>Pay Amount</th><th>Margin</th><th>Notes</th><th>Status</th><th>Actions</th></tr></thead><tbody>${body}</tbody></table></div>
       <p class="helptext" style="margin-top:12px;">Bill Amount is what will be invoiced to the company; Pay Amount is what the labour person earns. Approving a log makes those hours billable — generate an invoice for the company to include them. "Override rate" lets an authorised manager adjust the computed amounts, with a mandatory reason recorded below.</p>
       ${auditHtml}
     `;
@@ -3690,6 +3741,35 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       </form>
     `);
   }
+  function labourDateTimeInputValue(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (!Number.isFinite(d.getTime())) return '';
+    const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+    return local.toISOString().slice(0, 16);
+  }
+  function labourLogEditTimesModal(logId) {
+    if (!isAdmin()) { toast('Only Admin can edit Labour clock times.', 'err'); return; }
+    const log = state.labourLogs.find((g) => g.id === logId);
+    if (!log) return;
+    if (log.invoiceId) { toast('This log is invoiced; its clock times are locked.', 'err'); return; }
+    openModal(`
+      <div class="modal-head"><h3>Edit clock times — ${esc(log.labourName)} · ${esc(log.date)}</h3><button data-action="modal-close" aria-label="Close">✕</button></div>
+      <p class="helptext" style="margin-bottom:12px;">Times are shown in your device's local timezone. Actual hours, bill amount and worker pay are recalculated. A reason is required and the changes are recorded in the audit log.</p>
+      <form data-onsubmit="labour-log-edit-times-save" data-id="${logId}">
+        <div class="field-row" style="margin-bottom:12px;">
+          <div class="field"><label class="field-label">Clock-in</label><input type="datetime-local" name="clockInAt" value="${esc(labourDateTimeInputValue(log.clockInAt))}" required></div>
+          <div class="field"><label class="field-label">Clock-out</label><input type="datetime-local" name="clockOutAt" value="${esc(labourDateTimeInputValue(log.clockOutAt))}" required></div>
+        </div>
+        <div class="field"><label class="field-label">Reason for correction</label><textarea name="reason" rows="2" required placeholder="Explain why the recorded times are being corrected"></textarea></div>
+        <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;">
+          <button type="button" class="btn" data-action="modal-close">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save times</button>
+        </div>
+      </form>
+    `, { wide: true });
+  }
+
   // Writes one immutable auditLog entry per changed field — used whenever an
   // authorised manager manually overrides a computed rate/amount.
   async function writeAuditEntry(entityType, entityId, field, oldValue, newValue, reason) {
@@ -3816,6 +3896,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       renderView();
     },
     'labour-log-reject': (el) => labourLogRejectModal(el.dataset.id),
+    'labour-log-edit-times': (el) => labourLogEditTimesModal(el.dataset.id),
     'labour-log-override': (el) => labourLogOverrideModal(el.dataset.id),
     'invoice-generate': () => invoiceGenerateModal(),
     'invoice-view': (el) => invoiceViewModal(el.dataset.id),
@@ -3910,6 +3991,52 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       await state.db.doc('labourLogs/' + id).update({ status: 'Rejected', rejectionReason: fd.get('reason'), updatedAt: new Date().toISOString() });
       await loadLabourLogs();
       closeModal(); toast('Log rejected.', 'ok'); renderView();
+    },
+    'labour-log-edit-times-save': async (form) => {
+      if (!isAdmin()) { toast('Only Admin can edit Labour clock times.', 'err'); return; }
+      const fd = new FormData(form);
+      const id = form.dataset.id;
+      const log = state.labourLogs.find((g) => g.id === id);
+      if (!log) return;
+      if (log.invoiceId) { toast('This log is invoiced; its clock times are locked.', 'err'); return; }
+      const clockIn = new Date(String(fd.get('clockInAt') || ''));
+      const clockOut = new Date(String(fd.get('clockOutAt') || ''));
+      const reason = String(fd.get('reason') || '').trim();
+      if (!Number.isFinite(clockIn.getTime()) || !Number.isFinite(clockOut.getTime()) || clockOut <= clockIn) {
+        toast('Clock-out must be later than clock-in.', 'err'); return;
+      }
+      if (!reason) { toast('A reason is required.', 'err'); return; }
+      const company = state.companies.find((c) => c.id === log.companyId);
+      const labourPerson = state.labour.find((l) => l.id === log.labourId);
+      if (!company || !labourPerson) { toast('Linked company or labour profile not found. No changes saved.', 'err'); return; }
+      const hours = Math.round(((clockOut.getTime() - clockIn.getTime()) / 3600000) * 100) / 100;
+      const pad = (n) => String(n).padStart(2, '0');
+      const localStart = pad(clockIn.getHours()) + ':' + pad(clockIn.getMinutes());
+      const startForRates = log.scheduledStart || localStart;
+      const cost = summarizeShiftCost(company, labourPerson, log.category || 'Standard', log.date, startForRates, hours);
+      const amount = cost.billAmount, payAmount = cost.payAmount;
+      const rate = hours > 0 ? Math.round(amount / hours * 100) / 100 : 0;
+      const payRate = hours > 0 ? Math.round(payAmount / hours * 100) / 100 : 0;
+      const patch = {
+        clockInAt: clockIn.toISOString(), clockOutAt: clockOut.toISOString(),
+        hours, amount, payAmount, rate, payRate,
+        tierLines: cost.lines, usedRateCard: cost.usedRateCard,
+        timeEdited: true, timeEditedBy: state.session ? state.session.name : 'Admin',
+        timeEditedAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+      };
+      await state.db.doc('labourLogs/' + id).update(patch);
+      const changes = [
+        ['clockInAt', log.clockInAt || '', patch.clockInAt],
+        ['clockOutAt', log.clockOutAt || '', patch.clockOutAt],
+        ['hours', Number(log.hours) || 0, hours],
+        ['amount (bill)', Number(log.amount) || 0, amount],
+        ['payAmount (pay)', Number(log.payAmount) || 0, payAmount]
+      ];
+      for (const [field, oldValue, newValue] of changes) {
+        if (String(oldValue) !== String(newValue)) await writeAuditEntry('labourLog', id, field, oldValue, newValue, reason);
+      }
+      await loadLabourLogs(); await loadAuditLog();
+      closeModal(); toast('Clock times updated; hours and pay recalculated.', 'ok'); renderView();
     },
     'labour-log-override-save': async (form) => {
       const fd = new FormData(form);
@@ -4007,10 +4134,19 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   function finishWorkFormHtml(existing, isCorrection) {
     const s = state.settings;
     const failed0 = Number(existing.failed) || 0;
+    const linkedDriver = state.drivers.find((d) => d.id === existing.driverId);
+    const defaultVehicle = existing.vehicle || (linkedDriver && ['Car', 'Van'].includes(linkedDriver.vehicleType) ? linkedDriver.vehicleType : 'Car');
     const failureOptions = (s.failureReasons || []).map((r) => `<option value="${esc(r)}" ${existing.failureReason === r ? 'selected' : ''}>${esc(r)}</option>`).join('');
     return `
       <div class="card">
         <form data-onsubmit="driver-finish-work" data-id="${existing.id}">
+          <div class="field" style="margin-bottom:14px;">
+            <label class="field-label" style="font-size:0.95rem;">Vehicle used today</label>
+            <select name="vehicle" required>
+              <option value="Car" ${defaultVehicle === 'Car' ? 'selected' : ''}>🚗 Car</option>
+              <option value="Van" ${defaultVehicle === 'Van' ? 'selected' : ''}>🚐 Van</option>
+            </select>
+          </div>
           <div class="field-row">
             <div class="field"><label class="field-label" style="font-size:0.95rem;">Deliveries completed</label><input type="number" min="0" name="delivered" required value="${existing.delivered != null ? existing.delivered : ''}" style="font-size:1.6rem;padding:14px;text-align:center;" data-onchange="driver-finish-recalc"></div>
             <div class="field"><label class="field-label" style="font-size:0.95rem;">Deliveries failed</label><input type="number" min="0" name="failed" value="${existing.failed != null ? existing.failed : 0}" style="font-size:1.6rem;padding:14px;text-align:center;" data-onchange="driver-finish-recalc"></div>
@@ -4105,15 +4241,15 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     const body = rows.length ? rows.map((s) => {
       const attempted = submissionAttempted(s);
       return `<tr>
-      <td>${s.date}</td><td>${esc(s.companyName)}${s.blockName ? ' · ' + esc(s.blockName) : ''}</td><td class="tnum">${s.delivered}</td><td class="tnum">${s.failed}</td>
+      <td>${s.date}</td><td>${esc(s.companyName)}${s.blockName ? ' · ' + esc(s.blockName) : ''}</td><td>${esc(s.vehicle || '—')}</td><td class="tnum">${s.delivered}</td><td class="tnum">${s.failed}</td>
       <td class="tnum">${s.status === 'InProgress' ? '—' : successRatePct(s.delivered, attempted) + '%'}</td>
       <td>${s.screenshotDataUrl ? `<img src="${s.screenshotDataUrl}" data-action="view-screenshot" data-id="${s.id}" style="width:32px;height:32px;object-fit:cover;border-radius:6px;cursor:pointer;border:1px solid var(--border);">` : '—'}</td>
       <td>${submissionStatusPill(s.status)}</td>
     </tr>`;
-    }).join('') : `<tr><td colspan="7"><div class="empty-state">No submissions yet.</div></td></tr>`;
+    }).join('') : `<tr><td colspan="8"><div class="empty-state">No submissions yet.</div></td></tr>`;
     return `
       <div class="view-header"><div><h1>My Submissions</h1></div></div>
-      <div class="table-wrap"><table class="data"><thead><tr><th>Date</th><th>Company / Block</th><th>Delivered</th><th>Failed</th><th>Success</th><th>Photo</th><th>Status</th></tr></thead><tbody>${body}</tbody></table></div>
+      <div class="table-wrap"><table class="data"><thead><tr><th>Date</th><th>Company / Block</th><th>Vehicle</th><th>Delivered</th><th>Failed</th><th>Success</th><th>Photo</th><th>Status</th></tr></thead><tbody>${body}</tbody></table></div>
     `;
   }
 
@@ -4130,6 +4266,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const attempted = submissionAttempted(s);
       return `<tr>
       <td>${s.date}</td><td>${esc(s.driverName)}</td><td>${esc(s.companyName)}${s.blockName ? ' · ' + esc(s.blockName) : ''}</td>
+      <td>${esc(s.vehicle || '—')}</td>
       <td class="tnum">${s.delivered}</td><td class="tnum">${s.failed}</td><td class="tnum">${attempted}</td>
       <td class="tnum">${s.status === 'InProgress' ? '—' : successRatePct(s.delivered, attempted) + '%'}</td>
       <td>${esc(s.failureReason || '—')}</td>
@@ -4140,7 +4277,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         ? `<button class="btn btn-sm btn-primary" data-action="driver-sub-approve" data-id="${s.id}">Approve</button> <button class="btn btn-sm btn-danger" data-action="driver-sub-reject" data-id="${s.id}">Request correction</button>`
         : s.status === 'Rejected' ? `<span class="helptext">${esc(s.rejectionReason || '')}</span>` : s.status === 'InProgress' ? `<span class="helptext">Started ${fmtTimeHuman(s.startTime)}</span>` : '—'}</td>
     </tr>`;
-    }).join('') : `<tr><td colspan="12"><div class="empty-state">No submissions.</div></td></tr>`;
+    }).join('') : `<tr><td colspan="13"><div class="empty-state">No submissions.</div></td></tr>`;
     const recentAudit = state.auditLog.filter((a) => a.entityType === 'driverSubmission').slice(0, 15);
     const auditHtml = recentAudit.length ? `
       <div class="section-title"><h2>Recent corrections</h2></div>
@@ -4160,7 +4297,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         </select>
       </div>
       ${capNoticeHtml(cap)}
-      <div class="table-wrap"><table class="data"><thead><tr><th>Date</th><th>Driver</th><th>Company / Block</th><th>Delivered</th><th>Failed</th><th>Attempted</th><th>Success</th><th>Failure reason</th><th>Photo</th><th>Notes</th><th>Status</th><th>Actions</th></tr></thead><tbody>${body}</tbody></table></div>
+      <div class="table-wrap"><table class="data"><thead><tr><th>Date</th><th>Driver</th><th>Company / Block</th><th>Vehicle</th><th>Delivered</th><th>Failed</th><th>Attempted</th><th>Success</th><th>Failure reason</th><th>Photo</th><th>Notes</th><th>Status</th><th>Actions</th></tr></thead><tbody>${body}</tbody></table></div>
       <p class="helptext" style="margin-top:12px;">Approving a submission creates the matching driver payment record automatically (Deliveries completed → Parcels), using the same rate/prefix logic as Daily Entry — it will appear on Records, Payments and the Excel export. Requesting a correction sends it back to the driver; their resubmission is recorded in the audit log alongside the original values.</p>
       ${auditHtml}
     `;
@@ -4335,7 +4472,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const sub = state.driverSubmissions.find((s) => s.id === el.dataset.id);
       if (!sub) return;
       const driver = state.drivers.find((d) => d.id === sub.driverId) || driverByNameLoose(sub.driverName);
-      const vehicle = (driver && driver.vehicleType) || 'Car';
+      const vehicle = sub.vehicle || (driver && driver.vehicleType) || 'Car';
       const summaryNotes = `Delivered ${sub.delivered}, Failed ${sub.failed}.${sub.notes ? ' ' + sub.notes : ''}`;
       const n = await commitEntryRows(sub.date, [{ id: genId(), driverName: sub.driverName, vehicle, companyName: sub.companyName, parcels: sub.delivered, bonus: 0, adjustment: 0, notes: summaryNotes }]);
       if (n < 0) return; // cancelled (e.g. the duplicate-record warning was declined)
@@ -4433,6 +4570,8 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       }
       const screenshotDataUrl = newScreenshot || existing.screenshotDataUrl || '';
       const failureReason = failed > 0 ? (fd.get('failureReason') || '') : '';
+      const vehicle = String(fd.get('vehicle') || existing.vehicle || 'Car');
+      if (!['Car', 'Van'].includes(vehicle)) { toast('Select Car or Van.', 'err'); return; }
       const notes = fd.get('notes') || '';
       const wasRejected = existing.status === 'Rejected';
       if (wasRejected) {
@@ -4440,6 +4579,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         const changed = [
           ['delivered', existing.delivered, delivered],
           ['failed', existing.failed, failed],
+          ['vehicle', existing.vehicle || 'Car', vehicle],
           ['notes', existing.notes || '', notes],
         ];
         for (const [field, oldV, newV] of changed) {
@@ -4448,7 +4588,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       }
       const ref = existing.submissionRef || await claimSubmissionRef();
       await state.db.doc('driverSubmissions/' + id).update({
-        delivered, failed, attempted, failureReason, screenshotDataUrl, notes,
+        delivered, failed, attempted, failureReason, screenshotDataUrl, notes, vehicle,
         finishTime: new Date().toISOString(), status: 'Pending', rejectionReason: '',
         submissionRef: ref, submittedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       });
