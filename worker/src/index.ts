@@ -3,6 +3,7 @@ interface Env {
   EVIDENCE?: R2Bucket;
   ASSETS: Fetcher;
   SESSION_DAYS?: string;
+  GOOGLE_MAPS_API_KEY?: string;
 }
 
 type Account = {
@@ -21,7 +22,7 @@ type StoredDoc = { collection: string; doc_id: string; data_json: string; create
 const COLLECTIONS = new Set([
   'settings', 'staff', 'drivers', 'companies', 'days', 'driverSubmissions',
   'labour', 'labourShifts', 'labourLogs', 'invoices', 'rateCards', 'auditLog',
-  'deliveryBlocks', 'driverAssignments'
+  'deliveryBlocks', 'driverAssignments', 'routes'
 ]);
 const now = () => new Date().toISOString();
 const uid = () => crypto.randomUUID();
@@ -69,6 +70,59 @@ async function readDoc(env: Env, collection: string, id: string) {
   if (!row) return null;
   try { return JSON.parse(row.data_json); } catch { return null; }
 }
+// ---- Route planner: address lookup ---------------------------------------
+// Addresses are turned into map points with the Google Geocoding API (key kept
+// as the GOOGLE_MAPS_API_KEY secret). Every successful lookup is cached in the
+// internal 'geocache' collection (not exposed through /api/data), so the same
+// address is only ever paid for once.
+type GeoResult = { lat: number; lng: number; formatted: string; precision: string; partial: boolean } | { error: string };
+function normaliseAddress(address: string) {
+  return address.toLowerCase().replace(/[^\p{L}\p{N}/,\- ]+/gu, ' ').replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
+}
+async function geocodeOne(env: Env, address: string): Promise<GeoResult> {
+  if (!address) return { error: 'Empty address' };
+  const key = 'g_' + (await digest(normaliseAddress(address))).slice(0, 40);
+  const cached = await readDoc(env, 'geocache', key);
+  if (cached && Number.isFinite(cached.lat) && Number.isFinite(cached.lng)) {
+    return { lat: cached.lat, lng: cached.lng, formatted: cached.formatted || address, precision: cached.precision || '', partial: !!cached.partial };
+  }
+  if (!env.GOOGLE_MAPS_API_KEY) return { error: 'Route planning is not switched on yet (Google Maps key missing).' };
+  const url = 'https://maps.googleapis.com/maps/api/geocode/json?region=au&components=country:AU&address=' + encodeURIComponent(address) + '&key=' + env.GOOGLE_MAPS_API_KEY;
+  let data: any;
+  try {
+    const res = await fetch(url);
+    data = await res.json();
+  } catch {
+    return { error: 'Could not reach Google Maps. Try again.' };
+  }
+  if (data?.status === 'ZERO_RESULTS') return { error: 'Address not found' };
+  if (data?.status !== 'OK' || !data.results?.length) {
+    console.warn('Geocode failed', data?.status, data?.error_message);
+    return { error: data?.status === 'REQUEST_DENIED' ? 'Google Maps key was refused. Check the key and that Geocoding API is enabled.'
+      : data?.status === 'OVER_QUERY_LIMIT' ? 'Google Maps limit reached. Try again shortly.' : 'Address lookup failed' };
+  }
+  const top = data.results[0];
+  const result = {
+    lat: Number(top.geometry?.location?.lat), lng: Number(top.geometry?.location?.lng),
+    formatted: String(top.formatted_address || address), precision: String(top.geometry?.location_type || ''), partial: !!top.partial_match,
+  };
+  if (!Number.isFinite(result.lat) || !Number.isFinite(result.lng)) return { error: 'Address lookup failed' };
+  await saveDocument(env, 'geocache', key, { ...result, query: address }, 'set');
+  return result;
+}
+async function geocodeAddresses(env: Env, addresses: string[]): Promise<GeoResult[]> {
+  const out: GeoResult[] = new Array(addresses.length);
+  const unique = new Map<string, number[]>();
+  addresses.forEach((a, i) => { const k = normaliseAddress(a); unique.set(k, [...(unique.get(k) || []), i]); });
+  const jobs = [...unique.values()];
+  for (let i = 0; i < jobs.length; i += 8) {
+    const batch = jobs.slice(i, i + 8);
+    const res = await Promise.all(batch.map((idx) => geocodeOne(env, addresses[idx[0]])));
+    batch.forEach((idx, j) => idx.forEach((k) => { out[k] = res[j]; }));
+  }
+  return out;
+}
+
 // Labour clock-in/out site check. Mirrors checkLabourSite() in web/app.js:
 // allowed when (distance - min(accuracy, 50 m)) <= the company's radius.
 function distanceMetres(lat1: number, lng1: number, lat2: number, lng2: number) {
@@ -126,6 +180,7 @@ function visibleToAccount(collection: string, row: { id: string; data: any }, ac
     return true;
   }
   if (collection === 'staff') return row.id === account.id;
+  if (collection === 'settings') return true; // filtered by publicView()
   if (account.role === 'driver') {
     const driverId = account.driverId;
     if (collection === 'drivers') return row.id === driverId;
@@ -139,6 +194,7 @@ function visibleToAccount(collection: string, row: { id: string; data: any }, ac
       return owned.length > 0;
     }
     if (collection === 'deliveryBlocks') return true;
+    if (collection === 'routes') return row.data.driverId === driverId;
     return false;
   }
   if (account.role === 'labour') {
@@ -151,6 +207,15 @@ function visibleToAccount(collection: string, row: { id: string; data: any }, ac
   }
   return false;
 }
+// Drivers and Labour may read only a few harmless Settings fields (never bank,
+// ABN or rate details).
+const PUBLIC_SETTINGS = ['businessName', 'failureReasons', 'routeDepotAddress'];
+function publicView(collection: string, data: any, account: Account) {
+  if (collection !== 'settings' || ['admin', 'manager', 'staff'].includes(account.role)) return data;
+  const out: Record<string, unknown> = {};
+  for (const k of PUBLIC_SETTINGS) if (data && k in data) out[k] = data[k];
+  return out;
+}
 function canWrite(account: Account, collection: string, method: string) {
   const role = String(account.role || '').trim().toLowerCase();
   const target = String(collection || '').trim().toLowerCase();
@@ -161,7 +226,7 @@ function canWrite(account: Account, collection: string, method: string) {
   if (role === 'staff') return !['staff', 'auditlog', 'settings'].includes(target);
   // Driver/Labour updates are permitted only for their own records; record
   // ownership is checked in the update route below.
-  if (role === 'driver') return target === 'driversubmissions' && ['POST', 'PATCH', 'PUT'].includes(verb);
+  if (role === 'driver') return ['driversubmissions', 'routes'].includes(target) && ['POST', 'PATCH', 'PUT'].includes(verb);
   if (role === 'labour') return ['labourlogs', 'labourshifts'].includes(target) && ['POST', 'PATCH', 'PUT'].includes(verb);
   return false;
 }
@@ -267,6 +332,18 @@ async function api(request: Request, env: Env): Promise<Response> {
     return createSession(request, env, safeAccount(id, profile));
   }
 
+  if (path === '/api/route/geocode' && method === 'POST') {
+    const account = await currentAccount(request, env);
+    if (!account) return fail('Sign in required.', 401);
+    if (!['admin', 'manager', 'staff', 'driver'].includes(account.role)) return fail('Forbidden.', 403);
+    const body = await jsonBody(request);
+    const addresses: string[] = Array.isArray(body?.addresses) ? body.addresses.map((a: unknown) => String(a || '').trim()) : [];
+    if (!addresses.length) return fail('No addresses to look up.');
+    if (addresses.length > 300) return fail('Too many stops in one go (300 max).');
+    const results = await geocodeAddresses(env, addresses);
+    return json({ results });
+  }
+
   const match = path.match(/^\/api\/data\/([A-Za-z0-9_-]+)(?:\/([^/]+))?$/);
   if (!match) return fail('API route not found.', 404);
   const collection = match[1];
@@ -280,12 +357,12 @@ async function api(request: Request, env: Env): Promise<Response> {
   if (method === 'GET' && !id) {
     const rows = await listDocs(env, collection);
     const visible = rows.filter((row) => visibleToAccount(collection, row, account, ownDriver, ownLabour));
-    return json({ docs: visible.map((row) => ({ id: row.id, data: row.data })) });
+    return json({ docs: visible.map((row) => ({ id: row.id, data: publicView(collection, row.data, account) })) });
   }
   if (method === 'GET' && id) {
     const data = await readDoc(env, collection, id);
     if (!data || !visibleToAccount(collection, { id, data }, account, ownDriver, ownLabour)) return json({ id, exists: false, data: null });
-    return json({ id, exists: true, data });
+    return json({ id, exists: true, data: publicView(collection, data, account) });
   }
   if (method === 'POST' && !id) {
     if (!canWrite(account, collection, method)) return fail('You do not have permission to create this record.', 403);
@@ -311,10 +388,10 @@ async function api(request: Request, env: Env): Promise<Response> {
     }
     if (collection === 'staff' && account.role !== 'admin') return fail('Only Admin can update accounts.', 403);
     const body = await jsonBody(request);
-    if (String(account.role).trim().toLowerCase() === 'driver' && collection === 'driverSubmissions') {
+    if (String(account.role).trim().toLowerCase() === 'driver' && ['driverSubmissions', 'routes'].includes(collection)) {
       const existing = await readDoc(env, collection, id);
-      if (!existing || existing.driverId !== account.driverId) return fail('Submission does not belong to this Driver account.', 403);
-      if (body?.driverId && body.driverId !== account.driverId) return fail('Submission does not belong to this Driver account.', 403);
+      if (!existing || existing.driverId !== account.driverId) return fail('Record does not belong to this Driver account.', 403);
+      if (body?.driverId && body.driverId !== account.driverId) return fail('Record does not belong to this Driver account.', 403);
     }
     if (String(account.role).trim().toLowerCase() === 'labour') {
       if (!['labourLogs', 'labourShifts'].includes(collection)) return fail('Forbidden.', 403);

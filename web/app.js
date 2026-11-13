@@ -145,6 +145,8 @@
     // and the day-by-day assignment linking a driver to one for a given date.
     deliveryBlocks: [],
     driverAssignments: [],
+    // Route planner: one doc per uploaded run sheet (see viewDriverRoute()).
+    routes: [],
   };
 
   const SESSION_KEY = 'driverpay_session';
@@ -398,7 +400,7 @@
     await Promise.all([
       loadSettings(), loadStaff(), loadDrivers(), loadCompanies(), loadDays(),
       loadDriverSubmissions(), loadLabour(), loadLabourShifts(), loadLabourLogs(), loadInvoices(),
-      loadRateCards(), loadAuditLog(), loadDeliveryBlocks(), loadDriverAssignments(),
+      loadRateCards(), loadAuditLog(), loadDeliveryBlocks(), loadDriverAssignments(), loadRoutes(),
     ]);
   }
 
@@ -531,10 +533,12 @@
     { id: 'delivery-blocks', label: 'Delivery Blocks', mono: 'BK', roles: ['admin', 'manager'] },
     { id: 'driver-assignments', label: 'Driver Assignments', mono: 'AS', roles: ['admin', 'manager'] },
     { id: 'driver-performance', label: 'Driver Performance', mono: 'DP', roles: ['admin', 'manager'] },
+    { id: 'routes', label: 'Routes', mono: 'RO', roles: ['admin', 'manager'] },
     { id: 'labour-logs', label: 'Labour Logs', mono: 'LL', roles: ['admin', 'manager'] },
     { id: 'invoices', label: 'Invoices', mono: 'IV', roles: ['admin', 'manager'] },
     { id: 'export', label: 'Excel Export', mono: 'XL', roles: ['admin', 'manager', 'staff'] },
     { id: 'settings', label: 'Settings', mono: 'ST', roles: ['admin'] },
+    { id: 'driver-route', label: 'Route', mono: 'RT', roles: ['driver'] },
     { id: 'driver-submit', label: "Today's Deliveries", mono: 'DD', roles: ['driver'] },
     { id: 'driver-my-history', label: 'My Submissions', mono: 'MS', roles: ['driver'] },
     { id: 'labour-log', label: 'Today', mono: 'LW', roles: ['labour'] },
@@ -1712,6 +1716,15 @@
       </div>
 
       <div class="card" style="margin-bottom:18px;">
+        <h3 style="margin-bottom:4px;">Route planner</h3>
+        <p class="helptext" style="margin:0 0 14px;">Drivers can start their route from here instead of their current location. Address lookups use Google Maps (set up once by adding the GOOGLE_MAPS_API_KEY secret in Cloudflare).</p>
+        <form data-onsubmit="settings-save-route" style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;">
+          <div class="field" style="flex:1;min-width:240px;"><label class="field-label">Depot address</label><input type="text" name="routeDepotAddress" value="${esc(s.routeDepotAddress || '')}" placeholder="Street, Suburb STATE Postcode"></div>
+          <button class="btn btn-primary" type="submit">Save</button>
+        </form>
+      </div>
+
+      <div class="card" style="margin-bottom:18px;">
         <h3 style="margin-bottom:4px;">Invoice details</h3>
         <p class="helptext" style="margin:0 0 14px;">Printed on every invoice PDF. Workers' pay and your margin are never shown on invoices.</p>
         <form data-onsubmit="settings-save-invoice">
@@ -2045,14 +2058,466 @@
     'labour-log': () => viewLabourLog(), 'labour-my-shifts': () => viewLabourMyShifts(), 'labour-my-history': () => viewLabourMyHistory(), 'labour-logs': () => viewLabourLogs(),
     invoices: () => viewInvoices(),
     'driver-submissions': () => viewDriverSubmissions(), 'driver-submit': () => viewDriverSubmit(), 'driver-my-history': () => viewDriverMyHistory(),
+    'driver-route': () => viewDriverRoute(), routes: () => viewRoutesAdmin(),
     'delivery-blocks': () => viewDeliveryBlocks(), 'driver-assignments': () => viewDriverAssignments(), 'driver-performance': () => viewDriverPerformance(),
   };
+  // ---------------------------------------------------------------
+  // Route planner (Spoke-style)
+  // ---------------------------------------------------------------
+  // A driver uploads the day's run sheet (.xlsx or .csv). Rows are grouped by
+  // address into stops, looked up with Google via /api/route/geocode (cached
+  // server-side), put into a short driving order in the browser (nearest
+  // neighbour + 2-opt on straight-line distance), and saved as a 'routes' doc.
+  // The driver works through the stops and ticks Delivered / Failed; the
+  // counts pre-fill their daily submission. Admin/Manager see every route.
+  const routeUi = { draft: null, busy: '', adminDate: '', viewId: null, showAll: false };
+  const ROUTE_FIELDS = [
+    ['address', 'Street address', /^(delivery |receiver |consignee |customer |recipient )?(street )?(address|addr)( ?line ?1)?$|^street$|address 1|address line 1|delivery address/],
+    ['suburb', 'Suburb / city', /suburb|city|town|locality/],
+    ['state', 'State', /^state$|^st$|province|region/],
+    ['postcode', 'Postcode', /post ?code|zip|^pc$|pcode/],
+    ['name', 'Recipient name', /recipient|consignee|receiver|customer|^name$|full name|contact name/],
+    ['phone', 'Phone', /phone|mobile|^tel|contact (no|number)/],
+    ['ref', 'Parcel / tracking no.', /tracking|consignment|connote|con note|parcel ?(id|no|number)|barcode|article|reference|^ref|order (no|id|number)|label/],
+    ['parcels', 'Number of parcels', /^(qty|quantity|pieces|pcs|parcels|items|item count|count)$/],
+    ['notes', 'Delivery notes', /note|instruction|comment|remark|special/],
+  ];
+  const FAIL_REASONS = ['Nobody home', 'Address not found', 'No safe place', 'Access issue', 'Refused', 'Damaged', 'Other'];
+
+  async function loadRoutes() {
+    const q = await state.db.collection('routes').get();
+    state.routes = q.docs.map((d) => Object.assign({ id: d.id }, d.data()));
+    state.routes.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  }
+  function todaysRoute(driverId) {
+    const today = todayStr();
+    return (state.routes || []).find((r) => r.driverId === driverId && r.date === today && r.status !== 'archived') || null;
+  }
+  function routeCounts(route) {
+    const stops = (route && route.stops) || [];
+    const parcels = (s) => Number(s.parcels) || 1;
+    return {
+      stops: stops.length,
+      done: stops.filter((s) => s.status !== 'pending').length,
+      delivered: stops.filter((s) => s.status === 'delivered').reduce((n, s) => n + parcels(s), 0),
+      failed: stops.filter((s) => s.status === 'failed').reduce((n, s) => n + parcels(s), 0),
+      parcels: stops.reduce((n, s) => n + parcels(s), 0),
+    };
+  }
+
+  // ---- Reading the run sheet ----
+  function parseCsv(text) {
+    const rows = []; let row = []; let cell = ''; let quoted = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (quoted) {
+        if (ch === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+        else if (ch === '"') quoted = false;
+        else cell += ch;
+      } else if (ch === '"') quoted = true;
+      else if (ch === ',' || ch === '\t' || ch === ';') { row.push(cell); cell = ''; }
+      else if (ch === '\n' || ch === '\r') {
+        if (ch === '\r' && text[i + 1] === '\n') i++;
+        row.push(cell); rows.push(row); row = []; cell = '';
+      } else cell += ch;
+    }
+    if (cell || row.length) { row.push(cell); rows.push(row); }
+    return rows;
+  }
+  function cellText(v) {
+    if (v == null) return '';
+    if (typeof v === 'object') {
+      if (v.richText) return v.richText.map((t) => t.text).join('');
+      if (v.text != null) return String(v.text);
+      if (v.result != null) return String(v.result);
+      if (v instanceof Date) return v.toISOString().slice(0, 10);
+    }
+    return String(v);
+  }
+  async function readRunSheet(file) {
+    const name = file.name || 'run sheet';
+    let rows;
+    if (/\.csv$|\.txt$/i.test(name)) {
+      rows = parseCsv(await file.text());
+    } else if (/\.xlsx$/i.test(name)) {
+      if (!window.ExcelJS) throw new Error('The Excel reader is still loading. Wait a moment and try again.');
+      const wb = new window.ExcelJS.Workbook();
+      await wb.xlsx.load(await file.arrayBuffer());
+      const ws = wb.worksheets.find((w) => w.actualRowCount > 1) || wb.worksheets[0];
+      if (!ws) throw new Error('This Excel file has no sheets.');
+      rows = [];
+      ws.eachRow({ includeEmpty: false }, (r) => {
+        const vals = []; for (let c = 1; c <= r.cellCount; c++) vals.push(cellText(r.getCell(c).value));
+        rows.push(vals);
+      });
+    } else if (/\.xls$/i.test(name)) {
+      throw new Error('This is an old .xls file. Open it in Excel and "Save As" .xlsx (or CSV), then upload that.');
+    } else {
+      throw new Error('Upload an Excel (.xlsx) or CSV file.');
+    }
+    rows = rows.map((r) => r.map((c) => String(c || '').trim())).filter((r) => r.some(Boolean));
+    if (rows.length < 2) throw new Error('No delivery rows found in this file.');
+    // Header row: the first row (within the top 10) that looks like column names.
+    let headerIdx = 0, best = -1;
+    rows.slice(0, 10).forEach((r, i) => {
+      const score = r.filter((c) => ROUTE_FIELDS.some(([, , re]) => re.test(c.toLowerCase()))).length;
+      if (score > best) { best = score; headerIdx = i; }
+    });
+    const headers = rows[headerIdx].map((h, i) => h || `Column ${i + 1}`);
+    const body = rows.slice(headerIdx + 1).filter((r) => r.some(Boolean));
+    const map = {};
+    ROUTE_FIELDS.forEach(([key, , re]) => {
+      const idx = headers.findIndex((h, i) => re.test(h.toLowerCase()) && !Object.values(map).includes(i));
+      map[key] = idx;
+    });
+    if (map.address < 0) {
+      // Fall back to the column that most often looks like a street address.
+      let bestCol = -1, bestHits = 0;
+      headers.forEach((_, i) => {
+        const hits = body.slice(0, 30).filter((r) => /\d+[a-z]?\s+\w+.*\b(st|street|rd|road|ave|avenue|dr|drive|cres|ct|court|pl|place|pde|hwy|way|ln|lane|cl|close|blvd|tce|terrace)\b/i.test(r[i] || '')).length;
+        if (hits > bestHits) { bestHits = hits; bestCol = i; }
+      });
+      map.address = bestCol;
+    }
+    return { fileName: name, headers, rows: body, map };
+  }
+  function draftStops(draft) {
+    const m = draft.map; const get = (r, k) => (m[k] >= 0 ? String(r[m[k]] || '').trim() : '');
+    const byAddr = new Map();
+    draft.rows.forEach((r) => {
+      const street = get(r, 'address');
+      if (!street) return;
+      const parts = [street];
+      ['suburb', 'state', 'postcode'].forEach((k) => { const v = get(r, k); if (v && !street.toLowerCase().includes(v.toLowerCase())) parts.push(v); });
+      const full = parts.join(', ');
+      const key = full.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      const qty = Math.max(1, parseInt(get(r, 'parcels'), 10) || 1);
+      const existing = byAddr.get(key);
+      if (existing) {
+        existing.parcels += qty;
+        const ref = get(r, 'ref'); if (ref && !existing.refs.includes(ref)) existing.refs.push(ref);
+        const note = get(r, 'notes'); if (note && !existing.notes.includes(note)) existing.notes = existing.notes ? existing.notes + ' · ' + note : note;
+        const nm = get(r, 'name'); if (nm && !existing.name.toLowerCase().includes(nm.toLowerCase())) existing.name = existing.name ? existing.name + ', ' + nm : nm;
+      } else {
+        byAddr.set(key, { address: full, name: get(r, 'name'), phone: get(r, 'phone'), refs: get(r, 'ref') ? [get(r, 'ref')] : [], parcels: qty, notes: get(r, 'notes') });
+      }
+    });
+    return [...byAddr.values()];
+  }
+
+  // ---- Ordering the stops ----
+  function kmBetween(a, b) {
+    const R = 6371, toRad = (d) => (d * Math.PI) / 180;
+    const dLat = toRad(b.lat - a.lat), dLng = toRad(b.lng - a.lng);
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+  // Returns the visiting order (indices into pts) starting from `start`.
+  function optimiseOrder(start, pts, returnToStart) {
+    const n = pts.length;
+    if (n <= 1) return pts.map((_, i) => i);
+    const all = [start, ...pts];
+    const D = all.map((a) => all.map((b) => kmBetween(a, b)));
+    // Nearest neighbour from the start.
+    const tour = [0]; const used = new Array(n + 1).fill(false); used[0] = true;
+    for (let k = 0; k < n; k++) {
+      const last = tour[tour.length - 1]; let bestJ = -1, bestD = Infinity;
+      for (let j = 1; j <= n; j++) if (!used[j] && D[last][j] < bestD) { bestD = D[last][j]; bestJ = j; }
+      tour.push(bestJ); used[bestJ] = true;
+    }
+    if (returnToStart) tour.push(0);
+    // 2-opt: reverse segments while it shortens the route (start stays first).
+    const last = returnToStart ? tour.length - 2 : tour.length - 1;
+    let improved = true, passes = 0;
+    while (improved && passes < 60) {
+      improved = false; passes++;
+      for (let i = 1; i < last; i++) {
+        for (let k = i + 1; k <= last; k++) {
+          const a = tour[i - 1], b = tour[i], c = tour[k], d = tour[k + 1];
+          const before = D[a][b] + (d !== undefined ? D[c][d] : 0);
+          const after = D[a][c] + (d !== undefined ? D[b][d] : 0);
+          if (after < before - 1e-9) {
+            for (let x = i, y = k; x < y; x++, y--) { const t = tour[x]; tour[x] = tour[y]; tour[y] = t; }
+            improved = true;
+          }
+        }
+      }
+    }
+    return tour.filter((v) => v !== 0).map((v) => v - 1);
+  }
+  function routeDistanceKm(start, stops, returnToStart) {
+    let km = 0, prev = start;
+    stops.forEach((s) => { if (prev) km += kmBetween(prev, s); prev = s; });
+    if (returnToStart && start && stops.length) km += kmBetween(stops[stops.length - 1], start);
+    return Math.round(km * 1.3 * 10) / 10; // straight-line × 1.3 ≈ road distance
+  }
+  async function geocodeForRoute(addresses, onProgress) {
+    const out = [];
+    for (let i = 0; i < addresses.length; i += 50) {
+      const chunk = addresses.slice(i, i + 50);
+      const res = await fetch('/api/route/geocode', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ addresses: chunk }) });
+      let body = {}; try { body = await res.json(); } catch (e) {}
+      if (!res.ok) throw new Error(body.error || 'Address lookup failed.');
+      out.push(...body.results);
+      if (onProgress) onProgress(Math.min(addresses.length, i + chunk.length), addresses.length);
+    }
+    return out;
+  }
+
+  // ---- Map ----
+  async function loadLeaflet() {
+    if (!document.querySelector('link[data-leaflet]')) {
+      const l = document.createElement('link'); l.rel = 'stylesheet'; l.href = 'vendor/leaflet.css'; l.dataset.leaflet = '1'; document.head.appendChild(l);
+    }
+    await loadScriptOnce('vendor/leaflet.js');
+    return window.L;
+  }
+  let routeMap = null;
+  async function initRouteMap() {
+    const el = document.getElementById('routeMap');
+    if (routeMap) { try { routeMap.remove(); } catch (e) {} routeMap = null; }
+    if (!el) return;
+    const route = (state.routes || []).find((r) => r.id === el.dataset.routeId);
+    if (!route) return;
+    let L; try { L = await loadLeaflet(); } catch (e) { el.innerHTML = '<p class="helptext" style="padding:16px;">Map could not load. The stop list below still works.</p>'; return; }
+    if (!document.body.contains(el)) return;
+    routeMap = L.map(el, { zoomControl: true, attributionControl: true });
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(routeMap);
+    const pts = [];
+    if (route.start && Number.isFinite(route.start.lat)) {
+      L.marker([route.start.lat, route.start.lng], { icon: L.divIcon({ className: 'route-pin route-pin-start', html: 'S', iconSize: [26, 26] }) }).addTo(routeMap).bindPopup('Start: ' + esc(route.start.label || ''));
+      pts.push([route.start.lat, route.start.lng]);
+    }
+    const next = (route.stops || []).find((s) => s.status === 'pending');
+    (route.stops || []).forEach((s, i) => {
+      const cls = s.status === 'delivered' ? 'is-done' : s.status === 'failed' ? 'is-failed' : (next && s.id === next.id ? 'is-next' : '');
+      L.marker([s.lat, s.lng], { icon: L.divIcon({ className: 'route-pin ' + cls, html: String(i + 1), iconSize: [26, 26] }) })
+        .addTo(routeMap).bindPopup(`<strong>${i + 1}. ${esc(s.formatted || s.address)}</strong>${s.name ? '<br>' + esc(s.name) : ''}`);
+      pts.push([s.lat, s.lng]);
+    });
+    if (route.returnToStart && route.start && Number.isFinite(route.start.lat)) pts.push([route.start.lat, route.start.lng]);
+    if (pts.length > 1) L.polyline(pts, { color: '#131c2e', weight: 3, opacity: 0.55 }).addTo(routeMap);
+    if (pts.length) routeMap.fitBounds(pts, { padding: [24, 24], maxZoom: 15 });
+    else routeMap.setView([-33.87, 151.21], 10);
+  }
+  function navLinks(s) {
+    const g = `https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lng}&travelmode=driving`;
+    const a = `https://maps.apple.com/?daddr=${s.lat},${s.lng}&dirflg=d`;
+    return `<a class="btn btn-sm" href="${g}" target="_blank" rel="noopener">Google Maps</a><a class="btn btn-sm" href="${a}" target="_blank" rel="noopener">Apple Maps</a>`;
+  }
+
+  // ---- Views ----
+  function routeStopRow(route, s, i, editable) {
+    const status = s.status === 'delivered' ? '<span class="pill pill-paid">Delivered</span>'
+      : s.status === 'failed' ? `<span class="pill pill-cancelled">Failed</span>${s.reason ? `<div class="helptext">${esc(s.reason)}</div>` : ''}` : '';
+    const actions = !editable ? '' : s.status === 'pending'
+      ? `<div class="route-stop-actions">${navLinks(s)}<button class="btn btn-sm btn-primary" data-action="route-stop-done" data-route="${route.id}" data-stop="${s.id}">Delivered</button><button class="btn btn-sm" data-action="route-stop-fail" data-route="${route.id}" data-stop="${s.id}">Failed</button></div>`
+      : `<div class="route-stop-actions"><button class="btn btn-sm" data-action="route-stop-undo" data-route="${route.id}" data-stop="${s.id}">Undo</button></div>`;
+    return `<li class="route-stop ${s.status !== 'pending' ? 'is-' + s.status : ''}">
+      <span class="route-num">${i + 1}</span>
+      <div class="route-stop-body">
+        <div class="route-stop-addr">${esc(s.formatted || s.address)}</div>
+        <div class="helptext">${[s.name ? esc(s.name) : '', s.parcels > 1 ? s.parcels + ' parcels' : '', s.refs && s.refs.length ? esc(s.refs.slice(0, 3).join(', ')) + (s.refs.length > 3 ? '…' : '') : ''].filter(Boolean).join(' · ')}</div>
+        ${s.notes ? `<div class="helptext">Note: ${esc(s.notes)}</div>` : ''}
+        ${status}${actions}
+      </div>
+    </li>`;
+  }
+  function routeDetail(route, editable) {
+    const c = routeCounts(route);
+    const pct = c.stops ? Math.round((c.done / c.stops) * 100) : 0;
+    const next = (route.stops || []).find((s) => s.status === 'pending');
+    const nextIdx = next ? route.stops.indexOf(next) : -1;
+    const unmatched = route.unmatched || [];
+    return `
+      <div class="card route-summary">
+        <div class="route-summary-figures">
+          <div><span class="kpi-label">Stops</span><strong>${c.done}/${c.stops}</strong></div>
+          <div><span class="kpi-label">Delivered</span><strong>${c.delivered}</strong></div>
+          <div><span class="kpi-label">Failed</span><strong>${c.failed}</strong></div>
+          <div><span class="kpi-label">Distance</span><strong>≈ ${route.distanceKm || 0} km</strong></div>
+        </div>
+        <div class="route-progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><span style="width:${pct}%"></span></div>
+      </div>
+      ${editable && next ? `
+        <div class="card route-next">
+          <p class="eyebrow" style="margin:0 0 6px;">Next stop · ${nextIdx + 1} of ${c.stops}</p>
+          <h2 style="margin:0 0 4px;font-size:1.25rem;">${esc(next.formatted || next.address)}</h2>
+          <p class="helptext" style="margin:0 0 4px;">${[next.name ? esc(next.name) : '', next.parcels > 1 ? next.parcels + ' parcels' : '1 parcel', next.refs && next.refs.length ? esc(next.refs.join(', ')) : ''].filter(Boolean).join(' · ')}</p>
+          ${next.phone ? `<p style="margin:0 0 4px;"><a href="tel:${esc(next.phone.replace(/[^\d+]/g, ''))}">Call ${esc(next.phone)}</a></p>` : ''}
+          ${next.notes ? `<p class="helptext" style="margin:0 0 8px;">Note: ${esc(next.notes)}</p>` : ''}
+          <div class="route-next-actions">
+            ${navLinks(next)}
+          </div>
+          <div class="route-next-actions">
+            <button class="btn btn-primary" data-action="route-stop-done" data-route="${route.id}" data-stop="${next.id}">Delivered</button>
+            <button class="btn" data-action="route-stop-fail" data-route="${route.id}" data-stop="${next.id}">Failed</button>
+          </div>
+        </div>` : editable && c.stops ? `<div class="card route-next"><h2 style="margin:0 0 6px;">All stops done</h2><p class="helptext" style="margin:0 0 12px;">${c.delivered} delivered, ${c.failed} failed. These numbers are filled in for you on Today's Deliveries.</p><button class="btn btn-primary" data-action="nav" data-route="driver-submit">Go to Today's Deliveries</button></div>` : ''}
+      <div class="card route-map-card"><div id="routeMap" class="route-map" data-route-id="${route.id}"></div></div>
+      ${unmatched.length ? `
+        <div class="card" style="margin-bottom:16px;">
+          <h3 style="margin:0 0 4px;">Couldn't find ${unmatched.length} address${unmatched.length > 1 ? 'es' : ''}</h3>
+          <p class="helptext" style="margin:0 0 12px;">Fix the address and try again, or remove it from today's route.</p>
+          ${unmatched.map((u, i) => `
+            <form class="route-fix" data-onsubmit="route-fix-address" data-route="${route.id}" data-index="${i}">
+              <div class="field" style="flex:1;"><label class="field-label">${esc(u.name || 'Stop')}${u.refs && u.refs.length ? ' · ' + esc(u.refs[0]) : ''} — ${esc(u.error || 'Not found')}</label><input type="text" name="address" value="${esc(u.address)}" ${editable ? '' : 'disabled'}></div>
+              ${editable ? `<button class="btn btn-sm btn-primary" type="submit">Find</button><button class="btn btn-sm" type="button" data-action="route-unmatched-remove" data-route="${route.id}" data-index="${i}">Remove</button>` : ''}
+            </form>`).join('')}
+        </div>` : ''}
+      <div class="card">
+        <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;gap:10px;"><h3 style="margin:0;">All stops</h3>${route.fileName ? `<span class="helptext">From ${esc(route.fileName)}</span>` : ''}</div>
+        <ol class="route-stops">${(route.stops || []).map((s, i) => routeStopRow(route, s, i, editable)).join('')}</ol>
+      </div>
+      ${editable ? `
+        <div class="route-footer-actions">
+          <button class="btn" data-action="route-replan" data-route="${route.id}">Re-plan remaining stops from here</button>
+          <button class="btn btn-danger" data-action="route-archive" data-route="${route.id}">Start a new route</button>
+        </div>` : ''}
+    `;
+  }
+  function routeUploadCard() {
+    const d = routeUi.draft;
+    if (routeUi.busy) {
+      return `<div class="card" style="text-align:center;padding:32px 20px;"><div class="route-spinner" aria-hidden="true"></div><p style="margin:12px 0 0;font-weight:600;">${esc(routeUi.busy)}</p></div>`;
+    }
+    if (!d) {
+      return `
+        <div class="card route-upload">
+          <h2 style="margin:0 0 6px;">Plan today's route</h2>
+          <p class="helptext" style="margin:0 0 16px;">Upload your run sheet (Excel .xlsx or CSV). We'll find every address, group parcels going to the same place, and put the stops in a short driving order.</p>
+          <label class="route-drop">
+            <input type="file" accept=".xlsx,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" data-onchange="route-file">
+            <span class="route-drop-title">Choose run sheet</span>
+            <span class="helptext">.xlsx or .csv · up to 300 stops</span>
+          </label>
+        </div>`;
+    }
+    const stops = draftStops(d);
+    const options = (key) => `<option value="-1">— not in file —</option>` + d.headers.map((h, i) => `<option value="${i}" ${d.map[key] === i ? 'selected' : ''}>${esc(h)}</option>`).join('');
+    return `
+      <div class="card">
+        <h2 style="margin:0 0 4px;">${esc(d.fileName)}</h2>
+        <p class="helptext" style="margin:0 0 16px;">${d.rows.length} rows · <strong>${stops.length} stops</strong>${stops.length < d.rows.length ? ' (parcels to the same address are grouped)' : ''}</p>
+        <form data-onsubmit="route-plan">
+          <p class="eyebrow" style="margin:0 0 8px;">Match the columns</p>
+          <div class="route-mapping">
+            ${ROUTE_FIELDS.map(([key, label]) => `<div class="field"><label class="field-label">${label}${key === 'address' ? ' *' : ''}</label><select data-onchange="route-map" data-field="${key}">${options(key)}</select></div>`).join('')}
+          </div>
+          ${stops.length ? `<div class="table-wrap" style="margin:6px 0 16px;"><table class="data"><thead><tr><th>Address we'll look up</th><th>Recipient</th><th class="tnum">Parcels</th></tr></thead><tbody>${stops.slice(0, 4).map((s) => `<tr><td>${esc(s.address)}</td><td>${esc(s.name)}</td><td class="tnum">${s.parcels}</td></tr>`).join('')}</tbody></table></div>` : '<p class="helptext" style="color:var(--danger);">No addresses found — choose the column that holds the street address.</p>'}
+          <p class="eyebrow" style="margin:0 0 8px;">Start and finish</p>
+          <div class="field-row" style="margin-bottom:12px;">
+            <div class="field"><label class="field-label">Start from</label><select name="startMode" data-onchange="route-start-mode"><option value="here">My current location</option><option value="address">An address (e.g. depot)</option></select></div>
+            <div class="field"><label class="field-label">Finish</label><select name="finish"><option value="last">At the last stop</option><option value="return">Back at the start</option></select></div>
+          </div>
+          <div class="field" id="routeStartAddress" style="margin-bottom:12px;display:none;"><label class="field-label">Start address</label><input type="text" name="startAddress" value="${esc(state.settings.routeDepotAddress || '')}" placeholder="Depot address"></div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;">
+            <button class="btn btn-primary" type="submit" ${stops.length ? '' : 'disabled'}>Plan my route</button>
+            <button class="btn" type="button" data-action="route-draft-clear">Choose a different file</button>
+          </div>
+        </form>
+      </div>`;
+  }
+  function viewDriverRoute() {
+    const driverId = currentDriverId();
+    const route = todaysRoute(driverId);
+    const header = `<div class="view-header"><div><h1>Route</h1><div class="sub">${fmtDateHuman(todayStr())}</div></div></div>`;
+    if (route && !routeUi.busy) return header + routeDetail(route, true);
+    return header + routeUploadCard();
+  }
+  function viewRoutesAdmin() {
+    const date = routeUi.adminDate || todayStr();
+    const list = (state.routes || []).filter((r) => r.date === date && r.status !== 'archived');
+    const viewing = routeUi.viewId ? (state.routes || []).find((r) => r.id === routeUi.viewId) : null;
+    if (viewing) {
+      return `
+        <div class="view-header"><div><h1>${esc(viewing.driverName || 'Driver')}'s route</h1><div class="sub">${fmtDateHuman(viewing.date)} · updated ${viewing.updatedAt ? fmtTimeHuman(viewing.updatedAt) : '—'}</div></div>
+          <div class="view-actions"><button class="btn" data-action="route-admin-back">All routes</button><button class="btn" data-action="route-admin-refresh">Refresh</button></div></div>
+        ${routeDetail(viewing, false)}`;
+    }
+    return `
+      <div class="view-header"><div><h1>Routes</h1><div class="sub">Drivers' planned routes and progress</div></div>
+        <div class="view-actions"><input type="date" value="${date}" data-onchange="route-admin-date" aria-label="Date"><button class="btn" data-action="route-admin-refresh">Refresh</button></div></div>
+      ${list.length ? `<div class="route-admin-grid">${list.map((r) => {
+        const c = routeCounts(r); const pct = c.stops ? Math.round((c.done / c.stops) * 100) : 0;
+        return `<div class="card route-admin-card">
+          <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;"><h3 style="margin:0;">${esc(r.driverName || 'Driver')}</h3><span class="helptext">${r.updatedAt ? 'Updated ' + fmtTimeHuman(r.updatedAt) : ''}</span></div>
+          <p class="helptext" style="margin:4px 0 10px;">${c.stops} stops · ${c.parcels} parcels · ≈ ${r.distanceKm || 0} km${(r.unmatched || []).length ? ` · <span style="color:var(--danger);">${r.unmatched.length} not found</span>` : ''}</p>
+          <div class="route-progress"><span style="width:${pct}%"></span></div>
+          <p class="helptext" style="margin:8px 0 12px;">${c.done} of ${c.stops} stops done — ${c.delivered} delivered, ${c.failed} failed</p>
+          <button class="btn btn-sm" data-action="route-admin-view" data-id="${r.id}">View route</button>
+        </div>`;
+      }).join('')}</div>` : `<div class="card empty-state"><p>No routes planned for ${fmtDateHuman(date)}.</p><p class="helptext">Drivers plan a route from the Route page on their phone by uploading their run sheet.</p></div>`}`;
+  }
+
+  // ---- Saving changes ----
+  async function saveRouteStops(route, patch) {
+    Object.assign(route, patch, { updatedAt: new Date().toISOString() });
+    await state.db.doc('routes/' + route.id).update(Object.assign({}, patch, { updatedAt: route.updatedAt }));
+  }
+  async function planRoute(form) {
+    const d = routeUi.draft; if (!d) return;
+    const fd = new FormData(form);
+    const stops = draftStops(d);
+    if (!stops.length) { toast('No addresses to plan.', 'err'); return; }
+    if (stops.length > 300) { toast(`That's ${stops.length} stops — the limit is 300 per route. Split the file and try again.`, 'err'); return; }
+    const startMode = fd.get('startMode'); const returnToStart = fd.get('finish') === 'return';
+    const startAddress = String(fd.get('startAddress') || '').trim();
+    if (startMode === 'address' && !startAddress) { toast('Enter the start address.', 'err'); return; }
+    const driverId = currentDriverId();
+    const driver = state.drivers.find((x) => x.id === driverId);
+    try {
+      let start = null;
+      if (startMode === 'here') {
+        routeUi.busy = 'Getting your location…'; renderView();
+        try { const pos = await getCurrentPosition(); start = { label: 'My location', lat: pos.lat, lng: pos.lng }; }
+        catch (e) { routeUi.busy = ''; renderView(); toast(e.message + ' Or choose "An address" as the start.', 'err'); return; }
+      }
+      routeUi.busy = `Finding ${stops.length} addresses…`; renderView();
+      const lookups = await geocodeForRoute(stops.map((s) => s.address).concat(startMode === 'address' ? [startAddress] : []), (done, total) => {
+        routeUi.busy = `Finding addresses… ${done} of ${total}`; const p = document.querySelector('.route-spinner + p'); if (p) p.textContent = routeUi.busy;
+      });
+      if (startMode === 'address') {
+        const s = lookups.pop();
+        if (s.error) { routeUi.busy = ''; renderView(); toast('Start address: ' + s.error, 'err'); return; }
+        start = { label: startAddress, lat: s.lat, lng: s.lng };
+      }
+      const found = [], unmatched = [];
+      stops.forEach((s, i) => {
+        const g = lookups[i];
+        if (g && !g.error) found.push(Object.assign({}, s, { lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: g.partial }));
+        else unmatched.push(Object.assign({}, s, { error: g ? g.error : 'Not found' }));
+      });
+      const allMissing = !found.length && unmatched.length && unmatched.every((u) => /not switched on|key/i.test(u.error || ''));
+      if (allMissing) { routeUi.busy = ''; renderView(); toast(unmatched[0].error + ' Ask your admin to finish the Google Maps setup.', 'err'); return; }
+      routeUi.busy = 'Putting stops in the best order…'; renderView();
+      await new Promise((r) => setTimeout(r, 30));
+      const order = optimiseOrder(start, found, returnToStart);
+      const ordered = order.map((idx, i) => Object.assign({}, found[idx], { id: 's' + (i + 1) + '_' + genId().slice(0, 6), status: 'pending', reason: '', doneAt: null }));
+      const nowIso = new Date().toISOString();
+      const doc = {
+        driverId, driverName: driver ? driver.name : (state.session.name || ''), date: todayStr(), status: 'active',
+        fileName: d.fileName, start, returnToStart, stops: ordered, unmatched,
+        distanceKm: routeDistanceKm(start, ordered, returnToStart), createdAt: nowIso, updatedAt: nowIso,
+      };
+      const ref = await state.db.collection('routes').add(doc);
+      state.routes = state.routes || [];
+      state.routes.unshift(Object.assign({ id: ref.id }, doc));
+      routeUi.draft = null; routeUi.busy = '';
+      renderView();
+      toast(`Route ready: ${ordered.length} stops${unmatched.length ? `, ${unmatched.length} need checking` : ''}.`, unmatched.length ? 'err' : 'ok');
+    } catch (e) {
+      routeUi.busy = ''; renderView(); toast(e.message || 'Could not plan the route.', 'err');
+    }
+  }
+
   function renderView() {
     let route = VIEWS[state.route] ? state.route : 'dashboard';
     const role = state.session ? state.session.role : null;
     if (!roleAllowed(route, role)) { route = role === 'driver' ? 'driver-submit' : role === 'labour' ? 'labour-log' : 'dashboard'; }
     state.route = route;
     document.getElementById('content').innerHTML = VIEWS[route]();
+    if (document.getElementById('routeMap')) initRouteMap(); else if (routeMap) { try { routeMap.remove(); } catch (e) {} routeMap = null; }
     const topbarTitle = document.getElementById('topbar-title');
     if (topbarTitle) { const item = NAV.find((n) => n.id === route); topbarTitle.textContent = item ? item.label : ''; }
   }
@@ -2160,6 +2625,60 @@
 
   const ACTIONS = {
     'nav': (el) => setRoute(el.dataset.route),
+    'route-draft-clear': () => { routeUi.draft = null; renderView(); },
+    'route-stop-done': async (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
+      const stops = route.stops.map((s) => s.id === el.dataset.stop ? Object.assign({}, s, { status: 'delivered', reason: '', doneAt: new Date().toISOString() }) : s);
+      el.disabled = true;
+      try { await saveRouteStops(route, { stops }); renderView(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+      catch (e) { el.disabled = false; toast(e.message, 'err'); }
+    },
+    'route-stop-fail': (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
+      const stop = route.stops.find((s) => s.id === el.dataset.stop); if (!stop) return;
+      openModal(`
+        <div class="modal-head"><h3>Why did this delivery fail?</h3><button class="modal-close" data-action="modal-close" aria-label="Close">×</button></div>
+        <p class="helptext" style="margin:0 0 12px;">${esc(stop.formatted || stop.address)}</p>
+        <form data-onsubmit="route-fail-save" data-route="${route.id}" data-stop="${stop.id}">
+          <div class="route-reasons">${FAIL_REASONS.map((r, i) => `<label class="route-reason"><input type="radio" name="reason" value="${r}" ${i === 0 ? 'checked' : ''}> ${r}</label>`).join('')}</div>
+          <div class="field" style="margin:12px 0;"><label class="field-label">Note (optional)</label><input type="text" name="note" placeholder="e.g. Card left, gate locked"></div>
+          <div style="display:flex;gap:10px;justify-content:flex-end;"><button class="btn" type="button" data-action="modal-close">Cancel</button><button class="btn btn-primary" type="submit">Mark failed</button></div>
+        </form>`);
+    },
+    'route-stop-undo': async (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
+      const stops = route.stops.map((s) => s.id === el.dataset.stop ? Object.assign({}, s, { status: 'pending', reason: '', doneAt: null }) : s);
+      try { await saveRouteStops(route, { stops }); renderView(); } catch (e) { toast(e.message, 'err'); }
+    },
+    'route-unmatched-remove': async (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
+      const unmatched = (route.unmatched || []).filter((_, i) => i !== Number(el.dataset.index));
+      try { await saveRouteStops(route, { unmatched }); renderView(); } catch (e) { toast(e.message, 'err'); }
+    },
+    'route-replan': async (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
+      const done = route.stops.filter((s) => s.status !== 'pending');
+      const pending = route.stops.filter((s) => s.status === 'pending');
+      if (!pending.length) { toast('No stops left to plan.', 'ok'); return; }
+      el.disabled = true; const label = el.textContent; el.textContent = 'Getting your location…';
+      try {
+        const pos = await getCurrentPosition();
+        const here = { label: 'My location', lat: pos.lat, lng: pos.lng };
+        const order = optimiseOrder(here, pending, route.returnToStart);
+        const stops = done.concat(order.map((i) => pending[i]));
+        await saveRouteStops(route, { stops, distanceKm: Math.round((routeDistanceKm(route.start, done, false) + routeDistanceKm(here, order.map((i) => pending[i]), route.returnToStart)) * 10) / 10 });
+        renderView(); toast('Remaining stops re-planned from where you are.', 'ok');
+      } catch (e) { toast(e.message, 'err'); el.disabled = false; el.textContent = label; }
+    },
+    'route-archive': async (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
+      const ok = await confirmDialog('Start a new route? Today\'s current route will be closed (its delivered/failed counts are kept).', { title: 'Start a new route?', okLabel: 'Start new route' });
+      if (!ok) return;
+      try { await saveRouteStops(route, { status: 'archived' }); renderView(); } catch (e) { toast(e.message, 'err'); }
+    },
+    'route-admin-view': (el) => { routeUi.viewId = el.dataset.id; renderView(); window.scrollTo(0, 0); },
+    'route-admin-back': () => { routeUi.viewId = null; renderView(); },
+    'route-admin-refresh': async (el) => { el.disabled = true; try { await loadRoutes(); } finally { renderView(); } },
     'company-use-my-location': async (el) => {
       const form = el.closest('form');
       const input = form && form.querySelector('input[name="siteCoords"]');
@@ -2575,6 +3094,21 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   `);
 
   const CHANGE_HANDLERS = {
+    'route-file': async (el) => {
+      const file = el.files && el.files[0]; if (!file) return;
+      try { routeUi.draft = await readRunSheet(file); renderView(); }
+      catch (e) { el.value = ''; toast(e.message, 'err'); }
+    },
+    'route-map': (el) => {
+      if (!routeUi.draft) return;
+      routeUi.draft.map[el.dataset.field] = Number(el.value);
+      const form = el.closest('form'); const keep = form ? { startMode: form.startMode.value, finish: form.finish.value, startAddress: form.startAddress.value } : null;
+      renderView();
+      const f2 = document.querySelector('form[data-onsubmit="route-plan"]');
+      if (f2 && keep) { f2.startMode.value = keep.startMode; f2.finish.value = keep.finish; f2.startAddress.value = keep.startAddress; document.getElementById('routeStartAddress').style.display = keep.startMode === 'address' ? '' : 'none'; }
+    },
+    'route-start-mode': (el) => { const box = document.getElementById('routeStartAddress'); if (box) box.style.display = el.value === 'address' ? '' : 'none'; },
+    'route-admin-date': (el) => { routeUi.adminDate = el.value; routeUi.viewId = null; renderView(); },
     'entry-date-change': async (el) => { state.entryDate = el.value; loadEntryRowsForDate(state.entryDate); renderView(); },
     'entry-field': (el) => {
       const row = state.entryRows.find((r) => r.id === el.dataset.row);
@@ -2634,6 +3168,38 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   };
 
   const SUBMIT_HANDLERS = {
+    'route-plan': async (form) => { await planRoute(form); },
+    'route-fail-save': async (form) => {
+      const route = state.routes.find((r) => r.id === form.dataset.route); if (!route) return;
+      const fd = new FormData(form);
+      const reason = [fd.get('reason'), String(fd.get('note') || '').trim()].filter(Boolean).join(' — ');
+      const stops = route.stops.map((s) => s.id === form.dataset.stop ? Object.assign({}, s, { status: 'failed', reason, doneAt: new Date().toISOString() }) : s);
+      try { await saveRouteStops(route, { stops }); closeModal(); renderView(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+      catch (e) { toast(e.message, 'err'); }
+    },
+    'route-fix-address': async (form) => {
+      const route = state.routes.find((r) => r.id === form.dataset.route); if (!route) return;
+      const idx = Number(form.dataset.index); const u = (route.unmatched || [])[idx]; if (!u) return;
+      const address = String(new FormData(form).get('address') || '').trim(); if (!address) return;
+      try {
+        const [g] = await geocodeForRoute([address]);
+        if (g.error) { toast(/not found/i.test(g.error) ? g.error + ' — try adding the suburb and postcode.' : g.error, 'err'); return; }
+        const stop = Object.assign({}, u, { address, lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: g.partial, id: 's' + genId(), status: 'pending', reason: '', doneAt: null });
+        delete stop.error;
+        // Insert where it adds the least extra distance among the stops still to do.
+        const stops = route.stops.slice(); let bestAt = stops.length, bestCost = Infinity;
+        for (let i = 0; i <= stops.length; i++) {
+          if (i < stops.length && stops[i].status !== 'pending') continue;
+          const prev = i === 0 ? route.start : stops[i - 1]; const next = stops[i];
+          const cost = (prev ? kmBetween(prev, stop) : 0) + (next ? kmBetween(stop, next) : 0) - (prev && next ? kmBetween(prev, next) : 0);
+          if (cost < bestCost) { bestCost = cost; bestAt = i; }
+        }
+        stops.splice(bestAt, 0, stop);
+        const unmatched = route.unmatched.filter((_, i) => i !== idx);
+        await saveRouteStops(route, { stops, unmatched, distanceKm: routeDistanceKm(route.start, stops, route.returnToStart) });
+        renderView(); toast(`Added as stop ${bestAt + 1}.`, 'ok');
+      } catch (e) { toast(e.message, 'err'); }
+    },
     'gate-signup-admin': async (form) => {
       const fd = new FormData(form);
       const name = String(fd.get('name') || '').trim();
@@ -2790,6 +3356,10 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const fd = new FormData(form);
       await saveSettings({ businessName: fd.get('businessName') });
       renderSidebar(); renderView(); toast('Business name saved.', 'ok');
+    },
+    'settings-save-route': async (form) => {
+      await saveSettings({ routeDepotAddress: String(new FormData(form).get('routeDepotAddress') || '').trim() });
+      renderView(); toast('Depot address saved.', 'ok');
     },
     'settings-save-invoice': async (form) => {
       const fd = new FormData(form);
@@ -4433,6 +5003,15 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   // needs correcting (isCorrection true reuses the exact same fields so the
   // driver never has to re-enter anything that wasn't flagged).
   function finishWorkFormHtml(existing, isCorrection) {
+    // Pre-fill delivered/failed from today's planned route when the driver
+    // hasn't entered numbers yet.
+    const plannedRoute = !isCorrection && !Number(existing.delivered) && !Number(existing.failed)
+      ? todaysRoute(existing.driverId) || (state.routes || []).find((r) => r.driverId === existing.driverId && r.date === todayStr()) : null;
+    let routePrefilled = false;
+    if (plannedRoute) {
+      const rc = routeCounts(plannedRoute);
+      if (rc.done) { existing = Object.assign({}, existing, { delivered: rc.delivered, failed: rc.failed }); routePrefilled = true; }
+    }
     const s = state.settings;
     const failed0 = Number(existing.failed) || 0;
     const linkedDriver = state.drivers.find((d) => d.id === existing.driverId);
@@ -4448,6 +5027,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
               <option value="Van" ${defaultVehicle === 'Van' ? 'selected' : ''}>🚐 Van</option>
             </select>
           </div>
+          ${routePrefilled ? '<p class="helptext" style="margin:0 0 8px;">Filled in from your Route page — change them if they\'re not right.</p>' : ''}
           <div class="field-row">
             <div class="field"><label class="field-label" style="font-size:0.95rem;">Deliveries completed</label><input type="number" min="0" name="delivered" required value="${existing.delivered != null ? existing.delivered : ''}" style="font-size:1.6rem;padding:14px;text-align:center;" data-onchange="driver-finish-recalc"></div>
             <div class="field"><label class="field-label" style="font-size:0.95rem;">Deliveries failed</label><input type="number" min="0" name="failed" value="${existing.failed != null ? existing.failed : 0}" style="font-size:1.6rem;padding:14px;text-align:center;" data-onchange="driver-finish-recalc"></div>
