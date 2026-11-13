@@ -75,18 +75,24 @@ async function readDoc(env: Env, collection: string, id: string) {
 // as the GOOGLE_MAPS_API_KEY secret). Every successful lookup is cached in the
 // internal 'geocache' collection (not exposed through /api/data), so the same
 // address is only ever paid for once.
-type GeoResult = { lat: number; lng: number; formatted: string; precision: string; partial: boolean } | { error: string };
+type GeoResult = { lat: number; lng: number; formatted: string; precision: string; partial: boolean } | { error: string; lookupInBrowser?: boolean };
+const geoKey = async (address: string) => 'g_' + (await digest(normaliseAddress(address))).slice(0, 40);
+// Rough Australia bounding box: anything outside is rejected from the cache.
+const inAustralia = (lat: number, lng: number) => lat > -44.5 && lat < -9 && lng > 112 && lng < 154.5;
 function normaliseAddress(address: string) {
   return address.toLowerCase().replace(/[^\p{L}\p{N}/,\- ]+/gu, ' ').replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
 }
 async function geocodeOne(env: Env, address: string): Promise<GeoResult> {
   if (!address) return { error: 'Empty address' };
-  const key = 'g_' + (await digest(normaliseAddress(address))).slice(0, 40);
+  const key = await geoKey(address);
   const cached = await readDoc(env, 'geocache', key);
   if (cached && Number.isFinite(cached.lat) && Number.isFinite(cached.lng)) {
     return { lat: cached.lat, lng: cached.lng, formatted: cached.formatted || address, precision: cached.precision || '', partial: !!cached.partial };
   }
-  if (!env.GOOGLE_MAPS_API_KEY) return { error: 'Route planning is not switched on yet (Google Maps key missing).' };
+  // Free mode (default): the phone looks the address up on OpenStreetMap and
+  // sends the answer back to /api/route/geocache. Google is used only if a
+  // GOOGLE_MAPS_API_KEY secret is ever added.
+  if (!env.GOOGLE_MAPS_API_KEY) return { error: 'Not in saved addresses', lookupInBrowser: true };
   const url = 'https://maps.googleapis.com/maps/api/geocode/json?region=au&components=country:AU&address=' + encodeURIComponent(address) + '&key=' + env.GOOGLE_MAPS_API_KEY;
   let data: any;
   try {
@@ -332,6 +338,27 @@ async function api(request: Request, env: Env): Promise<Response> {
     return createSession(request, env, safeAccount(id, profile));
   }
 
+  if (path === '/api/route/geocache' && method === 'POST') {
+    const account = await currentAccount(request, env);
+    if (!account) return fail('Sign in required.', 401);
+    if (!['admin', 'manager', 'staff', 'driver'].includes(account.role)) return fail('Forbidden.', 403);
+    const body = await jsonBody(request);
+    const items: any[] = Array.isArray(body?.items) ? body.items.slice(0, 300) : [];
+    let saved = 0;
+    for (const item of items) {
+      const address = String(item?.address || '').trim().slice(0, 300);
+      const lat = Number(item?.lat), lng = Number(item?.lng);
+      if (!address || !Number.isFinite(lat) || !Number.isFinite(lng) || !inAustralia(lat, lng)) continue;
+      const key = await geoKey(address);
+      if (await readDoc(env, 'geocache', key)) continue; // never overwrite an existing answer
+      await saveDocument(env, 'geocache', key, {
+        lat, lng, formatted: String(item?.formatted || address).slice(0, 300), precision: String(item?.precision || '').slice(0, 40),
+        partial: !!item?.partial, query: address, source: 'osm', savedBy: account.id,
+      }, 'set');
+      saved++;
+    }
+    return json({ saved });
+  }
   if (path === '/api/route/geocode' && method === 'POST') {
     const account = await currentAccount(request, env);
     if (!account) return fail('Sign in required.', 401);

@@ -715,3 +715,4 @@ table.data tfoot td { background: var(--surface-2); border-top: 1px solid var(--
   .route-map { height: 260px; }
   .route-footer-actions .btn { flex: 1 1 100%; }
 }
+.route-approx { color: var(--warn); }

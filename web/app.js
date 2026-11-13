@@ -1717,7 +1717,7 @@
 
       <div class="card" style="margin-bottom:18px;">
         <h3 style="margin-bottom:4px;">Route planner</h3>
-        <p class="helptext" style="margin:0 0 14px;">Drivers can start their route from here instead of their current location. Address lookups use Google Maps (set up once by adding the GOOGLE_MAPS_API_KEY secret in Cloudflare).</p>
+        <p class="helptext" style="margin:0 0 14px;">Drivers can start their route from here instead of their current location. Addresses are looked up free on OpenStreetMap and saved, so repeat addresses are instant.</p>
         <form data-onsubmit="settings-save-route" style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;">
           <div class="field" style="flex:1;min-width:240px;"><label class="field-label">Depot address</label><input type="text" name="routeDepotAddress" value="${esc(s.routeDepotAddress || '')}" placeholder="Street, Suburb STATE Postcode"></div>
           <button class="btn btn-primary" type="submit">Save</button>
@@ -2199,7 +2199,8 @@
         const note = get(r, 'notes'); if (note && !existing.notes.includes(note)) existing.notes = existing.notes ? existing.notes + ' · ' + note : note;
         const nm = get(r, 'name'); if (nm && !existing.name.toLowerCase().includes(nm.toLowerCase())) existing.name = existing.name ? existing.name + ', ' + nm : nm;
       } else {
-        byAddr.set(key, { address: full, name: get(r, 'name'), phone: get(r, 'phone'), refs: get(r, 'ref') ? [get(r, 'ref')] : [], parcels: qty, notes: get(r, 'notes') });
+        byAddr.set(key, { address: full, name: get(r, 'name'), phone: get(r, 'phone'), refs: get(r, 'ref') ? [get(r, 'ref')] : [], parcels: qty, notes: get(r, 'notes'),
+          parts: { street, suburb: get(r, 'suburb'), state: get(r, 'state'), postcode: get(r, 'postcode') } });
       }
     });
     return [...byAddr.values()];
@@ -2251,7 +2252,38 @@
     if (returnToStart && start && stops.length) km += kmBetween(stops[stops.length - 1], start);
     return Math.round(km * 1.3 * 10) / 10; // straight-line × 1.3 ≈ road distance
   }
-  async function geocodeForRoute(addresses, onProgress) {
+  // Free address lookup on OpenStreetMap (Nominatim), done from the phone at
+  // most once per second as their usage policy asks. Answers are sent back to
+  // the Worker and saved, so each address is only ever looked up once.
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let lastOsmCall = 0;
+  async function osmSearch(params) {
+    const wait = lastOsmCall + 1100 - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastOsmCall = Date.now();
+    const qs = new URLSearchParams(Object.assign({ format: 'jsonv2', countrycodes: 'au', limit: '1', addressdetails: '0', 'accept-language': 'en' }, params));
+    const res = await fetch('https://nominatim.openstreetmap.org/search?' + qs.toString(), { headers: { Accept: 'application/json' } });
+    if (res.status === 429) throw new Error('The free address service is busy. Wait a minute and try again.');
+    if (!res.ok) throw new Error('The free address service did not respond. Try again shortly.');
+    const list = await res.json();
+    return Array.isArray(list) && list.length ? list[0] : null;
+  }
+  async function osmLookup(address, parts) {
+    let hit = null;
+    if (parts && parts.street && (parts.suburb || parts.postcode)) {
+      const p = { street: parts.street };
+      if (parts.suburb) p.city = parts.suburb;
+      if (parts.state) p.state = parts.state;
+      if (parts.postcode) p.postalcode = parts.postcode;
+      hit = await osmSearch(p);
+    }
+    if (!hit) hit = await osmSearch({ q: address });
+    if (!hit) return { error: 'Address not found' };
+    const type = String(hit.addresstype || hit.type || '');
+    const exact = ['house', 'building', 'residential', 'apartments', 'commercial', 'retail', 'industrial', 'office', 'shop', 'amenity'].includes(type) || /^\d/.test(String(hit.name || ''));
+    return { lat: Number(hit.lat), lng: Number(hit.lon), formatted: String(hit.display_name || address).replace(/, Australia$/, ''), precision: type, partial: !exact };
+  }
+  async function geocodeForRoute(addresses, onProgress, partsList) {
     const out = [];
     for (let i = 0; i < addresses.length; i += 50) {
       const chunk = addresses.slice(i, i + 50);
@@ -2259,7 +2291,25 @@
       let body = {}; try { body = await res.json(); } catch (e) {}
       if (!res.ok) throw new Error(body.error || 'Address lookup failed.');
       out.push(...body.results);
-      if (onProgress) onProgress(Math.min(addresses.length, i + chunk.length), addresses.length);
+    }
+    const misses = out.map((r, i) => (r && r.lookupInBrowser ? i : -1)).filter((i) => i >= 0);
+    const saved = [];
+    let done = addresses.length - misses.length;
+    if (onProgress) onProgress(done, addresses.length, misses.length);
+    for (let m = 0; m < misses.length; m++) {
+      const i = misses[m];
+      try { out[i] = await osmLookup(addresses[i], partsList ? partsList[i] : null); }
+      catch (e) {
+        // Stop asking a busy service; leave the rest for the driver to retry.
+        for (let k = m; k < misses.length; k++) out[misses[k]] = { error: e.message };
+        break;
+      }
+      if (!out[i].error) saved.push(Object.assign({ address: addresses[i] }, out[i]));
+      done++;
+      if (onProgress) onProgress(done, addresses.length, misses.length - m - 1);
+    }
+    if (saved.length) {
+      fetch('/api/route/geocache', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ items: saved }) }).catch(() => {});
     }
     return out;
   }
@@ -2292,7 +2342,7 @@
     (route.stops || []).forEach((s, i) => {
       const cls = s.status === 'delivered' ? 'is-done' : s.status === 'failed' ? 'is-failed' : (next && s.id === next.id ? 'is-next' : '');
       L.marker([s.lat, s.lng], { icon: L.divIcon({ className: 'route-pin ' + cls, html: String(i + 1), iconSize: [26, 26] }) })
-        .addTo(routeMap).bindPopup(`<strong>${i + 1}. ${esc(s.formatted || s.address)}</strong>${s.name ? '<br>' + esc(s.name) : ''}`);
+        .addTo(routeMap).bindPopup(`<strong>${i + 1}. ${esc(s.address)}</strong>${s.name ? '<br>' + esc(s.name) : ''}`);
       pts.push([s.lat, s.lng]);
     });
     if (route.returnToStart && route.start && Number.isFinite(route.start.lat)) pts.push([route.start.lat, route.start.lng]);
@@ -2316,7 +2366,8 @@
     return `<li class="route-stop ${s.status !== 'pending' ? 'is-' + s.status : ''}">
       <span class="route-num">${i + 1}</span>
       <div class="route-stop-body">
-        <div class="route-stop-addr">${esc(s.formatted || s.address)}</div>
+        <div class="route-stop-addr">${esc(s.address)}</div>
+        ${s.partial ? `<div class="helptext route-approx">Approximate pin (street only) — check the house number</div>` : ''}
         <div class="helptext">${[s.name ? esc(s.name) : '', s.parcels > 1 ? s.parcels + ' parcels' : '', s.refs && s.refs.length ? esc(s.refs.slice(0, 3).join(', ')) + (s.refs.length > 3 ? '…' : '') : ''].filter(Boolean).join(' · ')}</div>
         ${s.notes ? `<div class="helptext">Note: ${esc(s.notes)}</div>` : ''}
         ${status}${actions}
@@ -2342,7 +2393,8 @@
       ${editable && next ? `
         <div class="card route-next">
           <p class="eyebrow" style="margin:0 0 6px;">Next stop · ${nextIdx + 1} of ${c.stops}</p>
-          <h2 style="margin:0 0 4px;font-size:1.25rem;">${esc(next.formatted || next.address)}</h2>
+          <h2 style="margin:0 0 4px;font-size:1.25rem;">${esc(next.address)}</h2>
+          ${next.partial ? '<p class="helptext route-approx" style="margin:0 0 4px;">Map pin is approximate (street only) — check the house number when you arrive.</p>' : ''}
           <p class="helptext" style="margin:0 0 4px;">${[next.name ? esc(next.name) : '', next.parcels > 1 ? next.parcels + ' parcels' : '1 parcel', next.refs && next.refs.length ? esc(next.refs.join(', ')) : ''].filter(Boolean).join(' · ')}</p>
           ${next.phone ? `<p style="margin:0 0 4px;"><a href="tel:${esc(next.phone.replace(/[^\d+]/g, ''))}">Call ${esc(next.phone)}</a></p>` : ''}
           ${next.notes ? `<p class="helptext" style="margin:0 0 8px;">Note: ${esc(next.notes)}</p>` : ''}
@@ -2385,7 +2437,7 @@
       return `
         <div class="card route-upload">
           <h2 style="margin:0 0 6px;">Plan today's route</h2>
-          <p class="helptext" style="margin:0 0 16px;">Upload your run sheet (Excel .xlsx or CSV). We'll find every address, group parcels going to the same place, and put the stops in a short driving order.</p>
+          <p class="helptext" style="margin:0 0 16px;">Upload your run sheet (Excel .xlsx or CSV). We'll find every address, group parcels going to the same place, and put the stops in a short driving order. New addresses take about a second each the first time; saved ones are instant.</p>
           <label class="route-drop">
             <input type="file" accept=".xlsx,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" data-onchange="route-file">
             <span class="route-drop-title">Choose run sheet</span>
@@ -2474,9 +2526,10 @@
         catch (e) { routeUi.busy = ''; renderView(); toast(e.message + ' Or choose "An address" as the start.', 'err'); return; }
       }
       routeUi.busy = `Finding ${stops.length} addresses…`; renderView();
-      const lookups = await geocodeForRoute(stops.map((s) => s.address).concat(startMode === 'address' ? [startAddress] : []), (done, total) => {
-        routeUi.busy = `Finding addresses… ${done} of ${total}`; const p = document.querySelector('.route-spinner + p'); if (p) p.textContent = routeUi.busy;
-      });
+      const lookups = await geocodeForRoute(stops.map((s) => s.address).concat(startMode === 'address' ? [startAddress] : []), (done, total, left) => {
+        routeUi.busy = `Finding addresses… ${done} of ${total}` + (left > 3 ? ` (about ${Math.ceil(left * 1.1)} seconds left — saved addresses are instant next time)` : '');
+        const p = document.querySelector('.route-spinner + p'); if (p) p.textContent = routeUi.busy;
+      }, stops.map((s) => s.parts).concat(startMode === 'address' ? [null] : []));
       if (startMode === 'address') {
         const s = lookups.pop();
         if (s.error) { routeUi.busy = ''; renderView(); toast('Start address: ' + s.error, 'err'); return; }
@@ -2488,8 +2541,7 @@
         if (g && !g.error) found.push(Object.assign({}, s, { lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: g.partial }));
         else unmatched.push(Object.assign({}, s, { error: g ? g.error : 'Not found' }));
       });
-      const allMissing = !found.length && unmatched.length && unmatched.every((u) => /not switched on|key/i.test(u.error || ''));
-      if (allMissing) { routeUi.busy = ''; renderView(); toast(unmatched[0].error + ' Ask your admin to finish the Google Maps setup.', 'err'); return; }
+      if (!found.length) { routeUi.busy = ''; renderView(); toast(unmatched.length ? unmatched[0].error + ' — check the address column is right.' : 'No addresses found.', 'err'); return; }
       routeUi.busy = 'Putting stops in the best order…'; renderView();
       await new Promise((r) => setTimeout(r, 30));
       const order = optimiseOrder(start, found, returnToStart);
@@ -2638,7 +2690,7 @@
       const stop = route.stops.find((s) => s.id === el.dataset.stop); if (!stop) return;
       openModal(`
         <div class="modal-head"><h3>Why did this delivery fail?</h3><button class="modal-close" data-action="modal-close" aria-label="Close">×</button></div>
-        <p class="helptext" style="margin:0 0 12px;">${esc(stop.formatted || stop.address)}</p>
+        <p class="helptext" style="margin:0 0 12px;">${esc(stop.address)}</p>
         <form data-onsubmit="route-fail-save" data-route="${route.id}" data-stop="${stop.id}">
           <div class="route-reasons">${FAIL_REASONS.map((r, i) => `<label class="route-reason"><input type="radio" name="reason" value="${r}" ${i === 0 ? 'checked' : ''}> ${r}</label>`).join('')}</div>
           <div class="field" style="margin:12px 0;"><label class="field-label">Note (optional)</label><input type="text" name="note" placeholder="e.g. Card left, gate locked"></div>
