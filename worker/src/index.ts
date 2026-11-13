@@ -72,24 +72,45 @@ async function readDoc(env: Env, collection: string, id: string) {
   try { return JSON.parse(row.data_json); } catch { return null; }
 }
 // ---- Route planner: reading parcel labels with AI ------------------------
-const LABEL_MODEL = '@cf/meta/llama-4-scout-17b-16e-instruct';
-const LABEL_PROMPT = `You read Australian parcel delivery labels from photos.
-Return ONLY JSON, no other text, in this exact shape:
-{"labels":[{"address":"street address with unit, e.g. Unit 4, 12 Smith Street","suburb":"","state":"NSW|VIC|QLD|WA|SA|TAS|ACT|NT","postcode":"4 digits","name":"recipient name","phone":"","tracking":"tracking / consignment / barcode number","notes":"delivery instructions on the label","confidence":"high|medium|low"}]}
-Rules: use the DELIVER TO / recipient address, never the sender or return address. Copy text exactly as printed; do not guess missing parts (leave them empty). One object per label; if there is no readable label return {"labels":[]}.`;
+const LABEL_MODELS = ['@cf/meta/llama-4-scout-17b-16e-instruct', '@cf/google/gemma-3-12b-it'];
+const LABEL_PROMPT = `You read Australian parcel deliveries from photos. The photo is EITHER a parcel label OR a screenshot of a courier app's delivery task list (often several tasks per screenshot, each with a stop number like "8-1", a tracking number like "AMZ0001682231", a name, a masked phone and an address).
+Return ONLY JSON, no other text, exactly in this shape:
+{"labels":[{"stop":"stop/sequence number as shown e.g. 8-1","tracking":"tracking / consignment / barcode number","name":"recipient name","phone":"phone number exactly as shown","place":"business or building name if any, e.g. Caddens Medical Centre","address":"street address only, with unit/shop, e.g. Shop 14, 68 O'Connell Street","suburb":"","state":"NSW|VIC|QLD|WA|SA|TAS|ACT|NT or empty","postcode":"4 digits or empty","notes":"delivery instructions if any","confidence":"high|medium|low"}]}
+Rules:
+- One object for EVERY delivery task or label visible, in the order shown (top to bottom). Include tasks that are only partly visible if the address can be read.
+- Use the DELIVER TO / recipient address, never a sender, return or depot address.
+- Words can be broken across lines (e.g. "sh opping", "stre et."): join them back ("shopping", "street").
+- Put a business/building/centre name in "place", NOT in "address". "address" must start with the unit/shop or street number.
+- Copy text as printed; never invent missing parts (leave them empty).
+- If nothing readable, return {"labels":[]}.`;
+function aiText(out: any): string {
+  if (out == null) return '';
+  if (typeof out === 'string') return out;
+  const r = out.response ?? out.result?.response ?? out.choices?.[0]?.message?.content ?? out.output_text;
+  if (r == null) return JSON.stringify(out);
+  return typeof r === 'string' ? r : JSON.stringify(r);
+}
 function parseLabels(text: string) {
   const start = text.indexOf('{'), end = text.lastIndexOf('}');
-  if (start < 0 || end <= start) return [];
-  let data: any;
-  try { data = JSON.parse(text.slice(start, end + 1)); } catch { return []; }
-  const list = Array.isArray(data) ? data : Array.isArray(data?.labels) ? data.labels : [data];
+  let data: any = null;
+  if (start >= 0 && end > start) { try { data = JSON.parse(text.slice(start, end + 1)); } catch { data = null; } }
+  if (!data) {
+    // Some models wrap a bare array: [ {...}, {...} ]
+    const a = text.indexOf('['), z = text.lastIndexOf(']');
+    if (a >= 0 && z > a) { try { data = JSON.parse(text.slice(a, z + 1)); } catch { return []; } } else return [];
+  }
+  const list = Array.isArray(data) ? data : Array.isArray(data?.labels) ? data.labels : Array.isArray(data?.tasks) ? data.tasks : [data];
   const clean = (v: unknown, max = 200) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
-  return list.filter((l: any) => l && clean(l.address)).slice(0, 10).map((l: any) => ({
-    address: clean(l.address), suburb: clean(l.suburb, 80), state: clean(l.state, 10).toUpperCase(),
-    postcode: (clean(l.postcode, 10).match(/\d{4}/) || [''])[0], name: clean(l.name, 120), phone: clean(l.phone, 40),
-    tracking: clean(l.tracking, 80), notes: clean(l.notes, 300),
-    confidence: ['high', 'medium', 'low'].includes(clean(l.confidence).toLowerCase()) ? clean(l.confidence).toLowerCase() : 'medium',
-  }));
+  return list.filter((l: any) => l && clean(l.address)).slice(0, 25).map((l: any) => {
+    const phone = clean(l.phone, 40);
+    return {
+      stop: clean(l.stop ?? l.stopNumber ?? l.sequence, 20), tracking: clean(l.tracking, 80), name: clean(l.name, 120),
+      phone: /\*/.test(phone) ? '' : phone, place: clean(l.place, 120),
+      address: clean(l.address), suburb: clean(l.suburb, 80), state: clean(l.state, 10).toUpperCase(),
+      postcode: (clean(l.postcode, 10).match(/\d{4}/) || [''])[0], notes: clean(l.notes, 300),
+      confidence: ['high', 'medium', 'low'].includes(clean(l.confidence).toLowerCase()) ? clean(l.confidence).toLowerCase() : 'medium',
+    };
+  });
 }
 
 // ---- Route planner: address lookup ---------------------------------------
@@ -390,24 +411,30 @@ async function api(request: Request, env: Env): Promise<Response> {
     const image = String(body?.image || '');
     if (!/^data:image\/(jpeg|png|webp);base64,/.test(image)) return fail('Send a JPEG, PNG or WebP photo.');
     if (image.length > 2_000_000) return fail('Photo is too large. Try again with a smaller photo.');
-    try {
-      const out = await env.AI.run(LABEL_MODEL, {
-        messages: [
-          { role: 'system', content: LABEL_PROMPT },
-          { role: 'user', content: [
-            { type: 'text', text: 'Read the delivery label(s) in this photo and return the JSON.' },
-            { type: 'image_url', image_url: { url: image } },
-          ] },
-        ],
-        max_tokens: 500, temperature: 0,
-      });
-      const text = typeof out === 'string' ? out : String(out?.response ?? out?.result?.response ?? out?.choices?.[0]?.message?.content ?? '');
-      return json({ labels: parseLabels(text) });
-    } catch (e: any) {
-      console.warn('read-label failed', e?.message || e);
-      const msg = String(e?.message || '');
-      return fail(/limit|quota|neuron|4006/i.test(msg) ? 'Today\'s free photo-reading allowance is used up. Try again tomorrow or type the address.' : 'Could not read this photo. Try a clearer, closer photo of the label.', 502);
+    const input = {
+      messages: [
+        { role: 'system', content: LABEL_PROMPT },
+        { role: 'user', content: [
+          { type: 'text', text: 'Read every delivery in this image and return the JSON.' },
+          { type: 'image_url', image_url: { url: image } },
+        ] },
+      ],
+      max_tokens: 1500, temperature: 0,
+    };
+    let lastError = '';
+    for (const model of LABEL_MODELS) {
+      try {
+        const labels = parseLabels(aiText(await env.AI.run(model, input)));
+        if (labels.length) return json({ labels, model });
+        lastError = 'no-labels';
+      } catch (e: any) {
+        lastError = String(e?.message || e);
+        console.warn('read-label failed', model, lastError);
+        if (/limit|quota|neuron|4006/i.test(lastError)) return fail('Today\'s free photo-reading allowance is used up. Try again tomorrow or type the address.', 429);
+      }
     }
+    if (lastError === 'no-labels') return json({ labels: [] });
+    return fail('Could not read this photo. Try a clearer photo or screenshot.', 502);
   }
   if (path === '/api/route/address-note' && method === 'POST') {
     const account = await currentAccount(request, env);

@@ -783,3 +783,8 @@ table.data tfoot td { background: var(--surface-2); border-top: 1px solid var(--
 .photo-fields input { width: 100%; padding: 9px 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); font: inherit; font-size: .9rem; background: #fff; min-width: 0; }
 .photo-grid { display: grid; grid-template-columns: 1.4fr .7fr 1fr; gap: 6px; }
 @media (max-width: 480px) { .photo-grid { grid-template-columns: 1fr 1fr; } .photo-grid input:first-child { grid-column: 1 / -1; } }
+.photo-stop { display: inline-block; justify-self: start; font-size: .74rem; font-weight: 700; padding: 3px 9px; border-radius: 99px; background: var(--navy); color: var(--gold-light); }
+.photo-failed { margin-top: 12px; padding: 10px; border-radius: var(--radius); background: var(--danger-soft); }
+.photo-failed-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.photo-failed-item { display: flex; align-items: center; gap: 6px; background: #fff; padding: 4px; border-radius: 10px; }
+.photo-thumb-sm { width: 40px; height: 40px; object-fit: cover; border-radius: 6px; }

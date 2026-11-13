@@ -2905,13 +2905,59 @@
   // routeUi.photo = { target: 'new' | routeId, items: [{ id, thumb, status, labels, error }] }
   function photoInputs(label) {
     return `<div class="photo-pick">
-      <label class="btn btn-primary photo-btn"><input type="file" accept="image/*" capture="environment" data-onchange="route-photos">Take a photo</label>
-      <label class="btn photo-btn"><input type="file" accept="image/*" multiple data-onchange="route-photos">${label || 'Choose label photos'}</label>
-    </div>`;
+      <label class="btn btn-primary photo-btn"><input type="file" accept="image/*" multiple data-onchange="route-photos">${label || 'Choose photos / screenshots'}</label>
+      <label class="btn photo-btn"><input type="file" accept="image/*" capture="environment" data-onchange="route-photos">Take a photo</label>
+    </div>
+    <p class="helptext" style="margin:8px 0 0;">iPhone: tap <strong>Photo Library</strong>, then tap each screenshot to tick it (or tap <strong>Select</strong>), then <strong>Add</strong>. You can also add them a few at a time.</p>`;
   }
   function photoLabels() {
     const ph = routeUi.photo; if (!ph) return [];
-    return ph.items.flatMap((it) => (it.labels || []).map((l, j) => ({ it, l, j })));
+    const seen = new Set();
+    const all = ph.items.flatMap((it) => (it.labels || []).map((l, j) => ({ it, l, j }))).filter(({ l }) => {
+      const key = (l.tracking || '').toUpperCase() || `${l.stop}|${l.address}|${l.suburb}`.toLowerCase();
+      if (seen.has(key)) return false; seen.add(key); return true;
+    });
+    // A half-read copy of the same delivery (same name, missing tracking or
+    // suburb) is dropped in favour of the more complete one.
+    const score = (l) => (l.tracking ? 4 : 0) + (l.stop ? 2 : 0) + (l.suburb ? 2 : 0) + (l.address || '').length / 100;
+    return all.filter((x) => {
+      const nm = (x.l.name || '').trim().toLowerCase(); if (!nm) return true;
+      return !all.some((y) => y !== x && (y.l.name || '').trim().toLowerCase() === nm && (!x.l.tracking || !y.l.tracking || x.l.tracking === y.l.tracking) && score(y.l) > score(x.l));
+    });
+  }
+  // Tall screenshots are read in overlapping pieces so small text stays readable.
+  function photoTiles(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('Could not open this photo'));
+      reader.onload = () => {
+        const img = new Image();
+        img.onerror = () => reject(new Error('This photo format can\'t be opened. Try a screenshot or JPEG.'));
+        img.onload = () => {
+          const W = img.width, H = img.height;
+          const piece = (sy, sh, maxW) => {
+            const sc = Math.min(1, maxW / W);
+            const c = document.createElement('canvas'); c.width = Math.round(W * sc); c.height = Math.round(sh * sc);
+            c.getContext('2d').drawImage(img, 0, sy, W, sh, 0, 0, c.width, c.height);
+            return c.toDataURL('image/jpeg', 0.8);
+          };
+          const tiles = [];
+          // Normal phone screenshots (up to ~2.6× taller than wide) are read whole.
+          // Extra-tall scrolling screenshots are cut with an overlap larger
+          // than a task card, so every task is complete in at least one piece.
+          if (H > W * 2.6) {
+            const tileH = Math.round(W * 2), step = Math.round(W * 1.2);
+            for (let y = 0; y < H; y += step) { const sh = Math.min(tileH, H - y); tiles.push(piece(y, sh, 1100)); if (y + sh >= H) break; }
+          } else tiles.push(piece(0, H, H > W ? 1100 : 1400));
+          const sc = 160 / Math.max(W, H); const c = document.createElement('canvas');
+          c.width = Math.max(1, Math.round(W * sc)); c.height = Math.max(1, Math.round(H * sc));
+          c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+          resolve({ tiles, thumb: c.toDataURL('image/jpeg', 0.7) });
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
   }
   function routePhotoReview() {
     const ph = routeUi.photo;
@@ -2923,13 +2969,15 @@
         <h2 style="margin:0 0 4px;">${ph.target === 'new' ? 'Stops from parcel photos' : 'Add stops from parcel photos'}</h2>
         <p class="helptext" style="margin:0 0 12px;">Take or choose photos of the delivery labels. AI reads the address, name, phone and tracking number — check each one before adding.</p>
         ${photoInputs(ph.items.length ? 'Add more photos' : 'Choose label photos')}
-        ${reading ? `<div class="photo-progress"><div class="route-spinner" aria-hidden="true"></div><span>Reading ${ph.items.length - reading + 1} of ${ph.items.length} photos…</span></div>` : ''}
+        ${reading ? `<div class="photo-progress"><div class="route-spinner" aria-hidden="true"></div><span>Reading photo ${ph.items.length - reading + 1} of ${ph.items.length}…</span></div>` : ''}
         ${labels.length ? `<p class="eyebrow" style="margin:16px 0 8px;">${labels.length} label${labels.length > 1 ? 's' : ''} read</p>
           <div class="photo-list">${labels.map(({ it, l, j }) => `
             <div class="photo-row ${l.confidence === 'low' ? 'is-low' : ''}">
               <img src="${it.thumb}" alt="Label photo" class="photo-thumb">
               <div class="photo-fields">
+                ${l.stop ? `<span class="photo-stop">Stop ${esc(l.stop)}</span>` : ''}
                 ${l.confidence === 'low' ? '<p class="helptext route-approx" style="margin:0 0 4px;">Hard to read — please check</p>' : ''}
+                ${l.place ? `<input type="text" value="${esc(l.place)}" placeholder="Business / building" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="place" aria-label="Business or building">` : ''}
                 <input type="text" name="address" value="${esc(l.address)}" placeholder="Street address" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="address" aria-label="Street address">
                 <div class="photo-grid">
                   <input type="text" value="${esc(l.suburb)}" placeholder="Suburb" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="suburb" aria-label="Suburb">
@@ -2945,7 +2993,8 @@
               </div>
               <button class="btn btn-sm" data-action="route-photo-remove" data-item="${it.id}" data-j="${j}" aria-label="Remove">✕</button>
             </div>`).join('')}</div>` : ''}
-        ${failed.length ? `<p class="helptext" style="margin:12px 0 0;color:var(--danger);">${failed.length} photo${failed.length > 1 ? 's' : ''} couldn't be read${failed[0].error ? ` (${esc(failed[0].error)})` : ''}. Take a closer, straight-on photo of the label.</p>` : ''}
+        ${failed.length ? `<div class="photo-failed"><p class="helptext" style="margin:0;color:var(--danger);">${failed.length} photo${failed.length > 1 ? 's' : ''} had no readable deliveries${failed[0].error ? ` (${esc(failed[0].error)})` : ''}. Make sure the address is clear, then try again.</p>
+          <div class="photo-failed-list">${failed.map((it) => `<span class="photo-failed-item"><img src="${it.thumb}" alt="" class="photo-thumb-sm">${it.tiles && it.tiles.length ? `<button class="btn btn-sm" data-action="route-photo-retry" data-item="${it.id}">Try again</button>` : ''}<button class="btn btn-sm" data-action="route-photo-drop" data-item="${it.id}" aria-label="Remove photo">✕</button></span>`).join('')}</div></div>` : ''}
         <div class="stop-edit-actions">
           <button class="btn btn-primary" data-action="route-photo-use" ${labels.length && !reading ? '' : 'disabled'}>${ph.target === 'new' ? `Plan route with ${labels.length} stop${labels.length === 1 ? '' : 's'}` : `Add ${labels.length} stop${labels.length === 1 ? '' : 's'} to route`}</button>
           <button class="btn" data-action="route-photo-cancel">${ph.target === 'new' ? 'Cancel' : 'Back to route'}</button>
@@ -2959,22 +3008,29 @@
       while (routeUi.photo) {
         const it = routeUi.photo.items.find((x) => x.status === 'queued');
         if (!it) break;
-        it.status = 'reading'; renderView();
-        try {
-          const res = await fetch('/api/route/read-label', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ image: it.image }) });
-          let body = {}; try { body = await res.json(); } catch (e) {}
-          if (!res.ok) throw new Error(body.error || 'Could not read this photo.');
-          it.labels = (body.labels || []).map((l) => Object.assign({ suburb: '', state: '', postcode: '', name: '', phone: '', tracking: '', notes: '', confidence: 'medium' }, l));
-          it.status = 'done';
-          if (/allowance is used up/.test(String(body.error || ''))) break;
-        } catch (e) {
-          it.status = 'error'; it.error = e.message;
-          if (/allowance|not switched on/i.test(e.message)) { routeUi.photo.items.filter((x) => x.status === 'queued').forEach((x) => { x.status = 'error'; x.error = e.message; }); toast(e.message, 'err'); }
+        it.status = 'reading'; it.error = ''; it.labels = []; renderView();
+        let stopAll = '';
+        for (const tile of it.tiles || []) {
+          try {
+            const res = await fetch('/api/route/read-label', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ image: tile }) });
+            let body = {}; try { body = await res.json(); } catch (e) {}
+            if (!res.ok) throw new Error(body.error || 'Could not read this photo.');
+            (body.labels || []).forEach((l) => it.labels.push(Object.assign({ stop: '', place: '', suburb: '', state: '', postcode: '', name: '', phone: '', tracking: '', notes: '', confidence: 'medium' }, l)));
+          } catch (e) {
+            it.error = e.message;
+            if (/allowance|not switched on/i.test(e.message)) { stopAll = e.message; break; }
+          }
         }
-        delete it.image;
+        it.status = it.labels.length ? 'done' : 'error';
+        if (it.labels.length) { it.error = ''; delete it.tiles; }
+        if (stopAll) { routeUi.photo.items.filter((x) => x.status === 'queued').forEach((x) => { x.status = 'error'; x.error = stopAll; }); toast(stopAll, 'err'); }
         renderView();
       }
     } finally { photoQueueRunning = false; }
+  }
+  // Notes carry the courier's stop number and any business name, e.g. "Stop 8-2 · Caddens Medical Centre".
+  function labelNotes(l) {
+    return [l.stop ? 'Stop ' + l.stop : '', l.place, l.notes].filter(Boolean).join(' · ');
   }
   function labelFullAddress(l) {
     const parts = [l.address];
@@ -3365,6 +3421,8 @@
     },
     'route-photo-start': (el) => { routeUi.photo = { target: el.dataset.route, items: [] }; renderView(); window.scrollTo(0, 0); },
     'route-photo-cancel': () => { routeUi.photo = null; renderView(); },
+    'route-photo-retry': (el) => { const it = routeUi.photo && routeUi.photo.items.find((x) => x.id === el.dataset.item); if (it) { it.status = 'queued'; renderView(); runPhotoQueue(); } },
+    'route-photo-drop': (el) => { if (!routeUi.photo) return; routeUi.photo.items = routeUi.photo.items.filter((x) => x.id !== el.dataset.item); renderView(); },
     'route-photo-remove': (el) => {
       const it = routeUi.photo && routeUi.photo.items.find((x) => x.id === el.dataset.item); if (!it) return;
       it.labels.splice(Number(el.dataset.j), 1); renderView();
@@ -3376,7 +3434,7 @@
       if (ph.target === 'new') {
         const headers = ['Address', 'Suburb', 'State', 'Postcode', 'Recipient', 'Phone', 'Tracking', 'Notes'];
         routeUi.draft = { fileName: `${ph.items.length} label photo${ph.items.length > 1 ? 's' : ''}`, headers,
-          rows: labels.map((l) => [l.address, l.suburb, l.state, l.postcode, l.name, l.phone, l.tracking, l.notes]),
+          rows: labels.map((l) => [l.address, l.suburb, l.state, l.postcode, l.name, l.phone, l.tracking, labelNotes(l)]),
           map: { address: 0, suburb: 1, state: 2, postcode: 3, name: 4, phone: 5, ref: 6, notes: 7, parcels: -1, email: -1, earliest: -1, latest: -1, timeAtStop: -1, stopType: -1 } };
         routeUi.photo = null; renderView(); window.scrollTo(0, 0);
         return;
@@ -3389,7 +3447,7 @@
         const stops = route.stops.slice(); const unmatched = (route.unmatched || []).slice(); let added = 0;
         labels.forEach((l, i) => {
           const g = res[i];
-          const base = { address: labelFullAddress(l), name: l.name, phone: l.phone, email: '', refs: l.tracking ? [l.tracking] : [], parcels: 1, notes: l.notes, stopType: 'delivery', placement: 'auto',
+          const base = { address: labelFullAddress(l), name: l.name, phone: l.phone, email: '', refs: l.tracking ? [l.tracking] : [], parcels: 1, notes: labelNotes(l), stopType: 'delivery', placement: 'auto',
             parts: { street: l.address, suburb: l.suburb, state: l.state, postcode: l.postcode } };
           if (!g || g.error) { unmatched.push(Object.assign(base, { error: g ? g.error : 'Address not found' })); return; }
           insertCheapest(route, stops, Object.assign(base, { id: 's' + genId(), lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: !!g.partial, access: g.access || '', status: 'pending', reason: '', doneAt: null }));
@@ -3927,18 +3985,18 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
 
   const CHANGE_HANDLERS = {
     'route-photos': async (el) => {
-      const files = [...(el.files || [])].filter((f) => /^image\//.test(f.type) || /\.(jpe?g|png|heic|webp)$/i.test(f.name));
+      const files = [...(el.files || [])];
       el.value = '';
       if (!files.length) return;
       if (!routeUi.photo) routeUi.photo = { target: 'new', items: [] };
       if (routeUi.photo.items.length + files.length > 150) { toast('Up to 150 photos at a time.', 'err'); return; }
       for (const f of files) {
         try {
-          const image = await readAndCompressImage(f, 1280);
-          const thumb = await new Promise((resolve) => { const img = new Image(); img.onload = () => { const c = document.createElement('canvas'); const sc = 160 / Math.max(img.width, img.height); c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc); c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); resolve(c.toDataURL('image/jpeg', 0.7)); }; img.onerror = () => resolve(''); img.src = image; });
-          routeUi.photo.items.push({ id: 'p' + genId(), image, thumb, status: 'queued', labels: [] });
-        } catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
+          const { tiles, thumb } = await photoTiles(f);
+          routeUi.photo.items.push({ id: 'p' + genId(), tiles, thumb, status: 'queued', labels: [] });
+        } catch (e) { toast(`${f.name || 'Photo'}: ${e.message}`, 'err'); }
       }
+      if (files.length > 1) toast(`${files.length} photos added — reading them now.`, 'ok');
       renderView(); runPhotoQueue();
     },
     'route-photo-edit': (el) => {
