@@ -652,7 +652,7 @@
     const st = labourCostStats(from, to);
     if (!st.estBillCost && !st.actualBillCost) return '';
     return `
-      <div class="section-title"><h2>Labour cost visibility</h2><span class="helptext">${fmtDateHuman(from)} – ${fmtDateHuman(to)}</span></div>
+      <div class="section-title"><h2>Labour cost visibility</h2></div>
       <div class="grid-stats" style="margin-bottom:16px;">
         <div class="stat-tile"><div class="stat-label">Rostered bill (estimated)</div><div class="stat-value">${fmtMoney(st.estBillCost)}</div></div>
         <div class="stat-tile"><div class="stat-label">Rostered worker pay (estimated)</div><div class="stat-value">${fmtMoney(st.estPayCost)}</div></div>
@@ -686,7 +686,7 @@
     const st = deliveryOpsStats(from, to);
     if (!st.started) return '';
     return `
-      <div class="section-title"><h2>Delivery operations</h2><span class="helptext">${fmtDateHuman(from)} – ${fmtDateHuman(to)}</span></div>
+      <div class="section-title"><h2>Delivery operations</h2></div>
       <div class="grid-stats" style="margin-bottom:16px;">
         <div class="stat-tile accent"><div class="stat-label">Drivers started</div><div class="stat-value">${st.started}</div></div>
         <div class="stat-tile"><div class="stat-label">Drivers finished</div><div class="stat-value">${st.finished}</div></div>
@@ -697,7 +697,6 @@
     `;
   }
   function viewDashboard() {
-    const today = todayStr();
     const { from, to } = dashboardRange();
     const s = rangeStats(from, to);
     const companyRows = companyRangeStats(from, to);
@@ -708,63 +707,56 @@
       const d = new Date(); d.setDate(d.getDate() - i);
       const ds = toDateStr(d);
       const bs = rangeStats(ds, ds);
-      bars.push({ label: d.toLocaleDateString(undefined, { weekday: 'short' }), pay: bs.pay });
+      bars.push({ label: d.toLocaleDateString(undefined, { weekday: 'short' }), pay: bs.pay, isToday: i === 0 });
     }
     const maxPay = Math.max(1, ...bars.map((b) => b.pay));
+    const fmtMoneyShort = (n) => { n = Number(n) || 0; return Math.abs(n) >= 1000 ? `$${(n / 1000).toFixed(1).replace(/\.0$/, '')}k` : `$${Math.round(n)}`; };
+    const barsAria = 'Pay for the last 7 days: ' + bars.map((b) => `${b.label} ${fmtMoney(b.pay)}`).join(', ');
 
     const companyBody = companyRows.length ? companyRows.map((c) => `
-      <tr><td>${esc(c.name)}</td><td class="tnum">${c.jobs}</td><td class="tnum">${c.car}</td><td class="tnum">${c.van}</td><td class="tnum" style="font-weight:700;">${fmtMoney(c.pay)}</td><td class="tnum">${fmtMoney(c.jobs ? c.pay / c.jobs : 0)}</td></tr>
+      <tr><td>${esc(c.name)}</td><td class="tnum">${c.jobs}</td><td class="tnum col-opt">${c.car}</td><td class="tnum col-opt">${c.van}</td><td class="tnum" style="font-weight:700;">${fmtMoney(c.pay)}</td><td class="tnum col-opt">${fmtMoney(c.jobs ? c.pay / c.jobs : 0)}</td></tr>
     `).join('') : `<tr><td colspan="6"><div class="empty-state">No activity in this range.</div></td></tr>`;
+    const rangeText = from === to ? fmtDateHuman(from) : `${fmtDateHuman(from)} – ${fmtDateHuman(to)}`;
+    const attentionRows = isAdminOrManager() ? driverSubmissionsBanner() + labourLogsBanner() : '';
     const companyTotals = companyRows.reduce((acc, c) => ({ jobs: acc.jobs + c.jobs, car: acc.car + c.car, van: acc.van + c.van, pay: acc.pay + c.pay }), { jobs: 0, car: 0, van: 0, pay: 0 });
 
     return `
       <div class="view-header">
-        <div><h1>Dashboard</h1><div class="sub">${fmtDateHuman(today)}</div></div>
-        <button class="btn btn-primary" data-action="nav" data-route="entry">+ Enter today's records</button>
+        <div><h1>Dashboard</h1><div class="sub">${rangeText}</div></div>
+        <button class="btn btn-primary" data-action="nav" data-route="entry"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" style="vertical-align:-3px;margin-right:6px;"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>Add a record</button>
       </div>
 
-      <div class="card date-section" style="margin-bottom:16px;">
-        <div class="date-section-inner">
-          <div>
-            <label class="field-label">Showing</label>
-            <div class="date-display">${fmtDateHuman(from)} – ${fmtDateHuman(to)}</div>
-          </div>
-          <div class="date-section-controls">
-            <button class="btn btn-sm ${dashboardUi.range === 'today' ? 'btn-primary' : ''}" data-action="dash-range" data-range="today">Today</button>
-            <button class="btn btn-sm ${dashboardUi.range === 'week' ? 'btn-primary' : ''}" data-action="dash-range" data-range="week">This Week</button>
-            <button class="btn btn-sm ${dashboardUi.range === 'month' ? 'btn-primary' : ''}" data-action="dash-range" data-range="month">This Month</button>
-            <button class="btn btn-sm ${dashboardUi.range === 'custom' ? 'btn-primary' : ''}" data-action="dash-range" data-range="custom">Custom</button>
-            ${dashboardUi.range === 'custom' ? `<input type="date" value="${dashboardUi.from}" data-onchange="dash-custom" data-field="from"><input type="date" value="${dashboardUi.to}" data-onchange="dash-custom" data-field="to">` : ''}
-          </div>
+      ${attentionRows ? `<ul class="attention" aria-label="Needs attention">${attentionRows}</ul>` : ''}
+
+      <div class="dash-range">
+        <div class="seg" role="group" aria-label="Date range">
+          ${[['today', 'Today'], ['week', 'Week'], ['month', 'Month'], ['custom', 'Custom']].map(([key, label]) => `<button type="button" aria-pressed="${dashboardUi.range === key}" data-action="dash-range" data-range="${key}">${label}</button>`).join('')}
         </div>
+        ${dashboardUi.range === 'custom' ? `<div class="dash-custom-dates"><label class="field">From <input type="date" value="${dashboardUi.from}" data-onchange="dash-custom" data-field="from"></label><label class="field">To <input type="date" value="${dashboardUi.to}" data-onchange="dash-custom" data-field="to"></label></div>` : ''}
       </div>
 
-      <div class="grid-stats">
-        <div class="stat-tile accent"><div class="stat-label">Drivers working</div><div class="stat-value">${s.drivers}</div></div>
-        <div class="stat-tile"><div class="stat-label">Total blocks</div><div class="stat-value">${s.jobs}</div></div>
-        <div class="stat-tile"><div class="stat-label">Cars</div><div class="stat-value">${s.car}</div></div>
-        <div class="stat-tile"><div class="stat-label">Vans</div><div class="stat-value">${s.van}</div></div>
-        <div class="stat-tile"><div class="stat-label">Total payments</div><div class="stat-value">${fmtMoney(s.pay)}</div></div>
-      </div>
+      <section class="kpi">
+        <div class="eyebrow">Total pay</div>
+        <div class="kpi-value tnum">${fmtMoney(s.pay)}</div>
+        <div class="kpi-meta tnum">${s.jobs} block${s.jobs === 1 ? '' : 's'} · ${s.car} car · ${s.van} van · ${s.drivers} driver${s.drivers === 1 ? '' : 's'}</div>
+      </section>
 
-      <div class="section-title"><h2>By company</h2><span class="helptext">${fmtDateHuman(from)} – ${fmtDateHuman(to)}</span></div>
-      <div class="table-wrap">
+      <div class="section-title"><h2>By company</h2></div>
+      <div class="table-wrap dash-company">
         <table class="data">
-          <thead><tr><th>Company</th><th>Blocks</th><th>Car</th><th>Van</th><th>Total Pay</th><th>Avg / Block</th></tr></thead>
+          <thead><tr><th>Company</th><th class="num">Blocks</th><th class="num col-opt">Car</th><th class="num col-opt">Van</th><th class="num">Total pay</th><th class="num col-opt">Avg per block</th></tr></thead>
           <tbody>${companyBody}</tbody>
-          <tfoot><tr><td>TOTAL</td><td class="tnum">${companyTotals.jobs}</td><td class="tnum">${companyTotals.car}</td><td class="tnum">${companyTotals.van}</td><td class="tnum">${fmtMoney(companyTotals.pay)}</td><td class="tnum">${fmtMoney(companyTotals.jobs ? companyTotals.pay / companyTotals.jobs : 0)}</td></tr></tfoot>
+          <tfoot><tr><td>Total</td><td class="tnum">${companyTotals.jobs}</td><td class="tnum col-opt">${companyTotals.car}</td><td class="tnum col-opt">${companyTotals.van}</td><td class="tnum">${fmtMoney(companyTotals.pay)}</td><td class="tnum col-opt">${fmtMoney(companyTotals.jobs ? companyTotals.pay / companyTotals.jobs : 0)}</td></tr></tfoot>
         </table>
       </div>
 
-      ${isAdminOrManager() ? driverSubmissionsBanner() : ''}
-      ${isAdminOrManager() ? labourLogsBanner() : ''}
       ${isAdminOrManager() ? deliveryOpsCard(from, to) : ''}
       ${isAdminOrManager() ? labourCostCard(from, to) : ''}
 
-      <div class="section-title"><h2>Last 7 days — total pay</h2></div>
+      <div class="section-title"><h2>Pay, last 7 days</h2></div>
       <div class="card">
-        <div class="bars">
-          ${bars.map((b) => `<div class="bar-col"><div class="bar" style="height:${Math.max(3, Math.round((b.pay / maxPay) * 100))}%" title="${esc(b.label)}: ${fmtMoney(b.pay)}"></div><div class="bar-label">${esc(b.label)}</div></div>`).join('')}
+        <div class="bars dash-bars" role="img" aria-label="${esc(barsAria)}">
+          ${bars.map((b) => `<div class="bar-col" aria-hidden="true"><div class="bar-val tnum">${fmtMoneyShort(b.pay)}</div><div class="bar${b.isToday ? ' is-today' : ''}" style="height:${Math.max(3, Math.round((b.pay / maxPay) * 100))}%"></div><div class="bar-label">${esc(b.label)}</div></div>`).join('')}
         </div>
       </div>
       ${state.usingFallback ? `<p class="helptext" style="margin-top:16px;">Local preview mode — this browser isn't connected to the shared database, so data here is only stored on this device.</p>` : ''}
@@ -1828,7 +1820,7 @@
 
   function gateStorageNotice() {
     if (!state.usingFallback) return '';
-    return `<div class="gate-storage-notice" role="status"><strong>Device-only storage</strong><span>This build is not connected to your shared Cloudflare D1 data yet. Changes made here may not appear on other devices.</span></div>`;
+    return `<div class="gate-storage-notice" role="status"><strong>Offline copy</strong><span>This phone is using its own saved data. Changes won't show on other devices.</span></div>`;
   }
 
   function showGateError(message) {
@@ -1895,7 +1887,7 @@
         const dots = [0, 1, 2, 3].map((i) => `<div class="pin-dot ${i < pinBuffer.length ? 'filled' : ''}"></div>`).join('');
         gate.innerHTML = `
           <div class="gate-card card">
-            <div style="text-align:center;margin-bottom:6px;"><div class="avatar" style="margin:0 auto 10px;">${esc(staffMember.name.slice(0, 2).toUpperCase())}</div><h3>${esc(staffMember.name)}</h3><p class="helptext">${esc(String(staffMember.role || 'staff').charAt(0).toUpperCase() + String(staffMember.role || 'staff').slice(1))} account · Enter your 4-digit PIN</p>${state.usingFallback ? '<p class="gate-account-warning">This role is loaded from this device only. If you expected Labour but see Admin, this phone does not have the same account data as your laptop yet.</p>' : ''}</div>
+            <div style="text-align:center;margin-bottom:6px;"><div class="avatar" style="margin:0 auto 10px;">${esc(staffMember.name.slice(0, 2).toUpperCase())}</div><h3>${esc(staffMember.name)}</h3><p class="helptext">${esc(String(staffMember.role || 'staff').charAt(0).toUpperCase() + String(staffMember.role || 'staff').slice(1))} </p><p class="helptext" style="margin-top:10px;color:var(--ink);">Enter your 4-digit PIN</p>${state.usingFallback ? '<p class="gate-account-warning">Using this phone\'s saved data. If your role looks wrong, ask your manager.</p>' : ''}</div>
             <div class="pin-dots" aria-label="${pinBuffer.length} of 4 PIN digits entered">${dots}</div>
             <div class="keypad" aria-label="PIN keypad">
               ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `<button type="button" data-action="gate-key" data-key="${n}" aria-label="${n}">${n}</button>`).join('')}
@@ -1909,13 +1901,12 @@
     }
     gate.innerHTML = `
       <div class="gate-card card">
-        <div class="brand" style="padding:0 0 10px;"><div class="brand-mark">UM</div><div class="brand-text">${esc(state.settings.businessName || 'UMA Management')}<small>Log in</small></div></div>
-        <h2 style="margin-bottom:6px;">Log in</h2>
-        <p class="helptext" style="margin-bottom:16px;">Enter the mobile number linked to your account. Australian numbers work with 04 or +61 format.</p>
+        <div class="brand" style="padding:0 0 10px;"><div class="brand-mark">UM</div><div class="brand-text">${esc(state.settings.businessName || 'UMA Management')}</div></div>
+        <h2 style="margin-bottom:16px;">Sign in with your mobile number</h2>
         ${gateStorageNotice()}
         <form id="gate-mobile-form" data-onsubmit="gate-mobile-continue" novalidate>
-          <div class="field" style="margin-bottom:12px;"><label class="field-label" for="gate-mobile-input">Mobile number</label><input id="gate-mobile-input" type="tel" inputmode="tel" autocomplete="tel" enterkeyhint="go" autocapitalize="off" spellcheck="false" name="mobile" value="${esc(gateMobileDraft)}" aria-describedby="gate-mobile-help gate-mobile-error" required></div>
-          <p id="gate-mobile-help" class="helptext" style="margin:-4px 0 12px;font-size:.76rem;">Use the mobile number registered to your account.</p>
+          <div class="field" style="margin-bottom:12px;"><label class="field-label" for="gate-mobile-input">Mobile number</label><input id="gate-mobile-input" type="tel" inputmode="tel" autocomplete="tel" enterkeyhint="go" autocapitalize="off" spellcheck="false" name="mobile" placeholder="0412 345 678" value="${esc(gateMobileDraft)}" aria-describedby="gate-mobile-help gate-mobile-error" required></div>
+          <p id="gate-mobile-help" class="helptext" style="margin:-4px 0 12px;">04xx xxx xxx or +61 4xx xxx xxx</p>
           <p id="gate-mobile-error" class="gate-inline-error" role="alert" aria-live="polite" hidden></p>
           <button class="btn btn-primary gate-submit" type="button" data-action="gate-mobile-continue" style="width:100%;">Continue</button>
         </form>
@@ -1980,6 +1971,8 @@
     if (!roleAllowed(route, role)) { route = role === 'driver' ? 'driver-submit' : role === 'labour' ? 'labour-log' : 'dashboard'; }
     state.route = route;
     document.getElementById('content').innerHTML = VIEWS[route]();
+    const topbarTitle = document.getElementById('topbar-title');
+    if (topbarTitle) { const item = NAV.find((n) => n.id === route); topbarTitle.textContent = item ? item.label : ''; }
   }
 
   // ---------------------------------------------------------------
@@ -2125,7 +2118,7 @@
       const originalText = button.textContent;
       button.disabled = true;
       button.setAttribute('aria-busy', 'true');
-      button.textContent = 'Please wait…';
+      button.textContent = 'Checking number…';
       try {
         await SUBMIT_HANDLERS['gate-mobile-continue'](form);
       } catch (err) {
@@ -2579,7 +2572,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         const mobile = normalizeMobile(rawMobile);
         gateMobileDraft = rawMobile;
         if (mobile.length < 8 || mobile.length > 15) {
-          showGateError('Please enter a valid mobile number.');
+          showGateError('Enter a mobile number like 0412 345 678.');
           return;
         }
 
@@ -2597,8 +2590,8 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
 
         if (!matches.length) {
           showGateError(state.usingFallback
-            ? 'No account with this mobile number is saved on this phone. Your Labour account may be saved on your laptop only. Shared Cloudflare D1 login is not connected yet, so this phone cannot retrieve that account. Do not create a duplicate account; connect the existing D1 database first.'
-            : 'No active account was found for this mobile number. Check the number with your administrator.');
+            ? 'No account uses this number on this phone. Ask your manager to check your login — don\'t create a new one.'
+            : 'No account uses this number. Check it with your manager.');
           return;
         }
 
@@ -3558,7 +3551,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   function labourLogsBanner() {
     const pending = state.labourLogs.filter((g) => g.status === 'Pending').length;
     if (!pending) return '';
-    return `<div class="card" style="border-left:4px solid var(--accent);margin-bottom:16px;"><strong>${pending} labour log${pending === 1 ? '' : 's'}</strong> waiting for review — check <a data-action="nav" data-route="labour-logs" style="color:var(--accent);text-decoration:underline;cursor:pointer;">Labour Logs</a>.</div>`;
+    return `<li><span><strong class="tnum">${pending}</strong> labour log${pending === 1 ? '' : 's'} to approve</span><button class="btn btn-sm" data-action="nav" data-route="labour-logs">Review</button></li>`;
   }
   function todaysMatchedShift(labourId, today) {
     return state.labourShifts.find((s) => s.labourId === labourId && s.date === today && s.published);
@@ -4139,10 +4132,10 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     const pending = state.driverSubmissions.filter((s) => s.status === 'Pending').length;
     const missing = missingSubmissionsToday().length;
     if (!pending && !missing) return '';
-    const bits = [];
-    if (pending) bits.push(`<strong>${pending} driver submission${pending === 1 ? '' : 's'}</strong> waiting for review`);
-    if (missing) bits.push(`<strong>${missing} assigned driver${missing === 1 ? '' : 's'}</strong> haven't started today's work yet`);
-    return `<div class="card" style="border-left:4px solid var(--accent);margin-bottom:16px;">${bits.join(' — ')} — check <a data-action="nav" data-route="driver-submissions" style="color:var(--accent);text-decoration:underline;cursor:pointer;">Driver Submissions</a>.</div>`;
+    const rows = [];
+    if (pending) rows.push(`<li><span><strong class="tnum">${pending}</strong> driver submission${pending === 1 ? '' : 's'} to review</span><button class="btn btn-sm" data-action="nav" data-route="driver-submissions">Review</button></li>`);
+    if (missing) rows.push(`<li><span><strong class="tnum">${missing}</strong> assigned driver${missing === 1 ? '' : 's'} ${missing === 1 ? "hasn't" : "haven't"} started</span><button class="btn btn-sm" data-action="nav" data-route="driver-submissions">Check</button></li>`);
+    return rows.join('');
   }
   function submissionStatusPill(status) {
     if (status === 'Approved') return '<span class="pill pill-paid">Approved</span>';
