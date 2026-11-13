@@ -4,6 +4,7 @@ interface Env {
   ASSETS: Fetcher;
   SESSION_DAYS?: string;
   GOOGLE_MAPS_API_KEY?: string;
+  AI?: { run: (model: string, input: unknown) => Promise<any> };
 }
 
 type Account = {
@@ -70,6 +71,27 @@ async function readDoc(env: Env, collection: string, id: string) {
   if (!row) return null;
   try { return JSON.parse(row.data_json); } catch { return null; }
 }
+// ---- Route planner: reading parcel labels with AI ------------------------
+const LABEL_MODEL = '@cf/meta/llama-4-scout-17b-16e-instruct';
+const LABEL_PROMPT = `You read Australian parcel delivery labels from photos.
+Return ONLY JSON, no other text, in this exact shape:
+{"labels":[{"address":"street address with unit, e.g. Unit 4, 12 Smith Street","suburb":"","state":"NSW|VIC|QLD|WA|SA|TAS|ACT|NT","postcode":"4 digits","name":"recipient name","phone":"","tracking":"tracking / consignment / barcode number","notes":"delivery instructions on the label","confidence":"high|medium|low"}]}
+Rules: use the DELIVER TO / recipient address, never the sender or return address. Copy text exactly as printed; do not guess missing parts (leave them empty). One object per label; if there is no readable label return {"labels":[]}.`;
+function parseLabels(text: string) {
+  const start = text.indexOf('{'), end = text.lastIndexOf('}');
+  if (start < 0 || end <= start) return [];
+  let data: any;
+  try { data = JSON.parse(text.slice(start, end + 1)); } catch { return []; }
+  const list = Array.isArray(data) ? data : Array.isArray(data?.labels) ? data.labels : [data];
+  const clean = (v: unknown, max = 200) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+  return list.filter((l: any) => l && clean(l.address)).slice(0, 10).map((l: any) => ({
+    address: clean(l.address), suburb: clean(l.suburb, 80), state: clean(l.state, 10).toUpperCase(),
+    postcode: (clean(l.postcode, 10).match(/\d{4}/) || [''])[0], name: clean(l.name, 120), phone: clean(l.phone, 40),
+    tracking: clean(l.tracking, 80), notes: clean(l.notes, 300),
+    confidence: ['high', 'medium', 'low'].includes(clean(l.confidence).toLowerCase()) ? clean(l.confidence).toLowerCase() : 'medium',
+  }));
+}
+
 // ---- Route planner: address lookup ---------------------------------------
 // Addresses are turned into map points with the Google Geocoding API (key kept
 // as the GOOGLE_MAPS_API_KEY secret). Every successful lookup is cached in the
@@ -358,6 +380,34 @@ async function api(request: Request, env: Env): Promise<Response> {
       saved++;
     }
     return json({ saved });
+  }
+  if (path === '/api/route/read-label' && method === 'POST') {
+    const account = await currentAccount(request, env);
+    if (!account) return fail('Sign in required.', 401);
+    if (!['admin', 'manager', 'staff', 'driver'].includes(account.role)) return fail('Forbidden.', 403);
+    if (!env.AI) return fail('Photo reading is not switched on yet (Workers AI binding missing).', 503);
+    const body = await jsonBody(request);
+    const image = String(body?.image || '');
+    if (!/^data:image\/(jpeg|png|webp);base64,/.test(image)) return fail('Send a JPEG, PNG or WebP photo.');
+    if (image.length > 2_000_000) return fail('Photo is too large. Try again with a smaller photo.');
+    try {
+      const out = await env.AI.run(LABEL_MODEL, {
+        messages: [
+          { role: 'system', content: LABEL_PROMPT },
+          { role: 'user', content: [
+            { type: 'text', text: 'Read the delivery label(s) in this photo and return the JSON.' },
+            { type: 'image_url', image_url: { url: image } },
+          ] },
+        ],
+        max_tokens: 500, temperature: 0,
+      });
+      const text = typeof out === 'string' ? out : String(out?.response ?? out?.result?.response ?? out?.choices?.[0]?.message?.content ?? '');
+      return json({ labels: parseLabels(text) });
+    } catch (e: any) {
+      console.warn('read-label failed', e?.message || e);
+      const msg = String(e?.message || '');
+      return fail(/limit|quota|neuron|4006/i.test(msg) ? 'Today\'s free photo-reading allowance is used up. Try again tomorrow or type the address.' : 'Could not read this photo. Try a clearer, closer photo of the label.', 502);
+    }
   }
   if (path === '/api/route/address-note' && method === 'POST') {
     const account = await currentAccount(request, env);

@@ -765,3 +765,21 @@ table.data tfoot td { background: var(--surface-2); border-top: 1px solid var(--
 .colour-option input:focus-visible + span { outline: 2px solid var(--gold); outline-offset: 3px; }
 .stop-edit-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
 .stop-edit-actions .btn-primary { flex: 1 1 140px; justify-content: center; }
+
+/* Parcel label photos */
+.route-or { display: flex; align-items: center; gap: 12px; margin: 18px 0 14px; color: var(--ink-muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .1em; }
+.route-or::before, .route-or::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+.photo-pick { display: flex; gap: 10px; flex-wrap: wrap; }
+.photo-btn { position: relative; flex: 1 1 150px; justify-content: center; min-height: 48px; cursor: pointer; }
+.photo-btn input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.photo-btn:focus-within { outline: 2px solid var(--gold); outline-offset: 2px; }
+.photo-progress { display: flex; align-items: center; gap: 12px; margin: 14px 0 0; font-weight: 600; }
+.photo-progress .route-spinner { margin: 0; width: 24px; height: 24px; }
+.photo-list { display: grid; gap: 10px; }
+.photo-row { display: flex; gap: 10px; align-items: flex-start; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
+.photo-row.is-low { border-color: #e6cf9c; background: #fdf6e7; }
+.photo-thumb { width: 64px; height: 64px; object-fit: cover; border-radius: 8px; flex: none; }
+.photo-fields { flex: 1; min-width: 0; display: grid; gap: 6px; }
+.photo-fields input { width: 100%; padding: 9px 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); font: inherit; font-size: .9rem; background: #fff; min-width: 0; }
+.photo-grid { display: grid; grid-template-columns: 1.4fr .7fr 1fr; gap: 6px; }
+@media (max-width: 480px) { .photo-grid { grid-template-columns: 1fr 1fr; } .photo-grid input:first-child { grid-column: 1 / -1; } }

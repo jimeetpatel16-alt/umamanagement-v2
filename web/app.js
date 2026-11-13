@@ -2070,7 +2070,7 @@
   // neighbour + 2-opt on straight-line distance), and saved as a 'routes' doc.
   // The driver works through the stops and ticks Delivered / Failed; the
   // counts pre-fill their daily submission. Admin/Manager see every route.
-  const routeUi = { draft: null, busy: '', adminDate: '', viewId: null, showAll: false, reorder: false };
+  const routeUi = { draft: null, busy: '', adminDate: '', viewId: null, showAll: false, reorder: false, photo: null };
   const ROUTE_FIELDS = [
     ['address', 'Street address', /^(delivery |receiver |consignee |customer |recipient )?(street )?(address|addr)( ?line ?1)?$|^street$|address 1|address line 1|delivery address/],
     ['suburb', 'Suburb / city', /suburb|city|town|locality/],
@@ -2268,104 +2268,199 @@
     } catch (e) { return null; } finally { if (timer) clearTimeout(timer); }
   }
   const osrmCoords = (pts) => pts.map((p) => `${Number(p.lng).toFixed(6)},${Number(p.lat).toFixed(6)}`).join(';');
-  async function costMatrix(points) {
-    if (points.length >= 2 && points.length <= OSRM_MAX_POINTS) {
-      const j = await fetchJsonWithTimeout(`${OSRM_URL}/table/v1/driving/${osrmCoords(points)}?annotations=duration,distance`, 20000);
-      const sized = (m) => Array.isArray(m) && m.length === points.length && m.every((row) => Array.isArray(row) && row.length === points.length);
-      if (j && j.code === 'Ok' && sized(j.durations)) {
-        const dur = j.durations.map((row, i) => row.map((v, k) => (v == null ? straightSeconds(points[i], points[k]) : v)));
-        const dist = sized(j.distances)
-          ? j.distances.map((row, i) => row.map((v, k) => (v == null ? straightMetres(points[i], points[k]) : v)))
-          : points.map((a) => points.map((b) => straightMetres(a, b)));
-        return { dur, dist, source: 'roads' };
+  // Driving-time matrix. Up to 100 points is one request; bigger routes are
+  // fetched in 50×50 blocks (each request ≤ 100 points, as the free server
+  // allows), one block at a time to stay polite.
+  async function costMatrix(points, onProgress) {
+    const n = points.length;
+    const fallback = () => ({ dur: points.map((a) => points.map((b) => straightSeconds(a, b))), dist: points.map((a) => points.map((b) => straightMetres(a, b))), source: 'straight' });
+    if (n < 2) return fallback();
+    const dur = points.map(() => new Array(n).fill(null)), dist = points.map(() => new Array(n).fill(null));
+    const BLOCK = n <= OSRM_MAX_POINTS ? n : 50;
+    const blocks = []; for (let i = 0; i < n; i += BLOCK) blocks.push([...Array(Math.min(BLOCK, n - i)).keys()].map((k) => i + k));
+    const jobs = []; blocks.forEach((src) => blocks.forEach((dst) => jobs.push([src, dst])));
+    for (let jIdx = 0; jIdx < jobs.length; jIdx++) {
+      const [src, dst] = jobs[jIdx];
+      const ids = n <= OSRM_MAX_POINTS ? src : [...new Set(src.concat(dst))];
+      const pos = new Map(ids.map((id, k) => [id, k]));
+      const q = n <= OSRM_MAX_POINTS ? '' : `&sources=${src.map((i) => pos.get(i)).join(';')}&destinations=${dst.map((i) => pos.get(i)).join(';')}`;
+      if (jIdx > 0) await new Promise((r) => setTimeout(r, 1000));
+      const j = await fetchJsonWithTimeout(`${OSRM_URL}/table/v1/driving/${osrmCoords(ids.map((i) => points[i]))}?annotations=duration,distance${q}`, 20000);
+      if (!j || j.code !== 'Ok' || !Array.isArray(j.durations) || j.durations.length !== src.length || j.durations.some((row) => !Array.isArray(row) || row.length !== dst.length)) return fallback();
+      src.forEach((si, a) => dst.forEach((di, b) => {
+        const v = j.durations[a][b]; dur[si][di] = v == null ? straightSeconds(points[si], points[di]) : v;
+        const m = Array.isArray(j.distances) && j.distances[a] ? j.distances[a][b] : null; dist[si][di] = m == null ? straightMetres(points[si], points[di]) : m;
+      }));
+      if (onProgress && jobs.length > 1) onProgress(jIdx + 1, jobs.length);
+    }
+    return { dur, dist, source: 'roads' };
+  }
+  // ---- Route solver ----------------------------------------------------
+  // Iterated local search on the real (one-way-aware) driving-time matrix:
+  //   1. several nearest-neighbour starts,
+  //   2. local search with exact asymmetric 2-opt (segment reversal costed
+  //      in both directions), Or-opt (move 1–3 stops, either direction) and
+  //      stop swaps,
+  //   3. then, for a time budget, "kick" the best route (double-bridge:
+  //      cut it in four and rejoin in a new order) and re-run local search,
+  //      keeping any improvement.
+  // The start (node 0) is fixed. For one-way routes a free "end" node is
+  // added so every route is a closed loop internally.
+  // These functions are self-contained so they can also run in a Web Worker.
+  function rsBuild(C, n, ret) {
+    const N = ret ? n + 1 : n + 2, E = ret ? -1 : n + 1, BIG = 1e9;
+    const D = new Array(N);
+    for (let i = 0; i < N; i++) {
+      D[i] = new Float64Array(N);
+      for (let j = 0; j < N; j++) {
+        if (i === j) D[i][j] = 0;
+        else if (E < 0) D[i][j] = C[i][j];
+        else if (i === E) D[i][j] = j === 0 ? 0 : BIG;   // end → start only
+        else if (j === 0) D[i][j] = BIG;                 // nothing else returns to start
+        else if (j === E) D[i][j] = i === 0 ? BIG : 0;   // finish anywhere, for free
+        else D[i][j] = C[i][j];
       }
     }
-    return { dur: points.map((a) => points.map((b) => straightSeconds(a, b))), dist: points.map((a) => points.map((b) => straightMetres(a, b))), source: 'straight' };
+    return { D, N, E };
   }
-  function seededRandom(seed) {
-    return () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
-  }
-  function tourCost(C, tour, ret) {
-    let c = 0;
-    for (let i = 1; i < tour.length; i++) c += C[tour[i - 1]][tour[i]];
-    if (ret && tour.length > 1) c += C[tour[tour.length - 1]][tour[0]];
-    return c;
-  }
-  // tour = [0, stop nodes…]; node 0 (the start) never moves.
-  function improveTour(C, tour, ret) {
-    const n = tour.length;
-    const S = (a, b) => (a < 0 || b < 0 ? 0 : (C[a][b] + C[b][a]) / 2);
-    const after = (i) => (i < n ? tour[i] : ret ? tour[0] : -1);
+  function rsCost(D, t) { let c = 0; for (let i = 0; i < t.length; i++) c += D[t[i]][t[(i + 1) % t.length]]; return c; }
+  function rsLocal(D, t) {
+    const N = t.length; if (N < 4) return t;
+    const F = new Float64Array(N), B = new Float64Array(N);
+    const prefix = () => { F[0] = 0; B[0] = 0; for (let p = 1; p < N; p++) { F[p] = F[p - 1] + D[t[p - 1]][t[p]]; B[p] = B[p - 1] + D[t[p]][t[p - 1]]; } };
     let improved = true, guard = 0;
-    while (improved && guard++ < 100) {
-      improved = false;
-      for (let i = 1; i < n - 1; i++) {
-        for (let k = i + 1; k < n; k++) {
-          const a = tour[i - 1], b = tour[i], c = tour[k], e = after(k + 1);
-          if (S(a, c) + S(b, e) - S(a, b) - S(c, e) < -1e-6) {
-            for (let x = i, y = k; x < y; x++, y--) { const t = tour[x]; tour[x] = tour[y]; tour[y] = t; }
-            improved = true;
+    while (improved && guard++ < 400) {
+      improved = false; prefix();
+      // 2-opt: reverse t[i..k] (positions 1..N-1; node at position 0 stays)
+      for (let i = 1; i < N - 1 && !improved; i++) {
+        const a = t[i - 1];
+        for (let k = i + 1; k < N; k++) {
+          const b = t[i], c = t[k], d = t[(k + 1) % N];
+          const delta = D[a][c] + D[b][d] - D[a][b] - D[c][d] + (B[k] - B[i]) - (F[k] - F[i]);
+          if (delta < -1e-7) {
+            for (let x = i, y = k; x < y; x++, y--) { const tmp = t[x]; t[x] = t[y]; t[y] = tmp; }
+            improved = true; break;
           }
         }
       }
-      for (let L = 1; L <= 3; L++) {
-        for (let i = 1; i + L - 1 < n; i++) {
-          const segEnd = i + L - 1;
-          const p = tour[i - 1], f = tour[i], l = tour[segEnd], q = after(segEnd + 1);
-          const gain = S(p, f) + S(l, q) - S(p, q);
-          let best = null;
-          for (let j = 0; j < n; j++) {
-            if (j >= i - 1 && j <= segEnd) continue;
-            const x = tour[j], y = after(j + 1);
-            const fwd = S(x, f) + S(l, y) - S(x, y), rev = S(x, l) + S(f, y) - S(x, y);
-            const delta = Math.min(fwd, rev) - gain;
-            if (delta < -1e-6 && (!best || delta < best.delta)) best = { j, delta, rev: rev < fwd };
+      if (improved) continue;
+      // Or-opt: move a run of L stops to another place, forward or reversed
+      for (let L = 1; L <= 3 && !improved; L++) {
+        for (let i = 1; i + L - 1 < N && !improved; i++) {
+          const e = i + L - 1, p = t[i - 1], f = t[i], l = t[e], q = t[(e + 1) % N];
+          const inner = F[e] - F[i], innerRev = B[e] - B[i];
+          const gain = D[p][f] + D[l][q] - D[p][q];
+          for (let j = 0; j < N; j++) {
+            if (j >= i - 1 && j <= e) continue;
+            const x = t[j], y = t[(j + 1) % N];
+            if (y === f) continue;
+            const fwd = D[x][f] + D[l][y] - D[x][y];
+            const rev = D[x][l] + D[f][y] - D[x][y] + (innerRev - inner);
+            const best = Math.min(fwd, rev);
+            if (best - gain < -1e-7) {
+              const seg = t.splice(i, L); if (rev < fwd) seg.reverse();
+              const at = j > e ? j - L : j;
+              t.splice(at + 1, 0, ...seg);
+              improved = true; break;
+            }
           }
-          if (best) {
-            const seg = tour.splice(i, L);
-            if (best.rev) seg.reverse();
-            const at = best.j > segEnd ? best.j - L : best.j;
-            tour.splice(at + 1, 0, ...seg);
-            improved = true;
-          }
+        }
+      }
+      if (improved) continue;
+      // Swap two stops
+      for (let i = 1; i < N - 1 && !improved; i++) {
+        for (let k = i + 2; k < N; k++) {
+          const a = t[i - 1], b = t[i], c = t[i + 1], x = t[k - 1], y = t[k], z = t[(k + 1) % N];
+          const before = D[a][b] + D[b][c] + D[x][y] + D[y][z];
+          const after = D[a][y] + D[y][c] + D[x][b] + D[b][z];
+          if (after - before < -1e-7) { t[i] = y; t[k] = b; improved = true; break; }
         }
       }
     }
-    return tour;
+    return t;
+  }
+  function rsRandom(seed) {
+    return () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let x = Math.imul(seed ^ (seed >>> 15), 1 | seed); x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x; return ((x ^ (x >>> 14)) >>> 0) / 4294967296; };
+  }
+  function rsNearest(D, N, rand, pickFrom, E) {
+    const used = new Uint8Array(N); used[0] = 1; const t = [0];
+    for (let k = 1; k < N; k++) {
+      const last = t[t.length - 1]; const cand = [];
+      for (let j = 1; j < N; j++) if (!used[j] && (j !== E || k === N - 1)) cand.push(j);
+      cand.sort((p, q) => D[last][p] - D[last][q]);
+      const pick = cand[Math.floor(rand() * Math.min(pickFrom, cand.length))];
+      t.push(pick); used[pick] = 1;
+    }
+    return t;
+  }
+  function rsKick(t, rand) {
+    // double-bridge on positions 1..N-1 (keeps node 0 first)
+    const N = t.length; if (N < 8) return t.slice();
+    const cuts = []; while (cuts.length < 3) { const c = 1 + Math.floor(rand() * (N - 2)) + 1; if (!cuts.includes(c)) cuts.push(c); }
+    cuts.sort((a, b) => a - b);
+    const [p, q, r] = cuts;
+    return t.slice(0, p).concat(t.slice(q, r), t.slice(p, q), t.slice(r));
   }
   // Returns the visiting order as indices into the n stops (matrix nodes 1..n).
-  function solveOrder(C, n, ret) {
+  function rsSolve(C, n, ret, budgetMs) {
     if (n <= 1) return n ? [0] : [];
-    const rand = seededRandom(n * 7919 + 17);
-    const attempts = n > 150 ? 3 : n > 60 ? 6 : 10;
-    let best = null;
-    for (let r = 0; r < attempts; r++) {
-      const used = new Array(n + 1).fill(false); used[0] = true;
-      const tour = [0];
-      for (let k = 0; k < n; k++) {
-        const last = tour[tour.length - 1];
-        const cand = [];
-        for (let j = 1; j <= n; j++) if (!used[j]) cand.push(j);
-        cand.sort((a, b) => C[last][a] - C[last][b]);
-        const pick = r === 0 ? cand[0] : cand[Math.floor(rand() * Math.min(3, cand.length))];
-        tour.push(pick); used[pick] = true;
-      }
-      improveTour(C, tour, ret);
-      const cost = tourCost(C, tour, ret);
-      if (!best || cost < best.cost) best = { tour: tour.slice(), cost };
+    const { D, N, E } = rsBuild(C, n, ret);
+    const rand = rsRandom(n * 7919 + 17);
+    const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    const t0 = now();
+    let best = null, bestCost = Infinity;
+    const starts = n > 150 ? 2 : 4;
+    for (let s = 0; s < starts; s++) {
+      const t = rsLocal(D, rsNearest(D, N, rand, s === 0 ? 1 : 3, E));
+      const c = rsCost(D, t);
+      if (c < bestCost) { best = t; bestCost = c; }
     }
-    return best.tour.slice(1).map((v) => v - 1);
+    let cur = best.slice(), curCost = bestCost, iters = 0;
+    const budget = budgetMs != null ? budgetMs : (n <= 25 ? 500 : n <= 80 ? 1500 : 2500);
+    while (now() - t0 < budget && N >= 8) {
+      const cand = rsLocal(D, rsKick(cur, rand));
+      const c = rsCost(D, cand); iters++;
+      if (c < curCost - 1e-7) { cur = cand; curCost = c; if (c < bestCost - 1e-7) { best = cand.slice(); bestCost = c; } }
+      else if (iters % 60 === 0) { cur = best.slice(); curCost = bestCost; }
+    }
+    // rotate so node 0 is first, drop the virtual end node
+    const at = best.indexOf(0);
+    const loop = best.slice(at).concat(best.slice(0, at));
+    return loop.filter((v) => v !== 0 && v <= n).map((v) => v - 1);
+  }
+
+  // Runs rsSolve in a background Web Worker so the screen stays responsive
+  // while the search runs; falls back to the page if workers aren't available.
+  const RS_FUNCS = [rsBuild, rsCost, rsLocal, rsRandom, rsNearest, rsKick, rsSolve];
+  let rsWorkerUrl = null;
+  function solveOrder(C, n, ret, budgetMs) {
+    if (typeof Worker === 'undefined' || typeof Blob === 'undefined' || n < 8) return Promise.resolve(rsSolve(C, n, ret, budgetMs));
+    return new Promise((resolve) => {
+      let done = false, w;
+      const finish = (order) => { if (done) return; done = true; try { w && w.terminate(); } catch (e) {} resolve(order); };
+      try {
+        if (!rsWorkerUrl) {
+          const src = RS_FUNCS.map((f) => f.toString()).join('\n') + '\nself.onmessage = (e) => { const d = e.data; self.postMessage(rsSolve(d.C, d.n, d.ret, d.budget)); };';
+          rsWorkerUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        }
+        w = new Worker(rsWorkerUrl);
+        w.onmessage = (e) => finish(e.data);
+        w.onerror = () => finish(rsSolve(C, n, ret, budgetMs));
+        w.postMessage({ C, n, ret, budget: budgetMs });
+        setTimeout(() => finish(rsSolve(C, n, ret, 300)), (budgetMs || 2500) + 8000);
+      } catch (e) { finish(rsSolve(C, n, ret, budgetMs)); }
+    });
   }
   // Orders stops honouring "First / Auto / Last" and arrival time windows.
   // First stops are solved from the start, Auto stops from where the First
   // stops finish, Last stops after that. Stops with a time window are then
   // nudged earlier/later if that reduces lateness and waiting.
   const PLACEMENT_RANK = { first: 0, auto: 1, last: 2 };
-  function solveSubset(C, anchor, idxs, ret) {
+  async function solveSubset(C, anchor, idxs, ret, budgetMs) {
     if (!idxs.length) return [];
     const nodes = [anchor].concat(idxs);
     const sub = nodes.map((x) => nodes.map((y) => C[x][y]));
-    return solveOrder(sub, idxs.length, ret).map((k) => idxs[k]);
+    return (await solveOrder(sub, idxs.length, ret, budgetMs)).map((k) => idxs[k]);
   }
   function scheduleCost(C, seq, stops, startSec, anchor) {
     let t = startSec, prev = anchor, cost = 0;
@@ -2400,16 +2495,18 @@
     }
     return seq;
   }
-  async function planStopOrder(start, stops, ret) {
-    const M = await costMatrix([start].concat(stops));
+  async function planStopOrder(start, stops, ret, onProgress) {
+    const M = await costMatrix([start].concat(stops), onProgress);
     const groups = { first: [], auto: [], last: [] };
     stops.forEach((s, i) => groups[PLACEMENT_RANK[s.placement] === 0 ? 'first' : PLACEMENT_RANK[s.placement] === 2 ? 'last' : 'auto'].push(i + 1));
     const used = ['first', 'auto', 'last'].filter((g) => groups[g].length);
     let anchor = 0, seq = [];
-    used.forEach((g) => {
-      const part = solveSubset(M.dur, anchor, groups[g], ret && used.length === 1);
+    const totalBudget = stops.length <= 25 ? 500 : stops.length <= 80 ? 1500 : 2500;
+    for (const g of used) {
+      const budget = Math.max(200, Math.round(totalBudget * groups[g].length / stops.length));
+      const part = await solveSubset(M.dur, anchor, groups[g], ret && used.length === 1, budget);
       seq = seq.concat(part); if (part.length) anchor = part[part.length - 1];
-    });
+    }
     if (stops.some((s) => s.windowStart || s.windowEnd)) seq = refineForWindows(M.dur, seq, stops, 0);
     return { order: seq.map((v) => v - 1), source: M.source };
   }
@@ -2420,7 +2517,7 @@
     for (let i = 0; i < points.length - 1; i += OSRM_MAX_POINTS - 1) {
       const chunk = points.slice(i, i + OSRM_MAX_POINTS);
       if (chunk.length < 2) break;
-      const j = await fetchJsonWithTimeout(`${OSRM_URL}/route/v1/driving/${osrmCoords(chunk)}?overview=simplified&geometries=polyline&steps=false`, 20000);
+      const j = await fetchJsonWithTimeout(`${OSRM_URL}/route/v1/driving/${osrmCoords(chunk)}?overview=full&geometries=polyline&steps=false`, 20000);
       if (!j || j.code !== 'Ok' || !j.routes || !j.routes[0] || !Array.isArray(j.routes[0].legs) || j.routes[0].legs.length !== chunk.length - 1) return null;
       j.routes[0].legs.forEach((l) => legs.push({ sec: l.duration, m: l.distance }));
       geometry.push(j.routes[0].geometry);
@@ -2790,6 +2887,7 @@
         <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;"><h3 style="margin:0;">All stops</h3>${route.fileName ? `<span class="helptext">From ${esc(route.fileName)}</span>` : ''}</div>
         ${editable ? `<div class="route-tools">
           <button class="btn btn-sm btn-primary" data-action="route-stop-add" data-route="${route.id}">+ Add stop</button>
+          <button class="btn btn-sm" data-action="route-photo-start" data-route="${route.id}">Add from photos</button>
           <button class="btn btn-sm" data-action="route-reorder-toggle" aria-pressed="${routeUi.reorder ? 'true' : 'false'}">${routeUi.reorder ? 'Done ordering' : 'Manually order'}</button>
           <button class="btn btn-sm" data-action="route-reverse" data-route="${route.id}">Reverse route</button>
           <button class="btn btn-sm" data-action="route-replan" data-route="${route.id}">Re-optimise</button>
@@ -2801,6 +2899,87 @@
           <button class="btn btn-danger" data-action="route-archive" data-route="${route.id}">Start a new route</button>
         </div>` : ''}
     `;
+  }
+
+  // ---- Parcel label photos → stops (free Cloudflare Workers AI) ----
+  // routeUi.photo = { target: 'new' | routeId, items: [{ id, thumb, status, labels, error }] }
+  function photoInputs(label) {
+    return `<div class="photo-pick">
+      <label class="btn btn-primary photo-btn"><input type="file" accept="image/*" capture="environment" data-onchange="route-photos">Take a photo</label>
+      <label class="btn photo-btn"><input type="file" accept="image/*" multiple data-onchange="route-photos">${label || 'Choose label photos'}</label>
+    </div>`;
+  }
+  function photoLabels() {
+    const ph = routeUi.photo; if (!ph) return [];
+    return ph.items.flatMap((it) => (it.labels || []).map((l, j) => ({ it, l, j })));
+  }
+  function routePhotoReview() {
+    const ph = routeUi.photo;
+    const reading = ph.items.filter((it) => it.status === 'reading' || it.status === 'queued').length;
+    const labels = photoLabels();
+    const failed = ph.items.filter((it) => it.status === 'error' || (it.status === 'done' && !(it.labels || []).length));
+    return `
+      <div class="card photo-review">
+        <h2 style="margin:0 0 4px;">${ph.target === 'new' ? 'Stops from parcel photos' : 'Add stops from parcel photos'}</h2>
+        <p class="helptext" style="margin:0 0 12px;">Take or choose photos of the delivery labels. AI reads the address, name, phone and tracking number — check each one before adding.</p>
+        ${photoInputs(ph.items.length ? 'Add more photos' : 'Choose label photos')}
+        ${reading ? `<div class="photo-progress"><div class="route-spinner" aria-hidden="true"></div><span>Reading ${ph.items.length - reading + 1} of ${ph.items.length} photos…</span></div>` : ''}
+        ${labels.length ? `<p class="eyebrow" style="margin:16px 0 8px;">${labels.length} label${labels.length > 1 ? 's' : ''} read</p>
+          <div class="photo-list">${labels.map(({ it, l, j }) => `
+            <div class="photo-row ${l.confidence === 'low' ? 'is-low' : ''}">
+              <img src="${it.thumb}" alt="Label photo" class="photo-thumb">
+              <div class="photo-fields">
+                ${l.confidence === 'low' ? '<p class="helptext route-approx" style="margin:0 0 4px;">Hard to read — please check</p>' : ''}
+                <input type="text" name="address" value="${esc(l.address)}" placeholder="Street address" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="address" aria-label="Street address">
+                <div class="photo-grid">
+                  <input type="text" value="${esc(l.suburb)}" placeholder="Suburb" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="suburb" aria-label="Suburb">
+                  <input type="text" value="${esc(l.state)}" placeholder="State" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="state" aria-label="State">
+                  <input type="text" inputmode="numeric" value="${esc(l.postcode)}" placeholder="Postcode" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="postcode" aria-label="Postcode">
+                </div>
+                <div class="photo-grid">
+                  <input type="text" value="${esc(l.name)}" placeholder="Name" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="name" aria-label="Recipient name">
+                  <input type="tel" value="${esc(l.phone)}" placeholder="Phone" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="phone" aria-label="Phone">
+                  <input type="text" value="${esc(l.tracking)}" placeholder="Tracking" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="tracking" aria-label="Tracking number">
+                </div>
+                ${l.notes ? `<p class="helptext" style="margin:4px 0 0;">Note: ${esc(l.notes)}</p>` : ''}
+              </div>
+              <button class="btn btn-sm" data-action="route-photo-remove" data-item="${it.id}" data-j="${j}" aria-label="Remove">✕</button>
+            </div>`).join('')}</div>` : ''}
+        ${failed.length ? `<p class="helptext" style="margin:12px 0 0;color:var(--danger);">${failed.length} photo${failed.length > 1 ? 's' : ''} couldn't be read${failed[0].error ? ` (${esc(failed[0].error)})` : ''}. Take a closer, straight-on photo of the label.</p>` : ''}
+        <div class="stop-edit-actions">
+          <button class="btn btn-primary" data-action="route-photo-use" ${labels.length && !reading ? '' : 'disabled'}>${ph.target === 'new' ? `Plan route with ${labels.length} stop${labels.length === 1 ? '' : 's'}` : `Add ${labels.length} stop${labels.length === 1 ? '' : 's'} to route`}</button>
+          <button class="btn" data-action="route-photo-cancel">${ph.target === 'new' ? 'Cancel' : 'Back to route'}</button>
+        </div>
+      </div>`;
+  }
+  let photoQueueRunning = false;
+  async function runPhotoQueue() {
+    if (photoQueueRunning) return; photoQueueRunning = true;
+    try {
+      while (routeUi.photo) {
+        const it = routeUi.photo.items.find((x) => x.status === 'queued');
+        if (!it) break;
+        it.status = 'reading'; renderView();
+        try {
+          const res = await fetch('/api/route/read-label', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ image: it.image }) });
+          let body = {}; try { body = await res.json(); } catch (e) {}
+          if (!res.ok) throw new Error(body.error || 'Could not read this photo.');
+          it.labels = (body.labels || []).map((l) => Object.assign({ suburb: '', state: '', postcode: '', name: '', phone: '', tracking: '', notes: '', confidence: 'medium' }, l));
+          it.status = 'done';
+          if (/allowance is used up/.test(String(body.error || ''))) break;
+        } catch (e) {
+          it.status = 'error'; it.error = e.message;
+          if (/allowance|not switched on/i.test(e.message)) { routeUi.photo.items.filter((x) => x.status === 'queued').forEach((x) => { x.status = 'error'; x.error = e.message; }); toast(e.message, 'err'); }
+        }
+        delete it.image;
+        renderView();
+      }
+    } finally { photoQueueRunning = false; }
+  }
+  function labelFullAddress(l) {
+    const parts = [l.address];
+    [l.suburb, l.state, l.postcode].forEach((v) => { if (v && !l.address.toLowerCase().includes(String(v).toLowerCase())) parts.push(v); });
+    return parts.filter(Boolean).join(', ');
   }
   function routeUploadCard() {
     const d = routeUi.draft;
@@ -2817,6 +2996,10 @@
             <span class="route-drop-title">Choose run sheet</span>
             <span class="helptext">.xlsx or .csv · up to 300 stops</span>
           </label>
+          <div class="route-or"><span>or</span></div>
+          <p style="margin:0 0 10px;font-weight:600;">Snap the parcel labels</p>
+          <p class="helptext" style="margin:0 0 10px;">AI reads the address from each label photo. Pick many photos at once.</p>
+          ${photoInputs()}
         </div>`;
     }
     const stops = draftStops(d);
@@ -2848,6 +3031,7 @@
     const driverId = currentDriverId();
     const route = todaysRoute(driverId);
     const header = `<div class="view-header"><div><h1>Route</h1><div class="sub">${fmtDateHuman(todayStr())}</div></div></div>`;
+    if (routeUi.photo && !routeUi.busy) return header + routePhotoReview();
     if (route && !routeUi.busy) return header + routeDetail(route, true);
     return header + routeUploadCard();
   }
@@ -3015,7 +3199,9 @@
       });
       if (!found.length) { routeUi.busy = ''; renderView(); toast(unmatched.length ? unmatched[0].error + ' — check the address column is right.' : 'No addresses found.', 'err'); return; }
       routeUi.busy = 'Checking real driving times between stops…'; renderView();
-      const plan = await planStopOrder(start, found, returnToStart);
+      const plan = await planStopOrder(start, found, returnToStart, (done, total) => {
+        const p = document.querySelector('.route-spinner + p'); if (p) p.textContent = `Checking real driving times… ${done} of ${total}`;
+      });
       routeUi.busy = 'Putting stops in the best order…'; renderView();
       const ordered = plan.order.map((idx, i) => Object.assign({}, found[idx], { id: 's' + (i + 1) + '_' + genId().slice(0, 6), status: 'pending', reason: '', doneAt: null }));
       const metrics = await routeMetrics({ stops: ordered, start, returnToStart }, start);
@@ -3176,6 +3362,43 @@
       const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
       const stops = route.stops.map((s) => s.id === el.dataset.stop ? Object.assign({}, s, { status: 'pending', reason: '', doneAt: null }) : s);
       try { await saveRouteStops(route, { stops }); renderView(); } catch (e) { toast(e.message, 'err'); }
+    },
+    'route-photo-start': (el) => { routeUi.photo = { target: el.dataset.route, items: [] }; renderView(); window.scrollTo(0, 0); },
+    'route-photo-cancel': () => { routeUi.photo = null; renderView(); },
+    'route-photo-remove': (el) => {
+      const it = routeUi.photo && routeUi.photo.items.find((x) => x.id === el.dataset.item); if (!it) return;
+      it.labels.splice(Number(el.dataset.j), 1); renderView();
+    },
+    'route-photo-use': async (el) => {
+      const ph = routeUi.photo; if (!ph) return;
+      const labels = photoLabels().map((x) => x.l).filter((l) => l.address);
+      if (!labels.length) return;
+      if (ph.target === 'new') {
+        const headers = ['Address', 'Suburb', 'State', 'Postcode', 'Recipient', 'Phone', 'Tracking', 'Notes'];
+        routeUi.draft = { fileName: `${ph.items.length} label photo${ph.items.length > 1 ? 's' : ''}`, headers,
+          rows: labels.map((l) => [l.address, l.suburb, l.state, l.postcode, l.name, l.phone, l.tracking, l.notes]),
+          map: { address: 0, suburb: 1, state: 2, postcode: 3, name: 4, phone: 5, ref: 6, notes: 7, parcels: -1, email: -1, earliest: -1, latest: -1, timeAtStop: -1, stopType: -1 } };
+        routeUi.photo = null; renderView(); window.scrollTo(0, 0);
+        return;
+      }
+      const route = state.routes.find((r) => r.id === ph.target); if (!route) { routeUi.photo = null; renderView(); return; }
+      el.disabled = true; el.textContent = 'Finding addresses…';
+      try {
+        const res = await geocodeForRoute(labels.map(labelFullAddress), (done, total) => { el.textContent = `Finding addresses… ${Math.min(done, total)} of ${total}`; },
+          labels.map((l) => ({ street: l.address, suburb: l.suburb, state: l.state, postcode: l.postcode })));
+        const stops = route.stops.slice(); const unmatched = (route.unmatched || []).slice(); let added = 0;
+        labels.forEach((l, i) => {
+          const g = res[i];
+          const base = { address: labelFullAddress(l), name: l.name, phone: l.phone, email: '', refs: l.tracking ? [l.tracking] : [], parcels: 1, notes: l.notes, stopType: 'delivery', placement: 'auto',
+            parts: { street: l.address, suburb: l.suburb, state: l.state, postcode: l.postcode } };
+          if (!g || g.error) { unmatched.push(Object.assign(base, { error: g ? g.error : 'Address not found' })); return; }
+          insertCheapest(route, stops, Object.assign(base, { id: 's' + genId(), lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: !!g.partial, access: g.access || '', status: 'pending', reason: '', doneAt: null }));
+          added++;
+        });
+        await applyStops(route, stops, { unmatched });
+        routeUi.photo = null; renderView();
+        toast(`Added ${added} stop${added === 1 ? '' : 's'} from photos${labels.length - added ? `, ${labels.length - added} need checking` : ''}.`, labels.length - added ? 'err' : 'ok');
+      } catch (e) { el.disabled = false; el.textContent = 'Try again'; toast(e.message, 'err'); }
     },
     'route-stop-edit': (el) => {
       const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
@@ -3703,6 +3926,25 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   `);
 
   const CHANGE_HANDLERS = {
+    'route-photos': async (el) => {
+      const files = [...(el.files || [])].filter((f) => /^image\//.test(f.type) || /\.(jpe?g|png|heic|webp)$/i.test(f.name));
+      el.value = '';
+      if (!files.length) return;
+      if (!routeUi.photo) routeUi.photo = { target: 'new', items: [] };
+      if (routeUi.photo.items.length + files.length > 150) { toast('Up to 150 photos at a time.', 'err'); return; }
+      for (const f of files) {
+        try {
+          const image = await readAndCompressImage(f, 1280);
+          const thumb = await new Promise((resolve) => { const img = new Image(); img.onload = () => { const c = document.createElement('canvas'); const sc = 160 / Math.max(img.width, img.height); c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc); c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); resolve(c.toDataURL('image/jpeg', 0.7)); }; img.onerror = () => resolve(''); img.src = image; });
+          routeUi.photo.items.push({ id: 'p' + genId(), image, thumb, status: 'queued', labels: [] });
+        } catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
+      }
+      renderView(); runPhotoQueue();
+    },
+    'route-photo-edit': (el) => {
+      const it = routeUi.photo && routeUi.photo.items.find((x) => x.id === el.dataset.item); if (!it) return;
+      const l = it.labels[Number(el.dataset.j)]; if (l) l[el.dataset.field] = el.value.trim();
+    },
     'route-file': async (el) => {
       const file = el.files && el.files[0]; if (!file) return;
       try { routeUi.draft = await readRunSheet(file); renderView(); }

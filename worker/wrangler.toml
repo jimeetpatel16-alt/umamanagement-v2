@@ -13,6 +13,10 @@ migrations_dir = "migrations"
 [[r2_buckets]]
 binding = "EVIDENCE"
 bucket_name = "uma-management-private"
+# Free Cloudflare Workers AI (reads parcel labels in the route planner)
+[ai]
+binding = "AI"
+
 [vars]
 APP_NAME = "UMA Management"
 SESSION_DAYS = "7"
