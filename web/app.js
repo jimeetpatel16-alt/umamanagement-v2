@@ -1277,6 +1277,56 @@
     `;
   }
 
+  // ---- Labour clock-in site location ----------------------------------
+  // A Labour company can have a site pin (siteLat/siteLng) and an allowed
+  // radius in metres. When set, Labour can only clock in/out from within
+  // that radius. The Worker repeats the same check server-side.
+  const SITE_ACCURACY_ALLOWANCE_M = 50;
+  function hasSitePin(company) {
+    return !!company && company.siteLat !== '' && company.siteLat != null && company.siteLng !== '' && company.siteLng != null &&
+      Number.isFinite(Number(company.siteLat)) && Number.isFinite(Number(company.siteLng));
+  }
+  function parseSiteCoords(text) {
+    const m = String(text || '').match(/(-?\d{1,3}(?:\.\d+)?)\s*[, ]\s*(-?\d{1,3}(?:\.\d+)?)/);
+    if (!m) return null;
+    const lat = Number(m[1]); const lng = Number(m[2]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+    return { lat, lng };
+  }
+  function distanceMetres(lat1, lng1, lat2, lng2) {
+    const R = 6371000; const toRad = (d) => (d * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1); const dLng = toRad(lng2 - lng1);
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+    return Math.round(2 * R * Math.asin(Math.sqrt(a)));
+  }
+  function getCurrentPosition() {
+    return new Promise((resolve, reject) => {
+      if (!navigator.geolocation) { reject(new Error('This browser cannot share your location. Try Chrome or Safari on your phone.')); return; }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: Math.round(pos.coords.accuracy || 0) }),
+        (err) => reject(new Error(err && err.code === 1
+          ? 'Location is turned off for this site. Allow location in your browser settings, then try again.'
+          : 'Could not get your location. Move outside or near a window, then try again.')),
+        { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+      );
+    });
+  }
+  // Returns { ok, location, message }. location is saved on the log.
+  async function checkLabourSite(company, action) {
+    if (!hasSitePin(company)) return { ok: true, location: null };
+    let pos;
+    try { pos = await getCurrentPosition(); }
+    catch (e) { return { ok: false, message: e.message }; }
+    const radius = Number(company.siteRadius) || 200;
+    const distance = distanceMetres(pos.lat, pos.lng, Number(company.siteLat), Number(company.siteLng));
+    const location = { lat: pos.lat, lng: pos.lng, accuracy: pos.accuracy, distance, at: new Date().toISOString() };
+    if (distance - Math.min(pos.accuracy, SITE_ACCURACY_ALLOWANCE_M) > radius) {
+      const away = distance >= 1000 ? (distance / 1000).toFixed(1) + ' km' : distance + ' m';
+      return { ok: false, location, message: `You're ${away} from ${company.name}. You can only ${action} at the site (within ${radius} m).` };
+    }
+    return { ok: true, location };
+  }
+
   function companyModal(company) {
     const isEdit = !!company;
     const type = isEdit ? (company.type || 'delivery') : 'delivery';
@@ -1319,6 +1369,13 @@
             <div class="field"><label class="field-label">Phone</label><input type="tel" name="phone" value="${isEdit ? esc(company.phone || '') : ''}"></div>
           </div>
           <div class="field" style="margin-bottom:12px;"><label class="field-label">Warehouse / site address</label><input type="text" name="siteAddress" value="${isEdit ? esc(company.siteAddress || '') : ''}"></div>
+          <p class="eyebrow" style="margin:14px 0 8px;">Clock-in location</p>
+          <p class="helptext" style="margin:0 0 10px;">Labour can only clock in and out when their phone is within this distance of the site pin. Leave the pin empty to allow clocking in from anywhere. To get a pin: stand at the site and tap "Use my current location", or right-click the site in Google Maps and click the numbers to copy them.</p>
+          <div class="field-row" style="margin-bottom:12px;align-items:flex-end;">
+            <div class="field" style="flex:2;"><label class="field-label">Site pin (latitude, longitude)</label><input type="text" name="siteCoords" inputmode="decimal" placeholder="-33.86882, 151.20929" value="${isEdit && hasSitePin(company) ? esc(company.siteLat + ', ' + company.siteLng) : ''}"></div>
+            <div class="field"><label class="field-label">Allowed distance (metres)</label><input type="number" name="siteRadius" min="25" max="5000" step="5" value="${isEdit && company.siteRadius ? company.siteRadius : 200}"></div>
+          </div>
+          <div style="margin-bottom:12px;"><button type="button" class="btn btn-sm" data-action="company-use-my-location">Use my current location</button></div>
           <div class="field-row" style="margin-bottom:12px;">
             <div class="field"><label class="field-label">Contract start</label><input type="date" name="contractStartDate" value="${isEdit ? (company.contractStartDate || '') : ''}"></div>
             <div class="field"><label class="field-label">Contract end</label><input type="date" name="contractEndDate" value="${isEdit ? (company.contractEndDate || '') : ''}"></div>
@@ -2078,6 +2135,18 @@
 
   const ACTIONS = {
     'nav': (el) => setRoute(el.dataset.route),
+    'company-use-my-location': async (el) => {
+      const form = el.closest('form');
+      const input = form && form.querySelector('input[name="siteCoords"]');
+      if (!input) return;
+      const label = el.textContent; el.disabled = true; el.textContent = 'Getting location…';
+      try {
+        const pos = await getCurrentPosition();
+        input.value = pos.lat.toFixed(6) + ', ' + pos.lng.toFixed(6);
+        toast(`Site pin set (accurate to about ${pos.accuracy} m).`, 'ok');
+      } catch (e) { toast(e.message, 'err'); }
+      finally { el.disabled = false; el.textContent = label; }
+    },
     'switch-user': async () => {
       if (switchingUser) return;
       switchingUser = true;
@@ -2659,6 +2728,15 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         data.siteAddress = fd.get('siteAddress') || '';
         data.contractStartDate = fd.get('contractStartDate') || ''; data.contractEndDate = fd.get('contractEndDate') || '';
         data.contractStatus = fd.get('contractStatus') || 'Active';
+        const coordsText = String(fd.get('siteCoords') || '').trim();
+        if (coordsText) {
+          const pin = parseSiteCoords(coordsText);
+          if (!pin) { toast('Site pin should look like: -33.86882, 151.20929', 'err'); return; }
+          data.siteLat = pin.lat; data.siteLng = pin.lng;
+        } else {
+          data.siteLat = null; data.siteLng = null;
+        }
+        data.siteRadius = Math.min(5000, Math.max(25, Number(fd.get('siteRadius')) || 200));
       } else {
         data.rateType = fd.get('rateType');
         data.carRate = Number(fd.get('carRate')) || 0;
@@ -3639,6 +3717,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       <div class="card">
         <h3 style="margin:0 0 8px;">${todayLogs.length ? 'Start another work entry' : "Today's work"}</h3>
         <p class="helptext" style="margin:0 0 16px;">You can record multiple separate work periods today. Clock out of the current one before starting another. Each entry is sent separately for approval.</p>
+        ${hasSitePin(company) ? `<p class="helptext" style="margin:0 0 16px;">You need to be at ${esc(company.siteAddress || company.name)} to clock in and out. Your phone will ask to share your location.</p>` : ''}
         <form data-onsubmit="labour-clock-in">
           ${shiftPicker}
           ${workTypePicker}
@@ -3693,7 +3772,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       <td>${g.date}</td><td>${esc(g.labourName)}</td><td>${esc(g.companyName)}</td><td>${esc(LABOUR_TYPE_LABEL[g.workType] || g.workType)}</td>
       <td>${esc(g.category || 'Standard')}<br>${tierHtml}</td>
       <td class="tnum">${scheduledHours != null ? scheduledHours : '—'}</td>
-      <td class="tnum" style="white-space:nowrap;">${g.clockInAt ? `${fmtTimeHuman(g.clockInAt)} – ${g.clockOutAt ? fmtTimeHuman(g.clockOutAt) : 'In progress'}` : '—'}</td>
+      <td class="tnum" style="white-space:nowrap;">${g.clockInAt ? `${fmtTimeHuman(g.clockInAt)} – ${g.clockOutAt ? fmtTimeHuman(g.clockOutAt) : 'In progress'}` : '—'}${g.clockInLocation || g.clockOutLocation ? `<div class="helptext">${g.clockInLocation ? 'In: ' + g.clockInLocation.distance + ' m' : ''}${g.clockInLocation && g.clockOutLocation ? ' · ' : ''}${g.clockOutLocation ? 'Out: ' + g.clockOutLocation.distance + ' m' : ''} from site</div>` : ''}</td>
       <td class="tnum">${g.hours}</td>
       <td>${varianceHtml}</td>
       <td class="tnum" style="font-weight:700;">${fmtMoney(g.amount)}</td>
@@ -3970,8 +4049,11 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         return;
       }
       const category = shift ? (shift.category || 'Standard') : 'Standard';
+      const site = await checkLabourSite(company, 'clock in');
+      if (!site.ok) { toast(site.message, 'err'); return; }
       const nowIso = new Date().toISOString();
       const data = {
+        clockInLocation: site.location,
         labourId, labourName: l.name, companyId: l.companyId, companyName: company ? company.name : '',
         shiftId: shift ? shift.id : '', date: today, workType, category,
         scheduledStart: shift ? shift.startTime : '', scheduledFinish: shift ? shift.endTime : '',
@@ -3992,10 +4074,12 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const id = form.dataset.id;
       const log = state.labourLogs.find((g) => g.id === id);
       if (!log) return;
+      const company = state.companies.find((c) => c.id === log.companyId);
+      const site = await checkLabourSite(company, 'clock out');
+      if (!site.ok) { toast(site.message, 'err'); return; }
       const clockOutAt = new Date().toISOString();
       const ms = new Date(clockOutAt).getTime() - new Date(log.clockInAt).getTime();
       const hours = Math.max(0, Math.round((ms / 3600000) * 100) / 100);
-      const company = state.companies.find((c) => c.id === log.companyId);
       const labourPerson = state.labour.find((x) => x.id === log.labourId);
       const clockInLocal = new Date(log.clockInAt);
       const startTimeForCalc = log.scheduledStart || (String(clockInLocal.getHours()).padStart(2, '0') + ':' + String(clockInLocal.getMinutes()).padStart(2, '0'));
@@ -4005,6 +4089,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       await state.db.doc('labourLogs/' + id).update({
         clockOutAt, hours, amount: cost.billAmount, payAmount: cost.payAmount, rate, payRate,
         tierLines: cost.lines, usedRateCard: cost.usedRateCard,
+        clockOutLocation: site.location,
         notes: fd.get('notes') || '', status: 'Pending',
         submittedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       });

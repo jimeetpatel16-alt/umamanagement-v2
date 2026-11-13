@@ -69,6 +69,28 @@ async function readDoc(env: Env, collection: string, id: string) {
   if (!row) return null;
   try { return JSON.parse(row.data_json); } catch { return null; }
 }
+// Labour clock-in/out site check. Mirrors checkLabourSite() in web/app.js:
+// allowed when (distance - min(accuracy, 50 m)) <= the company's radius.
+function distanceMetres(lat1: number, lng1: number, lat2: number, lng2: number) {
+  const R = 6371000; const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1); const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.sqrt(a)));
+}
+async function labourSiteError(env: Env, companyId: string, location: any, action: string): Promise<string | null> {
+  if (!companyId) return null;
+  const company = await readDoc(env, 'companies', companyId);
+  if (!company) return null;
+  const siteLat = Number(company.siteLat); const siteLng = Number(company.siteLng);
+  if (company.siteLat == null || company.siteLat === '' || company.siteLng == null || company.siteLng === '' || !Number.isFinite(siteLat) || !Number.isFinite(siteLng)) return null;
+  const lat = Number(location?.lat); const lng = Number(location?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return `Your location is needed to ${action}. Allow location access and try again.`;
+  const radius = Number(company.siteRadius) || 200;
+  const accuracy = Math.max(0, Number(location?.accuracy) || 0);
+  const distance = distanceMetres(lat, lng, siteLat, siteLng);
+  if (distance - Math.min(accuracy, 50) > radius) return `You are ${distance} m from the site. You can only ${action} within ${radius} m of it.`;
+  return null;
+}
 async function currentAccount(request: Request, env: Env): Promise<Account | null> {
   const raw = getCookie(request, 'uma_shared');
   if (!raw) return null;
@@ -272,6 +294,10 @@ async function api(request: Request, env: Env): Promise<Response> {
     if (collection === 'staff' && account.role !== 'admin') return fail('Only Admin can create accounts.', 403);
     if (account.role === 'driver' && body?.driverId !== account.driverId) return fail('Submission does not belong to this Driver account.', 403);
     if (account.role === 'labour' && body?.labourId !== account.labourId) return fail('Record does not belong to this Labour account.', 403);
+    if (account.role === 'labour' && collection === 'labourLogs' && body?.clockInAt) {
+      const siteError = await labourSiteError(env, String(ownLabour?.companyId || body?.companyId || ''), body?.clockInLocation, 'clock in');
+      if (siteError) return fail(siteError, 403);
+    }
     try { await saveDocument(env, collection, newId, body, 'set', account); }
     catch (error) { return fail(error instanceof Error ? error.message : 'Could not save record.'); }
     return json({ id: newId }, 201);
@@ -295,6 +321,10 @@ async function api(request: Request, env: Env): Promise<Response> {
       const existing = await readDoc(env, collection, id);
       if (!existing || existing.labourId !== account.labourId) return fail('Record does not belong to this Labour account.', 403);
       if (body?.labourId && body.labourId !== account.labourId) return fail('Record does not belong to this Labour account.', 403);
+      if (collection === 'labourLogs' && body?.clockOutAt) {
+        const siteError = await labourSiteError(env, String(existing.companyId || ''), body?.clockOutLocation, 'clock out');
+        if (siteError) return fail(siteError, 403);
+      }
     }
     // PATCH is always partial. Some legacy Driver/Labour clients submit PUT
     // with partial fields too, so merge those safely while preserving PUT/set
