@@ -2420,20 +2420,102 @@
     const list = await res.json();
     return Array.isArray(list) && list.length ? list[0] : null;
   }
-  async function osmLookup(address, parts) {
-    let hit = null;
-    if (parts && parts.street && (parts.suburb || parts.postcode)) {
-      const p = { street: parts.street };
-      if (parts.suburb) p.city = parts.suburb;
-      if (parts.state) p.state = parts.state;
-      if (parts.postcode) p.postalcode = parts.postcode;
-      hit = await osmSearch(p);
-    }
-    if (!hit) hit = await osmSearch({ q: address });
-    if (!hit) return { error: 'Address not found' };
+  // Run sheets write units many ways ("Unit 428, 50A Jacqui Ave",
+  // "206/20C Hasluck St", "4B Hasluck St, Unit 706"). Map search finds the
+  // building, so the unit is taken out for the lookup (the driver still sees
+  // the full original address).
+  const UNIT_WORDS = 'unit|u|apt|apartment|flat|suite|ste|shop|villa|townhouse|th|level|lvl|lot';
+  function splitUnit(text) {
+    let unit = '';
+    let s = ' ' + String(text || '').replace(/\s+/g, ' ') + ' ';
+    s = s.replace(new RegExp(`[\\s,](?:${UNIT_WORDS})\\.?\\s*#?\\s*([a-z]?\\d+[a-z]?)\\s*(?:[,/]|(?=\\s))`, 'ig'), (m, n) => { if (!unit) unit = n; return ', '; });
+    s = s.trim().replace(/^,\s*/, '').replace(/^([a-z]?\d+[a-z]?)\s*\/\s*(?=\d)/i, (m, n) => { if (!unit) unit = n; return ''; });
+    s = s.replace(/\s*,\s*/g, ', ').replace(/(,\s*)+/g, ', ').replace(/^[,\s]+|[,\s]+$/g, '').replace(/\s+/g, ' ');
+    return { rest: s, unit };
+  }
+  function splitHouse(street) {
+    const m = String(street || '').match(/^(\d+)([a-z])?(?:\s*-\s*\d+[a-z]?)?\s+(.+)$/i);
+    return m ? { num: m[1], letter: m[2] || '', name: m[3] } : { num: '', letter: '', name: String(street || '') };
+  }
+  function osmResult(hit, address, forceApprox) {
     const type = String(hit.addresstype || hit.type || '');
-    const exact = ['house', 'building', 'residential', 'apartments', 'commercial', 'retail', 'industrial', 'office', 'shop', 'amenity'].includes(type) || /^\d/.test(String(hit.name || ''));
+    const exact = !forceApprox && (['house', 'building', 'residential', 'apartments', 'commercial', 'retail', 'industrial', 'office', 'shop', 'amenity'].includes(type) || /^\d/.test(String(hit.name || '')));
     return { lat: Number(hit.lat), lng: Number(hit.lon), formatted: String(hit.display_name || address).replace(/, Australia$/, ''), precision: type, partial: !exact };
+  }
+  let lastPhotonCall = 0;
+  async function photonSearch(q, area) {
+    const wait = lastPhotonCall + 350 - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastPhotonCall = Date.now();
+    try {
+      const res = await fetch('https://photon.komoot.io/api/?' + new URLSearchParams({ q, limit: '5', lang: 'en', bbox: '112.9,-43.7,153.7,-10.6' }).toString());
+      if (!res.ok) return [];
+      const data = await res.json();
+      const sub = String(area.suburb || '').toLowerCase(), pc = String(area.postcode || '');
+      return (data.features || []).filter((f) => {
+        const p = f.properties || {};
+        if (p.countrycode && p.countrycode !== 'AU') return false;
+        if (!sub && !pc) return true;
+        const places = [p.locality, p.district, p.city, p.name, p.county].filter(Boolean).map((x) => String(x).toLowerCase());
+        return (pc && String(p.postcode || '') === pc) || (sub && places.some((x) => x === sub || x.includes(sub)));
+      });
+    } catch (e) { return []; }
+  }
+  // Tries, in order: the address as given (unit removed), without a letter on
+  // the house number (50A → 50), a second free search (Photon), and finally
+  // the street itself — returned as an approximate pin rather than "not found".
+  async function osmLookup(address, parts) {
+    const fromParts = parts && parts.street;
+    const { rest, unit } = splitUnit(fromParts ? parts.street : address);
+    const area = fromParts ? { suburb: parts.suburb || '', state: parts.state || '', postcode: parts.postcode || '' } : {};
+    if (!area.suburb && !area.postcode) {
+      // Whole address in one box: pull a trailing "SUBURB NSW 2762" off for checks.
+      const m = rest.match(/,\s*([A-Za-z][A-Za-z\s'-]+?)\s+(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\b\.?\s*(\d{4})?\s*$/i);
+      if (m) Object.assign(area, { suburb: m[1].trim(), state: m[2].toUpperCase(), postcode: m[3] || '' });
+    }
+    // oneBox: suburb/postcode came from the address text itself, not separate columns.
+    const oneBox = !(fromParts && (parts.suburb || parts.postcode));
+    const streetPart = oneBox && area.suburb ? rest.split(',')[0].trim() : rest;
+    const tail = [area.suburb, area.state, area.postcode].filter(Boolean).join(' ');
+    const h = splitHouse(streetPart);
+    const structured = (street) => {
+      const p = { street };
+      if (area.suburb) p.city = area.suburb;
+      if (area.state) p.state = area.state;
+      if (area.postcode) p.postalcode = area.postcode;
+      return p;
+    };
+    const canStructure = !!(area.suburb || area.postcode);
+    const freeText = (street) => (oneBox ? rest.replace(streetPart, street) : tail ? `${street}, ${tail}` : street);
+    const attempts = [];
+    if (canStructure) attempts.push(() => osmSearch(structured(streetPart)));
+    attempts.push(() => osmSearch({ q: freeText(streetPart) }));
+    if (h.letter) {
+      const plain = `${h.num} ${h.name}`;
+      attempts.push(() => (canStructure ? osmSearch(structured(plain)) : osmSearch({ q: freeText(plain) })));
+    }
+    let hit = null;
+    for (const attempt of attempts) { hit = await attempt(); if (hit) { const r = osmResult(hit, address); if (!r.partial) return r; break; } }
+    let approx = hit ? osmResult(hit, address, true) : null;
+    // Second free service — better at fuzzy matches and some new estates.
+    const photon = await photonSearch(freeText(streetPart), area);
+    const wanted = h.num ? h.num.toLowerCase() : '';
+    const exactP = photon.find((f) => wanted && String(f.properties.housenumber || '').toLowerCase().replace(/[^0-9a-z]/g, '').replace(/[a-z]$/, '') === wanted);
+    if (exactP) {
+      const [lng, lat] = exactP.geometry.coordinates;
+      return { lat, lng, formatted: addrLabel(exactP.properties), precision: 'house', partial: false };
+    }
+    if (!approx && photon.length) {
+      const [lng, lat] = photon[0].geometry.coordinates;
+      approx = { lat, lng, formatted: addrLabel(photon[0].properties), precision: photon[0].properties.osm_value || 'street', partial: true };
+    }
+    if (!approx && h.name && h.num) {
+      // Street only (new estates often have the street mapped but not the houses).
+      const st = canStructure ? await osmSearch(structured(h.name)) : await osmSearch({ q: freeText(h.name) });
+      if (st) approx = osmResult(st, address, true);
+    }
+    if (approx) return Object.assign(approx, { unit });
+    return { error: 'Address not found' };
   }
   async function geocodeForRoute(addresses, onProgress, partsList) {
     const out = [];
@@ -2567,7 +2649,8 @@
       ${unmatched.length ? `
         <div class="card" style="margin-bottom:16px;">
           <h3 style="margin:0 0 4px;">Couldn't find ${unmatched.length} address${unmatched.length > 1 ? 'es' : ''}</h3>
-          <p class="helptext" style="margin:0 0 12px;">Fix the address and try again, or remove it from today's route.</p>
+          <p class="helptext" style="margin:0 0 12px;">Fix the address and tap Find, or remove it from today's route. Tip: start typing and pick from the suggestions.</p>
+          ${editable ? `<button class="btn btn-sm btn-primary" style="margin-bottom:10px;" data-action="route-unmatched-retry" data-route="${route.id}">Try all again</button>` : ''}
           ${unmatched.map((u, i) => `
             <form class="route-fix" data-onsubmit="route-fix-address" data-route="${route.id}" data-index="${i}">
               <div class="field" style="flex:1;"><label class="field-label">${esc(u.name || 'Stop')}${u.refs && u.refs.length ? ' · ' + esc(u.refs[0]) : ''} — ${esc(u.error || 'Not found')}</label><input type="text" name="address" value="${esc(u.address)}" ${editable ? '' : 'disabled'}></div>
@@ -2660,6 +2743,18 @@
   }
 
   // ---- Saving changes ----
+  // Puts a stop where it adds the least extra distance among stops still to do.
+  function insertCheapest(route, stops, stop) {
+    let bestAt = stops.length, bestCost = Infinity;
+    for (let i = 0; i <= stops.length; i++) {
+      if (i < stops.length && stops[i].status !== 'pending') continue;
+      const prev = i === 0 ? route.start : stops[i - 1]; const next = stops[i];
+      const cost = (prev ? kmBetween(prev, stop) : 0) + (next ? kmBetween(stop, next) : 0) - (prev && next ? kmBetween(prev, next) : 0);
+      if (cost < bestCost) { bestCost = cost; bestAt = i; }
+    }
+    stops.splice(bestAt, 0, stop);
+    return bestAt;
+  }
   async function saveRouteStops(route, patch) {
     Object.assign(route, patch, { updatedAt: new Date().toISOString() });
     await state.db.doc('routes/' + route.id).update(Object.assign({}, patch, { updatedAt: route.updatedAt }));
@@ -2861,6 +2956,27 @@
       const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
       const stops = route.stops.map((s) => s.id === el.dataset.stop ? Object.assign({}, s, { status: 'pending', reason: '', doneAt: null }) : s);
       try { await saveRouteStops(route, { stops }); renderView(); } catch (e) { toast(e.message, 'err'); }
+    },
+    'route-unmatched-retry': async (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route || !(route.unmatched || []).length) return;
+      const list = route.unmatched;
+      el.disabled = true; const label = el.textContent;
+      try {
+        const res = await geocodeForRoute(list.map((u) => u.address), (done, total) => { el.textContent = `Checking ${Math.min(done, total)} of ${total}…`; }, list.map((u) => u.parts || null));
+        const stops = route.stops.slice(); const still = []; let added = 0, approx = 0;
+        list.forEach((u, i) => {
+          const g = res[i];
+          if (!g || g.error) { still.push(Object.assign({}, u, { error: g ? g.error : 'Address not found' })); return; }
+          const stop = Object.assign({}, u, { lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: g.partial, id: 's' + genId(), status: 'pending', reason: '', doneAt: null });
+          delete stop.error;
+          insertCheapest(route, stops, stop); added++; if (g.partial) approx++;
+        });
+        if (!added) { el.disabled = false; el.textContent = label; toast('Still couldn\'t find these. Edit them (check spelling and suburb) and tap Find.', 'err'); return; }
+        const m = await routeMetrics(Object.assign({}, route, { stops }), routeAnchor(route));
+        await saveRouteStops(route, { stops: m.stops, unmatched: still, distanceKm: m.distanceKm, driveMin: m.driveMin, returnLegSec: m.returnLegSec, geometry: m.geometry, metricsSource: m.metricsSource });
+        renderView();
+        toast(`Added ${added} stop${added > 1 ? 's' : ''}${approx ? ` (${approx} with an approximate pin — check the house number on arrival)` : ''}${still.length ? `. ${still.length} still need fixing.` : '.'}`, still.length ? 'err' : 'ok');
+      } catch (e) { el.disabled = false; el.textContent = label; toast(e.message, 'err'); }
     },
     'route-unmatched-remove': async (el) => {
       const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
@@ -3413,15 +3529,8 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         if (g.error) { toast(/not found/i.test(g.error) ? g.error + ' — try adding the suburb and postcode.' : g.error, 'err'); return; }
         const stop = Object.assign({}, u, { address, lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: g.partial, id: 's' + genId(), status: 'pending', reason: '', doneAt: null });
         delete stop.error;
-        // Insert where it adds the least extra distance among the stops still to do.
-        const stops = route.stops.slice(); let bestAt = stops.length, bestCost = Infinity;
-        for (let i = 0; i <= stops.length; i++) {
-          if (i < stops.length && stops[i].status !== 'pending') continue;
-          const prev = i === 0 ? route.start : stops[i - 1]; const next = stops[i];
-          const cost = (prev ? kmBetween(prev, stop) : 0) + (next ? kmBetween(stop, next) : 0) - (prev && next ? kmBetween(prev, next) : 0);
-          if (cost < bestCost) { bestCost = cost; bestAt = i; }
-        }
-        stops.splice(bestAt, 0, stop);
+        const stops = route.stops.slice();
+        const bestAt = insertCheapest(route, stops, stop);
         const unmatched = route.unmatched.filter((_, i) => i !== idx);
         const m = await routeMetrics(Object.assign({}, route, { stops }), routeAnchor(route));
         await saveRouteStops(route, { stops: m.stops, unmatched, distanceKm: m.distanceKm, driveMin: m.driveMin, returnLegSec: m.returnLegSec, geometry: m.geometry, metricsSource: m.metricsSource });
