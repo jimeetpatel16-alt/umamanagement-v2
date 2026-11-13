@@ -571,7 +571,7 @@
   function renderSidebar() {
     const sb = document.getElementById('sidebar');
     sb.innerHTML = `
-      <div class="brand"><div class="brand-mark">UM</div><div class="brand-text">${esc(state.settings.businessName || 'UMA Management')}<small>UMA Management</small></div></div>
+      <div class="brand"><div class="brand-mark">UM</div><div class="brand-text">${esc(state.settings.businessName || 'UMA Management')}<small>Operations</small></div></div>
       ${navHtml()}
       <div id="staffbox">
         <div class="avatar">${esc((state.session && state.session.name || '?').slice(0, 2).toUpperCase())}</div>
@@ -1712,6 +1712,31 @@
       </div>
 
       <div class="card" style="margin-bottom:18px;">
+        <h3 style="margin-bottom:4px;">Invoice details</h3>
+        <p class="helptext" style="margin:0 0 14px;">Printed on every invoice PDF. Workers' pay and your margin are never shown on invoices.</p>
+        <form data-onsubmit="settings-save-invoice">
+          <div class="field-row" style="margin-bottom:12px;">
+            <div class="field"><label class="field-label">ABN</label><input type="text" name="invoiceAbn" value="${esc(s.invoiceAbn || '')}" placeholder="12 345 678 901"></div>
+            <div class="field"><label class="field-label">Phone</label><input type="tel" name="invoicePhone" value="${esc(s.invoicePhone || '')}"></div>
+            <div class="field"><label class="field-label">Email</label><input type="email" name="invoiceEmail" value="${esc(s.invoiceEmail || '')}"></div>
+          </div>
+          <div class="field" style="margin-bottom:12px;"><label class="field-label">Business address</label><input type="text" name="invoiceAddress" value="${esc(s.invoiceAddress || '')}" placeholder="Street, Suburb STATE Postcode"></div>
+          <div class="field-row" style="margin-bottom:12px;">
+            <div class="field"><label class="field-label">GST</label><select name="invoiceGst"><option value="none" ${s.invoiceGst !== 'add10' ? 'selected' : ''}>Not registered — no GST</option><option value="add10" ${s.invoiceGst === 'add10' ? 'selected' : ''}>Registered — add 10% GST</option></select></div>
+            <div class="field"><label class="field-label">Payment due (days)</label><input type="number" name="invoiceTermsDays" min="0" max="120" value="${s.invoiceTermsDays != null ? s.invoiceTermsDays : 14}"></div>
+          </div>
+          <p class="eyebrow" style="margin:14px 0 8px;">Bank details for payment</p>
+          <div class="field-row" style="margin-bottom:12px;">
+            <div class="field"><label class="field-label">Account name</label><input type="text" name="invoiceBankName" value="${esc(s.invoiceBankName || '')}"></div>
+            <div class="field"><label class="field-label">BSB</label><input type="text" name="invoiceBsb" inputmode="numeric" value="${esc(s.invoiceBsb || '')}" placeholder="062-000"></div>
+            <div class="field"><label class="field-label">Account number</label><input type="text" name="invoiceAccount" inputmode="numeric" value="${esc(s.invoiceAccount || '')}"></div>
+          </div>
+          <div class="field" style="margin-bottom:14px;"><label class="field-label">Note at the bottom of invoices (optional)</label><input type="text" name="invoiceNote" value="${esc(s.invoiceNote || '')}" placeholder="Thank you for your business."></div>
+          <button class="btn btn-primary" type="submit">Save invoice details</button>
+        </form>
+      </div>
+
+      <div class="card" style="margin-bottom:18px;">
         <h3 style="margin-bottom:14px;">Payment reference format</h3>
         <form data-onsubmit="settings-save-prefix">
           <div class="field-row">
@@ -2765,6 +2790,18 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const fd = new FormData(form);
       await saveSettings({ businessName: fd.get('businessName') });
       renderSidebar(); renderView(); toast('Business name saved.', 'ok');
+    },
+    'settings-save-invoice': async (form) => {
+      const fd = new FormData(form);
+      const get = (k) => String(fd.get(k) || '').trim();
+      await saveSettings({
+        invoiceAbn: get('invoiceAbn'), invoicePhone: get('invoicePhone'), invoiceEmail: get('invoiceEmail'),
+        invoiceAddress: get('invoiceAddress'), invoiceGst: get('invoiceGst') === 'add10' ? 'add10' : 'none',
+        invoiceTermsDays: Math.min(120, Math.max(0, Number(fd.get('invoiceTermsDays')) || 0)),
+        invoiceBankName: get('invoiceBankName'), invoiceBsb: get('invoiceBsb'), invoiceAccount: get('invoiceAccount'),
+        invoiceNote: get('invoiceNote'),
+      });
+      renderView(); toast('Invoice details saved.', 'ok');
     },
     'settings-save-prefix': async (form) => {
       const fd = new FormData(form);
@@ -3884,11 +3921,12 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     const rows = state.invoices.slice().sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
     const body = rows.length ? rows.map((inv) => `<tr>
       <td class="tnum">${esc(inv.invoiceRef)}</td><td>${esc(inv.companyName)}</td><td>${inv.periodFrom} – ${inv.periodTo}</td>
-      <td class="tnum">${inv.lineItems.length}</td><td class="tnum" style="font-weight:700;">${fmtMoney(inv.total)}</td>
+      <td class="tnum">${inv.lineItems.length}</td><td class="tnum" style="font-weight:700;">${fmtMoney(invoiceTotals(inv).total)}</td>
       <td class="tnum">${fmtMoney((Number(inv.total) || 0) - (Number(inv.payTotal) || 0))}</td>
       <td>${inv.status === 'Paid' ? '<span class="pill pill-paid">Paid</span>' : inv.status === 'Sent' ? '<span class="pill pill-other">Sent</span>' : '<span class="pill pill-pending">Draft</span>'}</td>
       <td style="white-space:nowrap;">
         <button class="btn btn-sm" data-action="invoice-view" data-id="${inv.id}">View</button>
+        <button class="btn btn-sm" data-action="invoice-pdf" data-id="${inv.id}">Download PDF</button>
         ${inv.status === 'Draft' ? `<button class="btn btn-sm" data-action="invoice-mark-sent" data-id="${inv.id}">Mark sent</button>` : ''}
         ${inv.status === 'Sent' ? `<button class="btn btn-sm" data-action="invoice-mark-paid" data-id="${inv.id}">Mark paid</button>` : ''}
       </td>
@@ -3949,6 +3987,150 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       </div>
     `, { wide: true });
   }
+  // ---- Invoice PDF ------------------------------------------------------
+  // jsPDF + AutoTable are served from /vendor and loaded only when needed.
+  const scriptLoads = {};
+  function loadScriptOnce(src) {
+    if (!scriptLoads[src]) {
+      scriptLoads[src] = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src; s.async = true;
+        s.onload = () => resolve();
+        s.onerror = () => { delete scriptLoads[src]; reject(new Error('Could not load the PDF tool. Check your connection and try again.')); };
+        document.head.appendChild(s);
+      });
+    }
+    return scriptLoads[src];
+  }
+  async function loadPdfLib() {
+    await loadScriptOnce('vendor/jspdf.umd.min.js');
+    await loadScriptOnce('vendor/jspdf.plugin.autotable.min.js');
+    if (!window.jspdf || !window.jspdf.jsPDF) throw new Error('The PDF tool did not load. Refresh the page and try again.');
+    return window.jspdf.jsPDF;
+  }
+  function invoiceDates(inv) {
+    const issued = String(inv.issuedDate || inv.createdAt || todayStr()).slice(0, 10);
+    const terms = Number(state.settings.invoiceTermsDays != null ? state.settings.invoiceTermsDays : 14) || 0;
+    const [y, m, d] = issued.split('-').map(Number);
+    const due = new Date(y, m - 1, d + terms);
+    const dueStr = due.getFullYear() + '-' + String(due.getMonth() + 1).padStart(2, '0') + '-' + String(due.getDate()).padStart(2, '0');
+    return { issued, due: dueStr, terms };
+  }
+  function invoiceTotals(inv) {
+    const subtotal = Math.round((Number(inv.subtotal != null ? inv.subtotal : inv.total) || 0) * 100) / 100;
+    const gst = state.settings.invoiceGst === 'add10' ? Math.round(subtotal * 10) / 100 : 0;
+    return { subtotal, gst, total: Math.round((subtotal + gst) * 100) / 100, hasGst: state.settings.invoiceGst === 'add10' };
+  }
+  function pdfDate(dateStr) {
+    if (!dateStr) return '';
+    const [y, m, d] = String(dateStr).slice(0, 10).split('-').map(Number);
+    return new Date(y, m - 1, d).toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' });
+  }
+  async function downloadInvoicePdf(invId) {
+    const inv = state.invoices.find((i) => i.id === invId);
+    if (!inv) { toast('Invoice not found.', 'err'); return; }
+    const JsPDF = await loadPdfLib();
+    const s = state.settings;
+    const company = state.companies.find((c) => c.id === inv.companyId) || {};
+    const { issued, due } = invoiceDates(inv);
+    const totals = invoiceTotals(inv);
+    const NAVY = [19, 28, 46], GOLD = [184, 146, 90], INK = [19, 28, 46], MUTED = [88, 98, 117], LINE = [228, 223, 212];
+    const money = (n) => fmtMoney(n);
+
+    const doc = new JsPDF({ unit: 'mm', format: 'a4' });
+    const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight(), M = 16;
+
+    // Header band
+    doc.setFillColor(...NAVY); doc.rect(0, 0, W, 38, 'F');
+    doc.setFillColor(...GOLD); doc.rect(0, 38, W, 1.2, 'F');
+    doc.setFont('times', 'bold'); doc.setFontSize(21); doc.setTextColor(255, 255, 255);
+    doc.text(s.businessName || 'UMA Management', M, 20);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5); doc.setTextColor(216, 187, 134);
+    const fromBits = [s.invoiceAbn ? 'ABN ' + s.invoiceAbn : '', s.invoicePhone, s.invoiceEmail].filter(Boolean).join('   ·   ');
+    if (fromBits) doc.text(fromBits, M, 28);
+    if (s.invoiceAddress) { doc.setTextColor(200, 206, 216); doc.text(s.invoiceAddress, M, 33); }
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(10); doc.setTextColor(216, 187, 134);
+    const title = totals.hasGst ? 'TAX INVOICE' : 'INVOICE';
+    const titleWidth = doc.getTextWidth(title) + 1.2 * (title.length - 1);
+    doc.text(title, W - M - titleWidth, 20, { charSpace: 1.2 });
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(255, 255, 255);
+    doc.text(inv.invoiceRef || '', W - M, 27, { align: 'right' });
+
+    // Bill to + invoice facts
+    let y = 52;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(7.5); doc.setTextColor(...GOLD);
+    doc.text('BILL TO', M, y, { charSpace: 0.8 });
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(12); doc.setTextColor(...INK);
+    doc.text(inv.companyName || company.name || '', M, y + 7);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(...MUTED);
+    const billLines = [company.contactPerson ? 'Attn: ' + company.contactPerson : '', company.abn ? 'ABN ' + company.abn : '', company.siteAddress || '', company.email || ''].filter(Boolean);
+    billLines.forEach((line, i) => doc.text(doc.splitTextToSize(line, 90)[0], M, y + 13 + i * 5));
+
+    const facts = [['Invoice number', inv.invoiceRef || ''], ['Issue date', pdfDate(issued)], ['Due date', pdfDate(due)], ['Work period', pdfDate(inv.periodFrom) + ' – ' + pdfDate(inv.periodTo)]];
+    facts.forEach(([k, v], i) => {
+      const fy = y + i * 6.5;
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5); doc.setTextColor(...MUTED); doc.text(k, W - M - 62, fy);
+      doc.setFont('helvetica', 'bold'); doc.setTextColor(...INK); doc.text(v, W - M, fy, { align: 'right' });
+    });
+
+    // Line items (client-facing only: no worker pay or margin)
+    const startY = Math.max(y + 16 + billLines.length * 5, y + facts.length * 6.5 + 6);
+    const items = (inv.lineItems || []).slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    doc.autoTable({
+      startY,
+      margin: { left: M, right: M },
+      head: [['Date', 'Worker', 'Work', 'Hours', 'Rate', 'Amount']],
+      body: items.map((li) => [pdfDate(li.date), li.labourName || '', LABOUR_TYPE_LABEL[li.workType] || li.workType || '', (Number(li.hours) || 0).toFixed(2), money(li.rate), money(li.amount)]),
+      theme: 'plain',
+      styles: { font: 'helvetica', fontSize: 9, textColor: INK, cellPadding: { top: 3, bottom: 3, left: 3, right: 3 }, lineColor: LINE },
+      headStyles: { fillColor: NAVY, textColor: [255, 255, 255], fontStyle: 'bold', fontSize: 8 },
+      alternateRowStyles: { fillColor: [250, 248, 244] },
+      columnStyles: { 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right', fontStyle: 'bold' } },
+      didParseCell: (data) => { if (data.section === 'head' && data.column.index >= 3) data.cell.styles.halign = 'right'; },
+    });
+
+    // Totals
+    y = doc.lastAutoTable.finalY + 8;
+    if (y > H - 70) { doc.addPage(); y = 24; }
+    const tx = W - M - 70;
+    const totalRows = [['Subtotal', money(totals.subtotal)]];
+    if (totals.hasGst) totalRows.push(['GST (10%)', money(totals.gst)]);
+    doc.setFontSize(9.5);
+    totalRows.forEach(([k, v], i) => {
+      doc.setFont('helvetica', 'normal'); doc.setTextColor(...MUTED); doc.text(k, tx, y + i * 6.5);
+      doc.setTextColor(...INK); doc.text(v, W - M, y + i * 6.5, { align: 'right' });
+    });
+    y += totalRows.length * 6.5;
+    doc.setFillColor(...NAVY); doc.roundedRect(tx - 4, y - 1, W - M - tx + 4, 12, 2, 2, 'F');
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(10.5); doc.setTextColor(216, 187, 134); doc.text('Total due', tx, y + 6.8);
+    doc.setTextColor(255, 255, 255); doc.text(money(totals.total) + ' AUD', W - M - 3, y + 6.8, { align: 'right' });
+    if (totals.hasGst) { doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5); doc.setTextColor(...MUTED); doc.text('Total includes GST of ' + money(totals.gst), W - M, y + 17, { align: 'right' }); }
+
+    // Payment details
+    if (s.invoiceBankName || s.invoiceBsb || s.invoiceAccount) {
+      let py = y + 26;
+      doc.setDrawColor(...LINE); doc.setLineWidth(0.3); doc.line(M, py - 6, W - M, py - 6);
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(7.5); doc.setTextColor(...GOLD); doc.text('HOW TO PAY', M, py, { charSpace: 0.8 });
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(...INK);
+      const payLines = [['Account name', s.invoiceBankName], ['BSB', s.invoiceBsb], ['Account number', s.invoiceAccount], ['Reference', inv.invoiceRef], ['Pay by', pdfDate(due)]].filter((r) => r[1]);
+      payLines.forEach(([k, v], i) => { doc.setTextColor(...MUTED); doc.text(k, M, py + 7 + i * 5.5); doc.setTextColor(...INK); doc.text(String(v), M + 34, py + 7 + i * 5.5); });
+    }
+
+    // Footer on every page
+    const pages = doc.getNumberOfPages();
+    for (let p = 1; p <= pages; p++) {
+      doc.setPage(p);
+      doc.setDrawColor(...GOLD); doc.setLineWidth(0.4); doc.line(M, H - 16, W - M, H - 16);
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(...MUTED);
+      doc.text(s.invoiceNote || 'Thank you for your business.', M, H - 10);
+      doc.text(`${inv.invoiceRef || ''}  ·  Page ${p} of ${pages}`, W - M, H - 10, { align: 'right' });
+    }
+
+    const safeName = `${inv.invoiceRef || 'Invoice'} ${inv.companyName || ''}`.replace(/[\\/:*?"<>|]+/g, '').trim();
+    doc.save(safeName + '.pdf');
+    toast('Invoice PDF downloaded.', 'ok');
+  }
+
   function invoiceViewModal(invId) {
     const inv = state.invoices.find((i) => i.id === invId);
     if (!inv) return;
@@ -3961,8 +4143,10 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         <table class="data"><thead><tr><th>Date</th><th>Labour</th><th>Type</th><th>Hours</th><th>Rate</th><th>Amount</th><th>Worker Pay</th></tr></thead><tbody>${rowsHtml}</tbody></table>
       </div>
       <p style="text-align:right;margin-top:10px;">Worker cost: ${fmtMoney(payTotal)} · Margin: <strong>${fmtMoney((Number(inv.total) || 0) - payTotal)}</strong></p>
-      <p style="text-align:right;font-weight:700;margin-top:4px;">Total: ${fmtMoney(inv.total)}</p>
-      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;"><button class="btn" data-action="modal-close">Close</button></div>
+      ${invoiceTotals(inv).hasGst ? `<p style="text-align:right;margin-top:4px;">Subtotal: ${fmtMoney(invoiceTotals(inv).subtotal)} · GST: ${fmtMoney(invoiceTotals(inv).gst)}</p>` : ''}
+      <p style="text-align:right;font-weight:700;margin-top:4px;">Total${invoiceTotals(inv).hasGst ? ' incl. GST' : ''}: ${fmtMoney(invoiceTotals(inv).total)}</p>
+      <p class="helptext" style="text-align:right;margin-top:4px;">Worker pay and margin are for you only — they're not printed on the PDF.</p>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;"><button class="btn" data-action="modal-close">Close</button><button class="btn btn-primary" data-action="invoice-pdf" data-id="${inv.id}">Download PDF</button></div>
     `, { wide: true });
   }
 
@@ -3980,6 +4164,11 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     'labour-log-override': (el) => labourLogOverrideModal(el.dataset.id),
     'invoice-generate': () => invoiceGenerateModal(),
     'invoice-view': (el) => invoiceViewModal(el.dataset.id),
+    'invoice-pdf': async (el) => {
+      const label = el.textContent; el.disabled = true; el.textContent = 'Preparing PDF…';
+      try { await downloadInvoicePdf(el.dataset.id); }
+      finally { if (el.isConnected) { el.disabled = false; el.textContent = label; } }
+    },
     'invoice-mark-sent': async (el) => {
       await state.db.doc('invoices/' + el.dataset.id).update({ status: 'Sent', updatedAt: new Date().toISOString() });
       await loadInvoices(); toast('Marked sent.', 'ok'); renderView();
