@@ -22,7 +22,7 @@ type StoredDoc = { collection: string; doc_id: string; data_json: string; create
 const COLLECTIONS = new Set([
   'settings', 'staff', 'drivers', 'companies', 'days', 'driverSubmissions',
   'labour', 'labourShifts', 'labourLogs', 'invoices', 'rateCards', 'auditLog',
-  'deliveryBlocks', 'driverAssignments', 'routes'
+  'deliveryBlocks', 'driverAssignments', 'routes', 'routePhotos'
 ]);
 const now = () => new Date().toISOString();
 const uid = () => crypto.randomUUID();
@@ -200,7 +200,7 @@ function visibleToAccount(collection: string, row: { id: string; data: any }, ac
       return owned.length > 0;
     }
     if (collection === 'deliveryBlocks') return true;
-    if (collection === 'routes') return row.data.driverId === driverId;
+    if (collection === 'routes' || collection === 'routePhotos') return row.data.driverId === driverId;
     return false;
   }
   if (account.role === 'labour') {
@@ -232,7 +232,7 @@ function canWrite(account: Account, collection: string, method: string) {
   if (role === 'staff') return !['staff', 'auditlog', 'settings'].includes(target);
   // Driver/Labour updates are permitted only for their own records; record
   // ownership is checked in the update route below.
-  if (role === 'driver') return ['driversubmissions', 'routes'].includes(target) && ['POST', 'PATCH', 'PUT'].includes(verb);
+  if (role === 'driver') return ['driversubmissions', 'routes', 'routephotos'].includes(target) && ['POST', 'PATCH', 'PUT'].includes(verb);
   if (role === 'labour') return ['labourlogs', 'labourshifts'].includes(target) && ['POST', 'PATCH', 'PUT'].includes(verb);
   return false;
 }
@@ -359,6 +359,17 @@ async function api(request: Request, env: Env): Promise<Response> {
     }
     return json({ saved });
   }
+  if (path === '/api/route/address-note' && method === 'POST') {
+    const account = await currentAccount(request, env);
+    if (!account) return fail('Sign in required.', 401);
+    if (!['admin', 'manager', 'staff', 'driver'].includes(account.role)) return fail('Forbidden.', 403);
+    const body = await jsonBody(request);
+    const address = String(body?.address || '').trim().slice(0, 300);
+    const note = String(body?.note || '').trim().slice(0, 500);
+    if (!address) return fail('Address required.');
+    await saveDocument(env, 'addressnotes', await geoKey(address), { address, note, updatedBy: account.id, updatedAt: new Date().toISOString() }, 'set');
+    return json({ ok: true });
+  }
   if (path === '/api/route/geocode' && method === 'POST') {
     const account = await currentAccount(request, env);
     if (!account) return fail('Sign in required.', 401);
@@ -367,7 +378,12 @@ async function api(request: Request, env: Env): Promise<Response> {
     const addresses: string[] = Array.isArray(body?.addresses) ? body.addresses.map((a: unknown) => String(a || '').trim()) : [];
     if (!addresses.length) return fail('No addresses to look up.');
     if (addresses.length > 300) return fail('Too many stops in one go (300 max).');
-    const results = await geocodeAddresses(env, addresses);
+    const results: any[] = await geocodeAddresses(env, addresses);
+    // Saved access instructions (gate codes etc.) for each address.
+    await Promise.all(addresses.map(async (a, i) => {
+      const n = await readDoc(env, 'addressnotes', await geoKey(a));
+      if (n && n.note) results[i] = { ...results[i], access: n.note };
+    }));
     return json({ results });
   }
 
@@ -415,7 +431,7 @@ async function api(request: Request, env: Env): Promise<Response> {
     }
     if (collection === 'staff' && account.role !== 'admin') return fail('Only Admin can update accounts.', 403);
     const body = await jsonBody(request);
-    if (String(account.role).trim().toLowerCase() === 'driver' && ['driverSubmissions', 'routes'].includes(collection)) {
+    if (String(account.role).trim().toLowerCase() === 'driver' && ['driverSubmissions', 'routes', 'routePhotos'].includes(collection)) {
       const existing = await readDoc(env, collection, id);
       if (!existing || existing.driverId !== account.driverId) return fail('Record does not belong to this Driver account.', 403);
       if (body?.driverId && body.driverId !== account.driverId) return fail('Record does not belong to this Driver account.', 403);

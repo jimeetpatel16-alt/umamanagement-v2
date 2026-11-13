@@ -2070,7 +2070,7 @@
   // neighbour + 2-opt on straight-line distance), and saved as a 'routes' doc.
   // The driver works through the stops and ticks Delivered / Failed; the
   // counts pre-fill their daily submission. Admin/Manager see every route.
-  const routeUi = { draft: null, busy: '', adminDate: '', viewId: null, showAll: false };
+  const routeUi = { draft: null, busy: '', adminDate: '', viewId: null, showAll: false, reorder: false };
   const ROUTE_FIELDS = [
     ['address', 'Street address', /^(delivery |receiver |consignee |customer |recipient )?(street )?(address|addr)( ?line ?1)?$|^street$|address 1|address line 1|delivery address/],
     ['suburb', 'Suburb / city', /suburb|city|town|locality/],
@@ -2081,7 +2081,34 @@
     ['ref', 'Parcel / tracking no.', /tracking|consignment|connote|con note|parcel ?(id|no|number)|barcode|article|reference|^ref|order (no|id|number)|label/],
     ['parcels', 'Number of parcels', /^(qty|quantity|pieces|pcs|parcels|items|item count|count)$/],
     ['notes', 'Delivery notes', /note|instruction|comment|remark|special/],
+    ['email', 'Email', /e-?mail/],
+    ['earliest', 'Earliest arrival', /earliest|window ?(start|from)|time ?from|from time|ready ?time|open(ing)? time/],
+    ['latest', 'Latest arrival', /latest|window ?(end|to)|time ?to|to time|deadline|clos(e|ing) time/],
+    ['timeAtStop', 'Time at stop (min)', /time at stop|service ?time|stop duration|^duration$/],
+    ['stopType', 'Stop type', /stop ?type|^type$|delivery ?\/ ?pick ?up|job ?type/],
   ];
+  const PKG_SIZES = ['Small', 'Medium', 'Large'];
+  const PKG_TYPES = ['Box', 'Bag', 'Letter'];
+  const PKG_POSITIONS = ['Front', 'Middle', 'Back'];
+  const PKG_SIDES = ['Left', 'Right'];
+  const PKG_SURFACES = ['Floor', 'Shelf'];
+  const STOP_COLOURS = [['', 'Auto'], ['#2f6fd6', 'Blue'], ['#1f7a52', 'Green'], ['#d97a1e', 'Orange'], ['#c0392b', 'Red'], ['#7b4bc4', 'Purple'], ['#14919b', 'Teal'], ['#c2417f', 'Pink']];
+  // Run-sheet times come as "9:00", "09:00", "9am", "0900" or Excel time values.
+  function parseClock(v) {
+    const t = String(v || '').trim().toLowerCase();
+    if (!t) return '';
+    const m = t.match(/^(\d{1,2})(?::|\.)?(\d{2})?\s*(am|pm)?$/);
+    if (!m) return '';
+    let h = Number(m[1]); const min = Number(m[2] || 0);
+    if (m[3] === 'pm' && h < 12) h += 12;
+    if (m[3] === 'am' && h === 12) h = 0;
+    if (!m[2] && !m[3] && t.length === 4) { h = Number(t.slice(0, 2)); }
+    if (h > 23 || min > 59) return '';
+    return String(h).padStart(2, '0') + ':' + String(min).padStart(2, '0');
+  }
+  const clockSec = (hhmm) => { if (!hhmm) return null; const [h, m] = String(hhmm).split(':').map(Number); return Number.isFinite(h) ? h * 3600 + (m || 0) * 60 : null; };
+  const stopServiceSec = (s) => (s && s.serviceMin != null && s.serviceMin !== '' ? Math.max(0, Number(s.serviceMin)) * 60 : STOP_SERVICE_SEC);
+  const fmtWindow = (s) => (s.windowStart || s.windowEnd ? `${s.windowStart ? fmtClock(new Date(2000, 0, 1, ...s.windowStart.split(':').map(Number))) : 'Anytime'}–${s.windowEnd ? fmtClock(new Date(2000, 0, 1, ...s.windowEnd.split(':').map(Number))) : 'Anytime'}` : '');
   const FAIL_REASONS = ['Nobody home', 'Address not found', 'No safe place', 'Access issue', 'Refused', 'Damaged', 'Other'];
 
   async function loadRoutes() {
@@ -2099,7 +2126,8 @@
     return {
       stops: stops.length,
       done: stops.filter((s) => s.status !== 'pending').length,
-      delivered: stops.filter((s) => s.status === 'delivered').reduce((n, s) => n + parcels(s), 0),
+      delivered: stops.filter((s) => s.status === 'delivered' && s.stopType !== 'pickup').reduce((n, s) => n + parcels(s), 0),
+      pickedUp: stops.filter((s) => s.status === 'delivered' && s.stopType === 'pickup').reduce((n, s) => n + parcels(s), 0),
       failed: stops.filter((s) => s.status === 'failed').reduce((n, s) => n + parcels(s), 0),
       parcels: stops.reduce((n, s) => n + parcels(s), 0),
     };
@@ -2130,7 +2158,11 @@
       if (v.richText) return v.richText.map((t) => t.text).join('');
       if (v.text != null) return String(v.text);
       if (v.result != null) return String(v.result);
-      if (v instanceof Date) return v.toISOString().slice(0, 10);
+    }
+    if (v instanceof Date) {
+      // Excel stores times-of-day as dates on 30 Dec 1899.
+      if (v.getUTCFullYear() < 1901) return String(v.getUTCHours()).padStart(2, '0') + ':' + String(v.getUTCMinutes()).padStart(2, '0');
+      return v.toISOString().slice(0, 10);
     }
     return String(v);
   }
@@ -2199,7 +2231,10 @@
         const note = get(r, 'notes'); if (note && !existing.notes.includes(note)) existing.notes = existing.notes ? existing.notes + ' · ' + note : note;
         const nm = get(r, 'name'); if (nm && !existing.name.toLowerCase().includes(nm.toLowerCase())) existing.name = existing.name ? existing.name + ', ' + nm : nm;
       } else {
-        byAddr.set(key, { address: full, name: get(r, 'name'), phone: get(r, 'phone'), refs: get(r, 'ref') ? [get(r, 'ref')] : [], parcels: qty, notes: get(r, 'notes'),
+        const svc = parseInt(get(r, 'timeAtStop'), 10);
+        byAddr.set(key, { address: full, name: get(r, 'name'), phone: get(r, 'phone'), email: get(r, 'email'), refs: get(r, 'ref') ? [get(r, 'ref')] : [], parcels: qty, notes: get(r, 'notes'),
+          windowStart: parseClock(get(r, 'earliest')), windowEnd: parseClock(get(r, 'latest')), serviceMin: Number.isFinite(svc) ? svc : null,
+          stopType: /pick/i.test(get(r, 'stopType')) ? 'pickup' : 'delivery', placement: 'auto',
           parts: { street, suburb: get(r, 'suburb'), state: get(r, 'state'), postcode: get(r, 'postcode') } });
       }
     });
@@ -2321,9 +2356,62 @@
     }
     return best.tour.slice(1).map((v) => v - 1);
   }
+  // Orders stops honouring "First / Auto / Last" and arrival time windows.
+  // First stops are solved from the start, Auto stops from where the First
+  // stops finish, Last stops after that. Stops with a time window are then
+  // nudged earlier/later if that reduces lateness and waiting.
+  const PLACEMENT_RANK = { first: 0, auto: 1, last: 2 };
+  function solveSubset(C, anchor, idxs, ret) {
+    if (!idxs.length) return [];
+    const nodes = [anchor].concat(idxs);
+    const sub = nodes.map((x) => nodes.map((y) => C[x][y]));
+    return solveOrder(sub, idxs.length, ret).map((k) => idxs[k]);
+  }
+  function scheduleCost(C, seq, stops, startSec, anchor) {
+    let t = startSec, prev = anchor, cost = 0;
+    for (const node of seq) {
+      const s = stops[node - 1];
+      t += C[prev][node];
+      const ws = clockSec(s.windowStart), we = clockSec(s.windowEnd);
+      if (ws != null && t < ws) { cost += ws - t; t = ws; }
+      if (we != null && t > we) cost += (t - we) * 25;
+      t += stopServiceSec(s); prev = node;
+    }
+    return cost + (t - startSec);
+  }
+  function refineForWindows(C, seq, stops, anchor) {
+    const now = new Date(); const startSec = now.getHours() * 3600 + now.getMinutes() * 60;
+    const rank = (node) => PLACEMENT_RANK[stops[node - 1].placement] ?? 1;
+    const ordered = (cand) => cand.every((n, i) => i === 0 || rank(cand[i - 1]) <= rank(n));
+    let best = scheduleCost(C, seq, stops, startSec, anchor), improved = true, guard = 0;
+    while (improved && guard++ < 25) {
+      improved = false;
+      for (let i = 0; i < seq.length && !improved; i++) {
+        const node = seq[i]; const st = stops[node - 1];
+        if (!st.windowStart && !st.windowEnd) continue;
+        for (let j = 0; j < seq.length; j++) {
+          if (j === i) continue;
+          const cand = seq.slice(); cand.splice(i, 1); cand.splice(j, 0, node);
+          if (!ordered(cand)) continue;
+          const c = scheduleCost(C, cand, stops, startSec, anchor);
+          if (c < best - 1) { best = c; seq = cand; improved = true; break; }
+        }
+      }
+    }
+    return seq;
+  }
   async function planStopOrder(start, stops, ret) {
     const M = await costMatrix([start].concat(stops));
-    return { order: solveOrder(M.dur, stops.length, ret), source: M.source };
+    const groups = { first: [], auto: [], last: [] };
+    stops.forEach((s, i) => groups[PLACEMENT_RANK[s.placement] === 0 ? 'first' : PLACEMENT_RANK[s.placement] === 2 ? 'last' : 'auto'].push(i + 1));
+    const used = ['first', 'auto', 'last'].filter((g) => groups[g].length);
+    let anchor = 0, seq = [];
+    used.forEach((g) => {
+      const part = solveSubset(M.dur, anchor, groups[g], ret && used.length === 1);
+      seq = seq.concat(part); if (part.length) anchor = part[part.length - 1];
+    });
+    if (stops.some((s) => s.windowStart || s.windowEnd)) seq = refineForWindows(M.dur, seq, stops, 0);
+    return { order: seq.map((v) => v - 1), source: M.source };
   }
   // Real road line + leg times for an ordered list of points (OSRM /route).
   async function roadRoute(points) {
@@ -2385,17 +2473,21 @@
   }
   // Arrival time for each pending stop, counted from now.
   function routeEtas(route) {
-    const etas = {}; let t = Date.now(); let first = true;
+    const etas = {}, late = {}; let t = Date.now();
     // Routes planned before arrival times existed have no leg times.
-    if (!(route.stops || []).some((s) => s.status === 'pending' && s.legSec != null)) return { etas, finish: new Date(t), any: false };
+    if (!(route.stops || []).some((s) => s.status === 'pending' && s.legSec != null)) return { etas, late, finish: new Date(t), any: false };
+    const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
     (route.stops || []).forEach((s) => {
       if (s.status !== 'pending') return;
-      t += (Number(s.legSec) || 0) * 1000 + (first ? 0 : STOP_SERVICE_SEC * 1000);
-      first = false;
+      t += (Number(s.legSec) || 0) * 1000;
+      const ws = clockSec(s.windowStart), we = clockSec(s.windowEnd);
+      if (ws != null && t < midnight.getTime() + ws * 1000) t = midnight.getTime() + ws * 1000;
       etas[s.id] = new Date(t);
+      if (we != null && t > midnight.getTime() + we * 1000) late[s.id] = true;
+      t += stopServiceSec(s) * 1000;
     });
-    const finish = route.returnToStart ? new Date(t + (STOP_SERVICE_SEC + (Number(route.returnLegSec) || 0)) * 1000) : new Date(t + STOP_SERVICE_SEC * 1000);
-    return { etas, finish, any: Object.keys(etas).length > 0 };
+    const finish = new Date(t + (route.returnToStart ? (Number(route.returnLegSec) || 0) * 1000 : 0));
+    return { etas, late, finish, any: Object.keys(etas).length > 0 };
   }
   const fmtClock = (d) => d.toLocaleTimeString('en-AU', { hour: 'numeric', minute: '2-digit' });
   function routeAnchor(route) {
@@ -2532,7 +2624,8 @@
     if (onProgress) onProgress(done, addresses.length, misses.length);
     for (let m = 0; m < misses.length; m++) {
       const i = misses[m];
-      try { out[i] = await osmLookup(addresses[i], partsList ? partsList[i] : null); }
+      const savedAccess = out[i] && out[i].access;
+      try { out[i] = await osmLookup(addresses[i], partsList ? partsList[i] : null); if (savedAccess) out[i].access = savedAccess; }
       catch (e) {
         // Stop asking a busy service; leave the rest for the driver to retry.
         for (let k = m; k < misses.length; k++) out[misses[k]] = { error: e.message };
@@ -2575,7 +2668,8 @@
     const next = (route.stops || []).find((s) => s.status === 'pending');
     (route.stops || []).forEach((s, i) => {
       const cls = s.status === 'delivered' ? 'is-done' : s.status === 'failed' ? 'is-failed' : (next && s.id === next.id ? 'is-next' : '');
-      L.marker([s.lat, s.lng], { icon: L.divIcon({ className: 'route-pin ' + cls, html: String(i + 1), iconSize: [26, 26] }) })
+      const colour = s.status === 'pending' && !(next && s.id === next.id) ? stopColour(s) : '';
+      L.marker([s.lat, s.lng], { icon: L.divIcon({ className: 'route-pin ' + cls, html: `<span${colour ? ` style="background:${colour};border-color:${colour};color:#fff;"` : ''}>${i + 1}</span>`, iconSize: [26, 26] }) })
         .addTo(routeMap).bindPopup(`<strong>${i + 1}. ${esc(s.address)}</strong>${s.name ? '<br>' + esc(s.name) : ''}`);
       pts.push([s.lat, s.lng]);
     });
@@ -2593,22 +2687,53 @@
   }
 
   // ---- Views ----
+  // Spoke-style colours: pickups purple, multi-package stops teal, or the
+  // colour the driver picked.
+  function stopColour(s) {
+    if (s.colour) return s.colour;
+    if (s.stopType === 'pickup') return '#7b4bc4';
+    if ((Number(s.parcels) || 1) > 1) return '#14919b';
+    return '';
+  }
+  function pkgSummary(s) {
+    const p = s.pkg || {};
+    const where = [p.position, p.side, p.surface].filter(Boolean).join(' · ');
+    const what = [p.size, p.type].filter(Boolean).join(' ');
+    return [where, what].filter(Boolean).join(' — ');
+  }
+  function stopChips(s, etas) {
+    const chips = [];
+    if (s.stopType === 'pickup') chips.push('<span class="stop-chip chip-pickup">Pickup</span>');
+    if (s.placement === 'first') chips.push('<span class="stop-chip">First</span>');
+    if (s.placement === 'last') chips.push('<span class="stop-chip">Last</span>');
+    if ((Number(s.parcels) || 1) > 1) chips.push(`<span class="stop-chip chip-multi">${s.parcels} packages</span>`);
+    if (s.windowStart || s.windowEnd) chips.push(`<span class="stop-chip ${etas && etas.late && etas.late[s.id] ? 'chip-late' : ''}">${esc(fmtWindow(s))}${etas && etas.late && etas.late[s.id] ? ' · may be late' : ''}</span>`);
+    if (pkgSummary(s)) chips.push(`<span class="stop-chip chip-pkg">${esc(pkgSummary(s))}</span>`);
+    if (s.photoId) chips.push('<span class="stop-chip">Photo</span>');
+    return chips.length ? `<div class="stop-chips">${chips.join('')}</div>` : '';
+  }
   function routeStopRow(route, s, i, editable, etas) {
-    const status = s.status === 'delivered' ? '<span class="pill pill-paid">Delivered</span>'
+    const status = s.status === 'delivered' ? `<span class="pill pill-paid">${s.stopType === 'pickup' ? 'Picked up' : 'Delivered'}</span>`
       : s.status === 'failed' ? `<span class="pill pill-cancelled">Failed</span>${s.reason ? `<div class="helptext">${esc(s.reason)}</div>` : ''}` : '';
+    const reorder = editable && routeUi.reorder && s.status === 'pending'
+      ? `<div class="route-move"><button class="btn btn-sm" data-action="route-stop-move" data-route="${route.id}" data-stop="${s.id}" data-dir="-1" aria-label="Move up">↑</button><button class="btn btn-sm" data-action="route-stop-move" data-route="${route.id}" data-stop="${s.id}" data-dir="1" aria-label="Move down">↓</button></div>` : '';
     const actions = !editable ? '' : s.status === 'pending'
-      ? `<div class="route-stop-actions">${navLinks(s)}<button class="btn btn-sm btn-primary" data-action="route-stop-done" data-route="${route.id}" data-stop="${s.id}">Delivered</button><button class="btn btn-sm" data-action="route-stop-fail" data-route="${route.id}" data-stop="${s.id}">Failed</button><button class="btn btn-sm" data-action="route-stop-next" data-route="${route.id}" data-stop="${s.id}" title="Make this my next stop">Do next</button></div>`
-      : `<div class="route-stop-actions"><button class="btn btn-sm" data-action="route-stop-undo" data-route="${route.id}" data-stop="${s.id}">Undo</button></div>`;
+      ? `<div class="route-stop-actions">${navLinks(s)}<button class="btn btn-sm btn-primary" data-action="route-stop-done" data-route="${route.id}" data-stop="${s.id}">${s.stopType === 'pickup' ? 'Picked up' : 'Delivered'}</button><button class="btn btn-sm" data-action="route-stop-fail" data-route="${route.id}" data-stop="${s.id}">Failed</button><button class="btn btn-sm" data-action="route-stop-edit" data-route="${route.id}" data-stop="${s.id}">Edit</button><button class="btn btn-sm" data-action="route-stop-next" data-route="${route.id}" data-stop="${s.id}" title="Make this my next stop">Do next</button></div>`
+      : `<div class="route-stop-actions"><button class="btn btn-sm" data-action="route-stop-undo" data-route="${route.id}" data-stop="${s.id}">Undo</button><button class="btn btn-sm" data-action="route-stop-edit" data-route="${route.id}" data-stop="${s.id}">Edit</button></div>`;
+    const colour = s.status === 'pending' ? stopColour(s) : '';
     return `<li class="route-stop ${s.status !== 'pending' ? 'is-' + s.status : ''}">
-      <span class="route-num">${i + 1}</span>
+      <span class="route-num"${colour ? ` style="background:${colour};color:#fff;"` : ''}>${i + 1}</span>
       <div class="route-stop-body">
         <div class="route-stop-addr">${esc(s.address)}</div>
         ${s.partial ? `<div class="helptext route-approx">Approximate pin (street only) — check the house number</div>` : ''}
-        <div class="helptext">${[s.name ? esc(s.name) : '', s.parcels > 1 ? s.parcels + ' parcels' : '', s.refs && s.refs.length ? esc(s.refs.slice(0, 3).join(', ')) + (s.refs.length > 3 ? '…' : '') : ''].filter(Boolean).join(' · ')}</div>
+        <div class="helptext">${[s.name ? esc(s.name) : '', s.refs && s.refs.length ? esc(s.refs.slice(0, 3).join(', ')) + (s.refs.length > 3 ? '…' : '') : ''].filter(Boolean).join(' · ')}</div>
+        ${stopChips(s, etas)}
+        ${s.access ? `<div class="helptext route-access">Access: ${esc(s.access)}</div>` : ''}
         ${s.notes ? `<div class="helptext">Note: ${esc(s.notes)}</div>` : ''}
         ${s.status === 'pending' && etas && etas.etas[s.id] ? `<div class="route-eta">Arrive ≈ ${fmtClock(etas.etas[s.id])}${s.legSec ? ` · ${fmtDuration(s.legSec / 60)} drive` : ''}</div>` : ''}
         ${status}${actions}
       </div>
+      ${reorder}
     </li>`;
   }
   function routeDetail(route, editable) {
@@ -2622,7 +2747,7 @@
       <div class="card route-summary">
         <div class="route-summary-figures">
           <div><span class="kpi-label">Stops</span><strong>${c.done}/${c.stops}</strong></div>
-          <div><span class="kpi-label">Delivered</span><strong>${c.delivered}</strong></div>
+          <div><span class="kpi-label">Delivered</span><strong>${c.delivered}${c.pickedUp ? `<small class="helptext"> +${c.pickedUp} picked up</small>` : ''}</strong></div>
           <div><span class="kpi-label">Failed</span><strong>${c.failed}</strong></div>
           <div><span class="kpi-label">Driving</span><strong>${route.driveMin != null ? '≈ ' + fmtDuration(route.driveMin) : '—'}</strong></div>
         </div>
@@ -2634,15 +2759,19 @@
           <p class="eyebrow" style="margin:0 0 6px;">Next stop · ${nextIdx + 1} of ${c.stops}${etas.etas[next.id] ? ' · arrive ≈ ' + fmtClock(etas.etas[next.id]) : ''}</p>
           <h2 style="margin:0 0 4px;font-size:1.25rem;">${esc(next.address)}</h2>
           ${next.partial ? '<p class="helptext route-approx" style="margin:0 0 4px;">Map pin is approximate (street only) — check the house number when you arrive.</p>' : ''}
-          <p class="helptext" style="margin:0 0 4px;">${[next.name ? esc(next.name) : '', next.parcels > 1 ? next.parcels + ' parcels' : '1 parcel', next.refs && next.refs.length ? esc(next.refs.join(', ')) : ''].filter(Boolean).join(' · ')}</p>
-          ${next.phone ? `<p style="margin:0 0 4px;"><a href="tel:${esc(next.phone.replace(/[^\d+]/g, ''))}">Call ${esc(next.phone)}</a></p>` : ''}
+          <p class="helptext" style="margin:0 0 4px;">${[next.name ? esc(next.name) : '', (next.parcels > 1 ? next.parcels + ' packages' : '1 package') + (next.stopType === 'pickup' ? ' to pick up' : ''), next.refs && next.refs.length ? esc(next.refs.join(', ')) : ''].filter(Boolean).join(' · ')}</p>
+          ${stopChips(next, etas)}
+          ${next.access ? `<p class="route-access-big"><strong>Access:</strong> ${esc(next.access)}</p>` : ''}
           ${next.notes ? `<p class="helptext" style="margin:0 0 8px;">Note: ${esc(next.notes)}</p>` : ''}
+          ${next.photoId ? `<button class="btn btn-sm" data-action="route-photo-view" data-photo="${esc(next.photoId)}" style="margin:0 0 6px;">See package photo</button>` : ''}
+          ${next.phone || next.email ? `<p style="margin:0 0 4px;display:flex;gap:14px;flex-wrap:wrap;">${next.phone ? `<a href="tel:${esc(next.phone.replace(/[^\d+]/g, ''))}">Call ${esc(next.phone)}</a><a href="sms:${esc(next.phone.replace(/[^\d+]/g, ''))}">Text</a>` : ''}${next.email ? `<a href="mailto:${esc(next.email)}">Email</a>` : ''}</p>` : ''}
           <div class="route-next-actions">
             ${navLinks(next)}
           </div>
           <div class="route-next-actions">
-            <button class="btn btn-primary" data-action="route-stop-done" data-route="${route.id}" data-stop="${next.id}">Delivered</button>
+            <button class="btn btn-primary" data-action="route-stop-done" data-route="${route.id}" data-stop="${next.id}">${next.stopType === 'pickup' ? 'Picked up' : 'Delivered'}</button>
             <button class="btn" data-action="route-stop-fail" data-route="${route.id}" data-stop="${next.id}">Failed</button>
+            <button class="btn" data-action="route-stop-edit" data-route="${route.id}" data-stop="${next.id}">Edit stop</button>
           </div>
         </div>` : editable && c.stops ? `<div class="card route-next"><h2 style="margin:0 0 6px;">All stops done</h2><p class="helptext" style="margin:0 0 12px;">${c.delivered} delivered, ${c.failed} failed. These numbers are filled in for you on Today's Deliveries.</p><button class="btn btn-primary" data-action="nav" data-route="driver-submit">Go to Today's Deliveries</button></div>` : ''}
       <div class="card route-map-card"><div id="routeMap" class="route-map" data-route-id="${route.id}"></div></div>
@@ -2658,12 +2787,17 @@
             </form>`).join('')}
         </div>` : ''}
       <div class="card">
-        <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;gap:10px;"><h3 style="margin:0;">All stops</h3>${route.fileName ? `<span class="helptext">From ${esc(route.fileName)}</span>` : ''}</div>
+        <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;"><h3 style="margin:0;">All stops</h3>${route.fileName ? `<span class="helptext">From ${esc(route.fileName)}</span>` : ''}</div>
+        ${editable ? `<div class="route-tools">
+          <button class="btn btn-sm btn-primary" data-action="route-stop-add" data-route="${route.id}">+ Add stop</button>
+          <button class="btn btn-sm" data-action="route-reorder-toggle" aria-pressed="${routeUi.reorder ? 'true' : 'false'}">${routeUi.reorder ? 'Done ordering' : 'Manually order'}</button>
+          <button class="btn btn-sm" data-action="route-reverse" data-route="${route.id}">Reverse route</button>
+          <button class="btn btn-sm" data-action="route-replan" data-route="${route.id}">Re-optimise</button>
+        </div>` : ''}
         <ol class="route-stops">${(route.stops || []).map((s, i) => routeStopRow(route, s, i, editable, etas)).join('')}</ol>
       </div>
       ${editable ? `
         <div class="route-footer-actions">
-          <button class="btn" data-action="route-replan" data-route="${route.id}">Re-plan remaining stops from here</button>
           <button class="btn btn-danger" data-action="route-archive" data-route="${route.id}">Start a new route</button>
         </div>` : ''}
     `;
@@ -2755,6 +2889,92 @@
     stops.splice(bestAt, 0, stop);
     return bestAt;
   }
+
+  // ---- Editing stops (Spoke-style) ----
+  const metricsPatch = (m) => ({ stops: m.stops, distanceKm: m.distanceKm, driveMin: m.driveMin, returnLegSec: m.returnLegSec, geometry: m.geometry, metricsSource: m.metricsSource });
+  async function applyStops(route, stops, extra) {
+    const m = await routeMetrics(Object.assign({}, route, { stops }), routeAnchor(route));
+    await saveRouteStops(route, Object.assign(metricsPatch(m), extra || {}));
+  }
+  function choiceGroup(name, options, value, labels) {
+    return `<div class="seg-choice" role="radiogroup">${options.map((o, i) => `<label class="seg-option"><input type="radio" name="${name}" value="${esc(o)}" ${String(value || '') === String(o) ? 'checked' : ''}><span>${esc(labels ? labels[i] : (o || '—'))}</span></label>`).join('')}</div>`;
+  }
+  function routeStopEditModal(route, stop) {
+    const p = stop.pkg || {};
+    openModal(`
+      <div class="modal-head"><h3>Edit stop</h3><button class="modal-close" data-action="modal-close" aria-label="Close">×</button></div>
+      <form class="stop-edit" data-onsubmit="route-stop-save" data-route="${route.id}" data-stop="${stop.id}">
+        <div class="field"><label class="field-label">Address</label><input type="text" name="address" value="${esc(stop.address)}" autocomplete="off"></div>
+        <p class="helptext" style="margin:-4px 0 12px;">Change the address by typing and picking from the list. The pin moves when you save.</p>
+        <div class="field"><label class="field-label">Notes</label><textarea name="notes" rows="2" placeholder="Anything that helps with this stop">${esc(stop.notes || '')}</textarea></div>
+        <div class="field"><label class="field-label">Access instructions</label><input type="text" name="access" value="${esc(stop.access || '')}" placeholder="Gate code, buzzer, where to leave it…"></div>
+        <label class="check-row"><input type="checkbox" name="rememberAccess"> Remember for this address (shows next time)</label>
+
+        <p class="eyebrow stop-edit-section">Recipient</p>
+        <div class="field-row">
+          <div class="field"><label class="field-label">Name</label><input type="text" name="name" value="${esc(stop.name || '')}"></div>
+          <div class="field"><label class="field-label">Phone</label><input type="tel" name="phone" value="${esc(stop.phone || '')}"></div>
+        </div>
+        <div class="field"><label class="field-label">Email</label><input type="email" name="email" value="${esc(stop.email || '')}"></div>
+
+        <p class="eyebrow stop-edit-section">Packages</p>
+        <div class="pkg-count"><button class="btn" type="button" data-action="route-pkg-step" data-step="-1" aria-label="One less">−</button><input type="number" name="parcels" min="1" max="99" value="${Number(stop.parcels) || 1}" aria-label="Packages"><button class="btn" type="button" data-action="route-pkg-step" data-step="1" aria-label="One more">+</button><span class="helptext">packages</span></div>
+        <div class="field"><label class="field-label">Package / barcode IDs</label><input type="text" name="refs" value="${esc((stop.refs || []).join(', '))}" placeholder="Separate with commas"></div>
+        <p class="field-label" style="margin:10px 0 6px;">Package finder — where it is in the vehicle</p>
+        <div class="pkg-finder">
+          <span class="pkg-label">Size</span>${choiceGroup('pkgSize', [''].concat(PKG_SIZES), p.size)}
+          <span class="pkg-label">Type</span>${choiceGroup('pkgType', [''].concat(PKG_TYPES), p.type)}
+          <span class="pkg-label">Position</span>${choiceGroup('pkgPosition', [''].concat(PKG_POSITIONS), p.position)}
+          <span class="pkg-label">Side</span>${choiceGroup('pkgSide', [''].concat(PKG_SIDES), p.side)}
+          <span class="pkg-label">Shelf</span>${choiceGroup('pkgSurface', [''].concat(PKG_SURFACES), p.surface)}
+        </div>
+        <div class="field" style="margin-top:10px;"><label class="field-label">Package photo</label>
+          ${stop.photoId ? `<button class="btn btn-sm" type="button" data-action="route-photo-view" data-photo="${esc(stop.photoId)}" style="margin-bottom:6px;">View current photo</button>` : ''}
+          <input type="file" name="photo" accept="image/*" capture="environment"></div>
+
+        <p class="eyebrow stop-edit-section">Stop setup</p>
+        <p class="field-label" style="margin:0 0 6px;">Type</p>
+        ${choiceGroup('stopType', ['delivery', 'pickup'], stop.stopType || 'delivery', ['Delivery', 'Pickup'])}
+        <p class="field-label" style="margin:12px 0 6px;">Order</p>
+        ${choiceGroup('placement', ['first', 'auto', 'last'], stop.placement || 'auto', ['First', 'Auto', 'Last'])}
+        <div class="field-row" style="margin-top:12px;">
+          <div class="field"><label class="field-label">Arrive after</label><input type="time" name="windowStart" value="${esc(stop.windowStart || '')}"></div>
+          <div class="field"><label class="field-label">Arrive before</label><input type="time" name="windowEnd" value="${esc(stop.windowEnd || '')}"></div>
+          <div class="field"><label class="field-label">Time at stop (min)</label><input type="number" name="serviceMin" min="0" max="240" value="${stop.serviceMin != null ? stop.serviceMin : ''}" placeholder="${STOP_SERVICE_SEC / 60}"></div>
+        </div>
+        <p class="helptext" style="margin:-4px 0 10px;">Leave times empty for Anytime.</p>
+        <p class="field-label" style="margin:0 0 6px;">Colour</p>
+        <div class="colour-choice">${STOP_COLOURS.map(([c, label]) => `<label class="colour-option" title="${label}"><input type="radio" name="colour" value="${c}" ${String(stop.colour || '') === c ? 'checked' : ''}><span style="${c ? `background:${c};` : ''}" class="${c ? '' : 'colour-auto'}">${c ? '' : 'Auto'}</span></label>`).join('')}</div>
+
+        <div class="stop-edit-actions">
+          <button class="btn btn-primary" type="submit">Save</button>
+          <button class="btn" type="button" data-action="route-stop-duplicate" data-route="${route.id}" data-stop="${stop.id}">Duplicate stop</button>
+          <button class="btn btn-danger" type="button" data-action="route-stop-remove" data-route="${route.id}" data-stop="${stop.id}">Remove stop</button>
+        </div>
+      </form>`);
+  }
+  function routeStopAddModal(route) {
+    openModal(`
+      <div class="modal-head"><h3>Add stop</h3><button class="modal-close" data-action="modal-close" aria-label="Close">×</button></div>
+      <form class="stop-edit" data-onsubmit="route-stop-add-save" data-route="${route.id}">
+        <div class="field"><label class="field-label">Address</label><input type="text" name="address" required autocomplete="off" placeholder="Start typing and pick from the list"></div>
+        <div class="field-row">
+          <div class="field"><label class="field-label">Recipient name</label><input type="text" name="name"></div>
+          <div class="field"><label class="field-label">Phone</label><input type="tel" name="phone"></div>
+        </div>
+        <div class="field"><label class="field-label">Notes</label><input type="text" name="notes"></div>
+        <div class="pkg-count"><button class="btn" type="button" data-action="route-pkg-step" data-step="-1" aria-label="One less">−</button><input type="number" name="parcels" min="1" max="99" value="1" aria-label="Packages"><button class="btn" type="button" data-action="route-pkg-step" data-step="1" aria-label="One more">+</button><span class="helptext">packages</span></div>
+        <p class="field-label" style="margin:12px 0 6px;">Type</p>
+        ${choiceGroup('stopType', ['delivery', 'pickup'], 'delivery', ['Delivery', 'Pickup'])}
+        <div class="stop-edit-actions"><button class="btn btn-primary" type="submit">Add to route</button><button class="btn" type="button" data-action="modal-close">Cancel</button></div>
+      </form>`);
+  }
+  async function lookupOne(input) {
+    const address = String(input.value || '').trim();
+    if (input.dataset.lat && input.dataset.lng) return { lat: Number(input.dataset.lat), lng: Number(input.dataset.lng), formatted: address, precision: 'house', partial: false };
+    const [g] = await geocodeForRoute([address]);
+    return g;
+  }
   async function saveRouteStops(route, patch) {
     Object.assign(route, patch, { updatedAt: new Date().toISOString() });
     await state.db.doc('routes/' + route.id).update(Object.assign({}, patch, { updatedAt: route.updatedAt }));
@@ -2790,7 +3010,7 @@
       const found = [], unmatched = [];
       stops.forEach((s, i) => {
         const g = lookups[i];
-        if (g && !g.error) found.push(Object.assign({}, s, { lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: g.partial }));
+        if (g && !g.error) found.push(Object.assign({}, s, { lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: g.partial, access: s.access || g.access || '' }));
         else unmatched.push(Object.assign({}, s, { error: g ? g.error : 'Not found' }));
       });
       if (!found.length) { routeUi.busy = ''; renderView(); toast(unmatched.length ? unmatched[0].error + ' — check the address column is right.' : 'No addresses found.', 'err'); return; }
@@ -2956,6 +3176,52 @@
       const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
       const stops = route.stops.map((s) => s.id === el.dataset.stop ? Object.assign({}, s, { status: 'pending', reason: '', doneAt: null }) : s);
       try { await saveRouteStops(route, { stops }); renderView(); } catch (e) { toast(e.message, 'err'); }
+    },
+    'route-stop-edit': (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
+      const stop = route.stops.find((x) => x.id === el.dataset.stop); if (stop) routeStopEditModal(route, stop);
+    },
+    'route-stop-add': (el) => { const route = state.routes.find((r) => r.id === el.dataset.route); if (route) routeStopAddModal(route); },
+    'route-pkg-step': (el) => {
+      const input = el.closest('form').querySelector('input[name="parcels"]');
+      input.value = Math.min(99, Math.max(1, (Number(input.value) || 1) + Number(el.dataset.step)));
+    },
+    'route-stop-duplicate': async (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
+      const i = route.stops.findIndex((x) => x.id === el.dataset.stop); if (i < 0) return;
+      const copy = Object.assign({}, route.stops[i], { id: 's' + genId(), status: 'pending', reason: '', doneAt: null, photoId: null });
+      const stops = route.stops.slice(); stops.splice(i + 1, 0, copy);
+      try { await applyStops(route, stops); closeModal(); renderView(); toast('Stop duplicated.', 'ok'); } catch (e) { toast(e.message, 'err'); }
+    },
+    'route-stop-remove': async (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
+      const ok = await confirmDialog('Remove this stop from today\'s route?', { title: 'Remove stop?', okLabel: 'Remove stop' });
+      if (!ok) return;
+      try { await applyStops(route, route.stops.filter((x) => x.id !== el.dataset.stop)); closeModal(); renderView(); toast('Stop removed.', 'ok'); } catch (e) { toast(e.message, 'err'); }
+    },
+    'route-reorder-toggle': () => { routeUi.reorder = !routeUi.reorder; renderView(); },
+    'route-stop-move': async (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
+      const stops = route.stops.slice(); const i = stops.findIndex((x) => x.id === el.dataset.stop);
+      let j = i + Number(el.dataset.dir);
+      while (j >= 0 && j < stops.length && stops[j].status !== 'pending') j += Number(el.dataset.dir);
+      if (i < 0 || j < 0 || j >= stops.length) return;
+      [stops[i], stops[j]] = [stops[j], stops[i]];
+      el.disabled = true;
+      try { await applyStops(route, stops); renderView(); } catch (e) { el.disabled = false; toast(e.message, 'err'); }
+    },
+    'route-reverse': async (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
+      const done = route.stops.filter((x) => x.status !== 'pending'); const pending = route.stops.filter((x) => x.status === 'pending').reverse();
+      el.disabled = true;
+      try { await applyStops(route, done.concat(pending)); renderView(); toast('Route reversed.', 'ok'); } catch (e) { el.disabled = false; toast(e.message, 'err'); }
+    },
+    'route-photo-view': async (el) => {
+      try {
+        const snap = await state.db.doc('routePhotos/' + el.dataset.photo).get();
+        if (!snap.exists) { toast('Photo not found.', 'err'); return; }
+        openModal(`<div class="modal-head"><h3>Package photo</h3><button class="modal-close" data-action="modal-close" aria-label="Close">×</button></div><img src="${esc(snap.data().image)}" alt="Package photo" style="width:100%;border-radius:10px;">`);
+      } catch (e) { toast(e.message, 'err'); }
     },
     'route-unmatched-retry': async (el) => {
       const route = state.routes.find((r) => r.id === el.dataset.route); if (!route || !(route.unmatched || []).length) return;
@@ -3512,6 +3778,66 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
 
   const SUBMIT_HANDLERS = {
     'route-plan': async (form) => { await planRoute(form); },
+    'route-stop-save': async (form) => {
+      const route = state.routes.find((r) => r.id === form.dataset.route); if (!route) return;
+      const old = route.stops.find((x) => x.id === form.dataset.stop); if (!old) return;
+      const fd = new FormData(form); const get = (k) => String(fd.get(k) || '').trim();
+      const btn = form.querySelector('button[type="submit"]'); btn.disabled = true; btn.textContent = 'Saving…';
+      try {
+        const stop = Object.assign({}, old, {
+          notes: get('notes'), access: get('access'), name: get('name'), phone: get('phone'), email: get('email'),
+          parcels: Math.min(99, Math.max(1, Number(fd.get('parcels')) || 1)), refs: get('refs').split(',').map((x) => x.trim()).filter(Boolean),
+          pkg: { size: get('pkgSize'), type: get('pkgType'), position: get('pkgPosition'), side: get('pkgSide'), surface: get('pkgSurface') },
+          stopType: get('stopType') === 'pickup' ? 'pickup' : 'delivery', placement: ['first', 'last'].includes(get('placement')) ? get('placement') : 'auto',
+          windowStart: get('windowStart'), windowEnd: get('windowEnd'), serviceMin: get('serviceMin') === '' ? null : Math.max(0, Number(get('serviceMin'))), colour: get('colour'),
+        });
+        const addressInput = form.querySelector('input[name="address"]');
+        const newAddress = get('address');
+        let moved = false;
+        if (newAddress && newAddress !== old.address) {
+          const g = await lookupOne(addressInput);
+          if (!g || g.error) { toast((g && g.error) || 'Address not found', 'err'); btn.disabled = false; btn.textContent = 'Save'; return; }
+          Object.assign(stop, { address: newAddress, lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: !!g.partial, parts: null });
+          moved = true;
+        }
+        const file = form.querySelector('input[name="photo"]').files[0];
+        if (file) {
+          const image = await readAndCompressImage(file, 900);
+          const ref = await state.db.collection('routePhotos').add({ driverId: route.driverId, routeId: route.id, stopId: stop.id, image, createdAt: new Date().toISOString() });
+          stop.photoId = ref.id;
+        }
+        if (fd.get('rememberAccess') && stop.access) {
+          fetch('/api/route/address-note', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ address: stop.address, note: stop.access }) }).catch(() => {});
+        }
+        let stops = route.stops.map((x) => (x.id === stop.id ? stop : x));
+        if (stop.status === 'pending' && stop.placement !== old.placement && stop.placement !== 'auto') {
+          stops = stops.filter((x) => x.id !== stop.id);
+          if (stop.placement === 'first') { const at = stops.findIndex((x) => x.status === 'pending'); stops.splice(at < 0 ? stops.length : at, 0, stop); }
+          else stops.push(stop);
+          moved = true;
+        }
+        const timing = stop.windowStart !== old.windowStart || stop.windowEnd !== old.windowEnd || stop.serviceMin !== old.serviceMin;
+        if (moved || timing) await applyStops(route, stops); else await saveRouteStops(route, { stops });
+        closeModal(); renderView();
+        toast(timing && stop.status === 'pending' ? 'Saved. Tap Re-optimise to fit the new arrival time.' : 'Stop saved.', 'ok');
+      } catch (e) { btn.disabled = false; btn.textContent = 'Save'; toast(e.message, 'err'); }
+    },
+    'route-stop-add-save': async (form) => {
+      const route = state.routes.find((r) => r.id === form.dataset.route); if (!route) return;
+      const fd = new FormData(form); const get = (k) => String(fd.get(k) || '').trim();
+      const btn = form.querySelector('button[type="submit"]'); btn.disabled = true; btn.textContent = 'Finding address…';
+      try {
+        const g = await lookupOne(form.querySelector('input[name="address"]'));
+        if (!g || g.error) { toast((g && g.error) || 'Address not found', 'err'); btn.disabled = false; btn.textContent = 'Add to route'; return; }
+        const stop = { id: 's' + genId(), address: get('address'), name: get('name'), phone: get('phone'), email: '', notes: get('notes'), access: g.access || '', refs: [],
+          parcels: Math.min(99, Math.max(1, Number(fd.get('parcels')) || 1)), stopType: get('stopType') === 'pickup' ? 'pickup' : 'delivery', placement: 'auto',
+          lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: !!g.partial, status: 'pending', reason: '', doneAt: null };
+        const stops = route.stops.slice();
+        const at = insertCheapest(route, stops, stop);
+        await applyStops(route, stops);
+        closeModal(); renderView(); toast(`Added as stop ${at + 1}.`, 'ok');
+      } catch (e) { btn.disabled = false; btn.textContent = 'Add to route'; toast(e.message, 'err'); }
+    },
     'route-fail-save': async (form) => {
       const route = state.routes.find((r) => r.id === form.dataset.route); if (!route) return;
       const fd = new FormData(form);
