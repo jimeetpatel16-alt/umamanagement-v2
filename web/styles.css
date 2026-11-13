@@ -716,3 +716,13 @@ table.data tfoot td { background: var(--surface-2); border-top: 1px solid var(--
   .route-footer-actions .btn { flex: 1 1 100%; }
 }
 .route-approx { color: var(--warn); }
+.route-meta { margin: 10px 0 0; }
+.route-eta { margin-top: 4px; font-size: .82rem; font-weight: 600; color: var(--gold-ink); font-variant-numeric: tabular-nums; }
+
+/* Address suggestions drop-down */
+.addr-suggest { position: fixed; z-index: 10050; max-height: 300px; overflow-y: auto; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); box-shadow: var(--shadow-lift); padding: 4px 0; }
+.addr-option { padding: 10px 14px; cursor: pointer; font-size: .92rem; line-height: 1.35; color: var(--ink); min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.addr-option:hover, .addr-option[aria-selected="true"] { background: var(--gold-soft); }
+.addr-hint { flex: none; font-size: .7rem; color: var(--ink-muted); text-transform: uppercase; letter-spacing: .06em; }
+.addr-empty { padding: 12px 14px; font-size: .88rem; color: var(--ink-muted); }
+.addr-credit { padding: 6px 14px 4px; font-size: .68rem; color: var(--ink-faint); border-top: 1px solid var(--border); margin-top: 4px; }

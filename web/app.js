@@ -2207,51 +2207,203 @@
   }
 
   // ---- Ordering the stops ----
+  // Costs come from real driving times (free OSRM routing service, called
+  // from the phone) when available, otherwise from straight-line distance.
+  // The solver builds several starting orders (nearest-neighbour, then
+  // randomised variants) and improves each with 2-opt (reverse a stretch) and
+  // Or-opt (move a run of 1–3 stops elsewhere), keeping the best.
+  const OSRM_URL = 'https://router.project-osrm.org';
+  const OSRM_MAX_POINTS = 100;          // public server limit per request
+  const STOP_SERVICE_SEC = 120;         // time at each door, used for arrival times
   function kmBetween(a, b) {
     const R = 6371, toRad = (d) => (d * Math.PI) / 180;
     const dLat = toRad(b.lat - a.lat), dLng = toRad(b.lng - a.lng);
     const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
     return 2 * R * Math.asin(Math.sqrt(h));
   }
-  // Returns the visiting order (indices into pts) starting from `start`.
-  function optimiseOrder(start, pts, returnToStart) {
-    const n = pts.length;
-    if (n <= 1) return pts.map((_, i) => i);
-    const all = [start, ...pts];
-    const D = all.map((a) => all.map((b) => kmBetween(a, b)));
-    // Nearest neighbour from the start.
-    const tour = [0]; const used = new Array(n + 1).fill(false); used[0] = true;
-    for (let k = 0; k < n; k++) {
-      const last = tour[tour.length - 1]; let bestJ = -1, bestD = Infinity;
-      for (let j = 1; j <= n; j++) if (!used[j] && D[last][j] < bestD) { bestD = D[last][j]; bestJ = j; }
-      tour.push(bestJ); used[bestJ] = true;
+  const straightMetres = (a, b) => kmBetween(a, b) * 1300;       // ×1.3 ≈ road distance
+  const straightSeconds = (a, b) => (straightMetres(a, b) / 1000 / 35) * 3600; // ≈35 km/h suburban
+  async function fetchJsonWithTimeout(url, ms) {
+    const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), ms) : null;
+    try {
+      const res = await fetch(url, ctl ? { signal: ctl.signal } : {});
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (e) { return null; } finally { if (timer) clearTimeout(timer); }
+  }
+  const osrmCoords = (pts) => pts.map((p) => `${Number(p.lng).toFixed(6)},${Number(p.lat).toFixed(6)}`).join(';');
+  async function costMatrix(points) {
+    if (points.length >= 2 && points.length <= OSRM_MAX_POINTS) {
+      const j = await fetchJsonWithTimeout(`${OSRM_URL}/table/v1/driving/${osrmCoords(points)}?annotations=duration,distance`, 20000);
+      const sized = (m) => Array.isArray(m) && m.length === points.length && m.every((row) => Array.isArray(row) && row.length === points.length);
+      if (j && j.code === 'Ok' && sized(j.durations)) {
+        const dur = j.durations.map((row, i) => row.map((v, k) => (v == null ? straightSeconds(points[i], points[k]) : v)));
+        const dist = sized(j.distances)
+          ? j.distances.map((row, i) => row.map((v, k) => (v == null ? straightMetres(points[i], points[k]) : v)))
+          : points.map((a) => points.map((b) => straightMetres(a, b)));
+        return { dur, dist, source: 'roads' };
+      }
     }
-    if (returnToStart) tour.push(0);
-    // 2-opt: reverse segments while it shortens the route (start stays first).
-    const last = returnToStart ? tour.length - 2 : tour.length - 1;
-    let improved = true, passes = 0;
-    while (improved && passes < 60) {
-      improved = false; passes++;
-      for (let i = 1; i < last; i++) {
-        for (let k = i + 1; k <= last; k++) {
-          const a = tour[i - 1], b = tour[i], c = tour[k], d = tour[k + 1];
-          const before = D[a][b] + (d !== undefined ? D[c][d] : 0);
-          const after = D[a][c] + (d !== undefined ? D[b][d] : 0);
-          if (after < before - 1e-9) {
+    return { dur: points.map((a) => points.map((b) => straightSeconds(a, b))), dist: points.map((a) => points.map((b) => straightMetres(a, b))), source: 'straight' };
+  }
+  function seededRandom(seed) {
+    return () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  function tourCost(C, tour, ret) {
+    let c = 0;
+    for (let i = 1; i < tour.length; i++) c += C[tour[i - 1]][tour[i]];
+    if (ret && tour.length > 1) c += C[tour[tour.length - 1]][tour[0]];
+    return c;
+  }
+  // tour = [0, stop nodes…]; node 0 (the start) never moves.
+  function improveTour(C, tour, ret) {
+    const n = tour.length;
+    const S = (a, b) => (a < 0 || b < 0 ? 0 : (C[a][b] + C[b][a]) / 2);
+    const after = (i) => (i < n ? tour[i] : ret ? tour[0] : -1);
+    let improved = true, guard = 0;
+    while (improved && guard++ < 100) {
+      improved = false;
+      for (let i = 1; i < n - 1; i++) {
+        for (let k = i + 1; k < n; k++) {
+          const a = tour[i - 1], b = tour[i], c = tour[k], e = after(k + 1);
+          if (S(a, c) + S(b, e) - S(a, b) - S(c, e) < -1e-6) {
             for (let x = i, y = k; x < y; x++, y--) { const t = tour[x]; tour[x] = tour[y]; tour[y] = t; }
             improved = true;
           }
         }
       }
+      for (let L = 1; L <= 3; L++) {
+        for (let i = 1; i + L - 1 < n; i++) {
+          const segEnd = i + L - 1;
+          const p = tour[i - 1], f = tour[i], l = tour[segEnd], q = after(segEnd + 1);
+          const gain = S(p, f) + S(l, q) - S(p, q);
+          let best = null;
+          for (let j = 0; j < n; j++) {
+            if (j >= i - 1 && j <= segEnd) continue;
+            const x = tour[j], y = after(j + 1);
+            const fwd = S(x, f) + S(l, y) - S(x, y), rev = S(x, l) + S(f, y) - S(x, y);
+            const delta = Math.min(fwd, rev) - gain;
+            if (delta < -1e-6 && (!best || delta < best.delta)) best = { j, delta, rev: rev < fwd };
+          }
+          if (best) {
+            const seg = tour.splice(i, L);
+            if (best.rev) seg.reverse();
+            const at = best.j > segEnd ? best.j - L : best.j;
+            tour.splice(at + 1, 0, ...seg);
+            improved = true;
+          }
+        }
+      }
     }
-    return tour.filter((v) => v !== 0).map((v) => v - 1);
+    return tour;
   }
-  function routeDistanceKm(start, stops, returnToStart) {
-    let km = 0, prev = start;
-    stops.forEach((s) => { if (prev) km += kmBetween(prev, s); prev = s; });
-    if (returnToStart && start && stops.length) km += kmBetween(stops[stops.length - 1], start);
-    return Math.round(km * 1.3 * 10) / 10; // straight-line × 1.3 ≈ road distance
+  // Returns the visiting order as indices into the n stops (matrix nodes 1..n).
+  function solveOrder(C, n, ret) {
+    if (n <= 1) return n ? [0] : [];
+    const rand = seededRandom(n * 7919 + 17);
+    const attempts = n > 150 ? 3 : n > 60 ? 6 : 10;
+    let best = null;
+    for (let r = 0; r < attempts; r++) {
+      const used = new Array(n + 1).fill(false); used[0] = true;
+      const tour = [0];
+      for (let k = 0; k < n; k++) {
+        const last = tour[tour.length - 1];
+        const cand = [];
+        for (let j = 1; j <= n; j++) if (!used[j]) cand.push(j);
+        cand.sort((a, b) => C[last][a] - C[last][b]);
+        const pick = r === 0 ? cand[0] : cand[Math.floor(rand() * Math.min(3, cand.length))];
+        tour.push(pick); used[pick] = true;
+      }
+      improveTour(C, tour, ret);
+      const cost = tourCost(C, tour, ret);
+      if (!best || cost < best.cost) best = { tour: tour.slice(), cost };
+    }
+    return best.tour.slice(1).map((v) => v - 1);
   }
+  async function planStopOrder(start, stops, ret) {
+    const M = await costMatrix([start].concat(stops));
+    return { order: solveOrder(M.dur, stops.length, ret), source: M.source };
+  }
+  // Real road line + leg times for an ordered list of points (OSRM /route).
+  async function roadRoute(points) {
+    if (points.length < 2) return null;
+    const legs = [], geometry = [];
+    for (let i = 0; i < points.length - 1; i += OSRM_MAX_POINTS - 1) {
+      const chunk = points.slice(i, i + OSRM_MAX_POINTS);
+      if (chunk.length < 2) break;
+      const j = await fetchJsonWithTimeout(`${OSRM_URL}/route/v1/driving/${osrmCoords(chunk)}?overview=simplified&geometries=polyline&steps=false`, 20000);
+      if (!j || j.code !== 'Ok' || !j.routes || !j.routes[0] || !Array.isArray(j.routes[0].legs) || j.routes[0].legs.length !== chunk.length - 1) return null;
+      j.routes[0].legs.forEach((l) => legs.push({ sec: l.duration, m: l.distance }));
+      geometry.push(j.routes[0].geometry);
+    }
+    return { legs, geometry };
+  }
+  function decodePolyline(str) {
+    const out = []; let i = 0, lat = 0, lng = 0;
+    while (i < str.length) {
+      let b, shift = 0, result = 0;
+      do { b = str.charCodeAt(i++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+      lat += result & 1 ? ~(result >> 1) : result >> 1;
+      shift = 0; result = 0;
+      do { b = str.charCodeAt(i++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+      lng += result & 1 ? ~(result >> 1) : result >> 1;
+      out.push([lat / 1e5, lng / 1e5]);
+    }
+    return out;
+  }
+  // Recomputes leg times, distance, drive time and the road line for the
+  // stops still to do, starting from `anchor` (start point, last finished
+  // stop or the driver's current location). Finished stops keep their legs.
+  async function routeMetrics(route, anchor) {
+    const stops = route.stops.map((s) => Object.assign({}, s));
+    const pendingIdx = stops.map((s, i) => (s.status === 'pending' ? i : -1)).filter((i) => i >= 0);
+    const pts = [anchor].concat(pendingIdx.map((i) => stops[i]));
+    if (route.returnToStart && route.start && pendingIdx.length) pts.push(route.start);
+    const road = anchor ? await roadRoute(pts) : null;
+    pendingIdx.forEach((si, k) => {
+      const leg = road ? road.legs[k] : null;
+      const prev = pts[k];
+      stops[si].legSec = Math.round(leg ? leg.sec : prev ? straightSeconds(prev, stops[si]) : 0);
+      stops[si].legM = Math.round(leg ? leg.m : prev ? straightMetres(prev, stops[si]) : 0);
+    });
+    const backLeg = route.returnToStart && pendingIdx.length
+      ? (road ? road.legs[pendingIdx.length] : { sec: straightSeconds(pts[pts.length - 2], route.start), m: straightMetres(pts[pts.length - 2], route.start) })
+      : null;
+    const totalM = stops.reduce((m, s) => m + (Number(s.legM) || 0), 0) + (backLeg ? backLeg.m : 0);
+    const totalSec = stops.reduce((t, s) => t + (Number(s.legSec) || 0), 0) + (backLeg ? backLeg.sec : 0);
+    return {
+      stops, returnLegSec: backLeg ? Math.round(backLeg.sec) : 0,
+      distanceKm: Math.round(totalM / 100) / 10, driveMin: Math.round(totalSec / 60),
+      geometry: road ? road.geometry : [], metricsSource: road ? 'roads' : 'straight',
+    };
+  }
+  function fmtDuration(min) {
+    min = Math.max(0, Math.round(min));
+    if (min < 60) return min + ' min';
+    return Math.floor(min / 60) + ' h' + (min % 60 ? ' ' + (min % 60) + ' min' : '');
+  }
+  // Arrival time for each pending stop, counted from now.
+  function routeEtas(route) {
+    const etas = {}; let t = Date.now(); let first = true;
+    // Routes planned before arrival times existed have no leg times.
+    if (!(route.stops || []).some((s) => s.status === 'pending' && s.legSec != null)) return { etas, finish: new Date(t), any: false };
+    (route.stops || []).forEach((s) => {
+      if (s.status !== 'pending') return;
+      t += (Number(s.legSec) || 0) * 1000 + (first ? 0 : STOP_SERVICE_SEC * 1000);
+      first = false;
+      etas[s.id] = new Date(t);
+    });
+    const finish = route.returnToStart ? new Date(t + (STOP_SERVICE_SEC + (Number(route.returnLegSec) || 0)) * 1000) : new Date(t + STOP_SERVICE_SEC * 1000);
+    return { etas, finish, any: Object.keys(etas).length > 0 };
+  }
+  const fmtClock = (d) => d.toLocaleTimeString('en-AU', { hour: 'numeric', minute: '2-digit' });
+  function routeAnchor(route) {
+    const done = (route.stops || []).filter((s) => s.status !== 'pending' && s.doneAt);
+    if (!done.length) return route.start;
+    return done.reduce((a, b) => (String(b.doneAt) > String(a.doneAt) ? b : a));
+  }
+
   // Free address lookup on OpenStreetMap (Nominatim), done from the phone at
   // most once per second as their usage policy asks. Answers are sent back to
   // the Worker and saved, so each address is only ever looked up once.
@@ -2346,7 +2498,9 @@
       pts.push([s.lat, s.lng]);
     });
     if (route.returnToStart && route.start && Number.isFinite(route.start.lat)) pts.push([route.start.lat, route.start.lng]);
-    if (pts.length > 1) L.polyline(pts, { color: '#131c2e', weight: 3, opacity: 0.55 }).addTo(routeMap);
+    const road = Array.isArray(route.geometry) ? route.geometry.filter(Boolean) : [];
+    if (road.length) road.forEach((g) => { try { L.polyline(decodePolyline(g), { color: '#131c2e', weight: 4, opacity: 0.7 }).addTo(routeMap); } catch (e) {} });
+    else if (pts.length > 1) L.polyline(pts, { color: '#131c2e', weight: 3, opacity: 0.45, dashArray: '6 6' }).addTo(routeMap);
     if (pts.length) routeMap.fitBounds(pts, { padding: [24, 24], maxZoom: 15 });
     else routeMap.setView([-33.87, 151.21], 10);
   }
@@ -2357,11 +2511,11 @@
   }
 
   // ---- Views ----
-  function routeStopRow(route, s, i, editable) {
+  function routeStopRow(route, s, i, editable, etas) {
     const status = s.status === 'delivered' ? '<span class="pill pill-paid">Delivered</span>'
       : s.status === 'failed' ? `<span class="pill pill-cancelled">Failed</span>${s.reason ? `<div class="helptext">${esc(s.reason)}</div>` : ''}` : '';
     const actions = !editable ? '' : s.status === 'pending'
-      ? `<div class="route-stop-actions">${navLinks(s)}<button class="btn btn-sm btn-primary" data-action="route-stop-done" data-route="${route.id}" data-stop="${s.id}">Delivered</button><button class="btn btn-sm" data-action="route-stop-fail" data-route="${route.id}" data-stop="${s.id}">Failed</button></div>`
+      ? `<div class="route-stop-actions">${navLinks(s)}<button class="btn btn-sm btn-primary" data-action="route-stop-done" data-route="${route.id}" data-stop="${s.id}">Delivered</button><button class="btn btn-sm" data-action="route-stop-fail" data-route="${route.id}" data-stop="${s.id}">Failed</button><button class="btn btn-sm" data-action="route-stop-next" data-route="${route.id}" data-stop="${s.id}" title="Make this my next stop">Do next</button></div>`
       : `<div class="route-stop-actions"><button class="btn btn-sm" data-action="route-stop-undo" data-route="${route.id}" data-stop="${s.id}">Undo</button></div>`;
     return `<li class="route-stop ${s.status !== 'pending' ? 'is-' + s.status : ''}">
       <span class="route-num">${i + 1}</span>
@@ -2370,6 +2524,7 @@
         ${s.partial ? `<div class="helptext route-approx">Approximate pin (street only) — check the house number</div>` : ''}
         <div class="helptext">${[s.name ? esc(s.name) : '', s.parcels > 1 ? s.parcels + ' parcels' : '', s.refs && s.refs.length ? esc(s.refs.slice(0, 3).join(', ')) + (s.refs.length > 3 ? '…' : '') : ''].filter(Boolean).join(' · ')}</div>
         ${s.notes ? `<div class="helptext">Note: ${esc(s.notes)}</div>` : ''}
+        ${s.status === 'pending' && etas && etas.etas[s.id] ? `<div class="route-eta">Arrive ≈ ${fmtClock(etas.etas[s.id])}${s.legSec ? ` · ${fmtDuration(s.legSec / 60)} drive` : ''}</div>` : ''}
         ${status}${actions}
       </div>
     </li>`;
@@ -2380,19 +2535,21 @@
     const next = (route.stops || []).find((s) => s.status === 'pending');
     const nextIdx = next ? route.stops.indexOf(next) : -1;
     const unmatched = route.unmatched || [];
+    const etas = routeEtas(route);
     return `
       <div class="card route-summary">
         <div class="route-summary-figures">
           <div><span class="kpi-label">Stops</span><strong>${c.done}/${c.stops}</strong></div>
           <div><span class="kpi-label">Delivered</span><strong>${c.delivered}</strong></div>
           <div><span class="kpi-label">Failed</span><strong>${c.failed}</strong></div>
-          <div><span class="kpi-label">Distance</span><strong>≈ ${route.distanceKm || 0} km</strong></div>
+          <div><span class="kpi-label">Driving</span><strong>${route.driveMin != null ? '≈ ' + fmtDuration(route.driveMin) : '—'}</strong></div>
         </div>
         <div class="route-progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><span style="width:${pct}%"></span></div>
+        <p class="helptext route-meta">≈ ${route.distanceKm || 0} km${etas.any ? ` · finish around ${fmtClock(etas.finish)}` : ''} · ${route.orderedBy === 'roads' ? 'ordered by real driving times' : 'ordered by straight-line distance (road data was unavailable)'}</p>
       </div>
       ${editable && next ? `
         <div class="card route-next">
-          <p class="eyebrow" style="margin:0 0 6px;">Next stop · ${nextIdx + 1} of ${c.stops}</p>
+          <p class="eyebrow" style="margin:0 0 6px;">Next stop · ${nextIdx + 1} of ${c.stops}${etas.etas[next.id] ? ' · arrive ≈ ' + fmtClock(etas.etas[next.id]) : ''}</p>
           <h2 style="margin:0 0 4px;font-size:1.25rem;">${esc(next.address)}</h2>
           ${next.partial ? '<p class="helptext route-approx" style="margin:0 0 4px;">Map pin is approximate (street only) — check the house number when you arrive.</p>' : ''}
           <p class="helptext" style="margin:0 0 4px;">${[next.name ? esc(next.name) : '', next.parcels > 1 ? next.parcels + ' parcels' : '1 parcel', next.refs && next.refs.length ? esc(next.refs.join(', ')) : ''].filter(Boolean).join(' · ')}</p>
@@ -2419,7 +2576,7 @@
         </div>` : ''}
       <div class="card">
         <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;gap:10px;"><h3 style="margin:0;">All stops</h3>${route.fileName ? `<span class="helptext">From ${esc(route.fileName)}</span>` : ''}</div>
-        <ol class="route-stops">${(route.stops || []).map((s, i) => routeStopRow(route, s, i, editable)).join('')}</ol>
+        <ol class="route-stops">${(route.stops || []).map((s, i) => routeStopRow(route, s, i, editable, etas)).join('')}</ol>
       </div>
       ${editable ? `
         <div class="route-footer-actions">
@@ -2494,7 +2651,7 @@
         const c = routeCounts(r); const pct = c.stops ? Math.round((c.done / c.stops) * 100) : 0;
         return `<div class="card route-admin-card">
           <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;"><h3 style="margin:0;">${esc(r.driverName || 'Driver')}</h3><span class="helptext">${r.updatedAt ? 'Updated ' + fmtTimeHuman(r.updatedAt) : ''}</span></div>
-          <p class="helptext" style="margin:4px 0 10px;">${c.stops} stops · ${c.parcels} parcels · ≈ ${r.distanceKm || 0} km${(r.unmatched || []).length ? ` · <span style="color:var(--danger);">${r.unmatched.length} not found</span>` : ''}</p>
+          <p class="helptext" style="margin:4px 0 10px;">${c.stops} stops · ${c.parcels} parcels · ≈ ${r.distanceKm || 0} km${r.driveMin != null ? ' · ' + fmtDuration(r.driveMin) + ' driving' : ''}${(r.unmatched || []).length ? ` · <span style="color:var(--danger);">${r.unmatched.length} not found</span>` : ''}</p>
           <div class="route-progress"><span style="width:${pct}%"></span></div>
           <p class="helptext" style="margin:8px 0 12px;">${c.done} of ${c.stops} stops done — ${c.delivered} delivered, ${c.failed} failed</p>
           <button class="btn btn-sm" data-action="route-admin-view" data-id="${r.id}">View route</button>
@@ -2542,15 +2699,17 @@
         else unmatched.push(Object.assign({}, s, { error: g ? g.error : 'Not found' }));
       });
       if (!found.length) { routeUi.busy = ''; renderView(); toast(unmatched.length ? unmatched[0].error + ' — check the address column is right.' : 'No addresses found.', 'err'); return; }
+      routeUi.busy = 'Checking real driving times between stops…'; renderView();
+      const plan = await planStopOrder(start, found, returnToStart);
       routeUi.busy = 'Putting stops in the best order…'; renderView();
-      await new Promise((r) => setTimeout(r, 30));
-      const order = optimiseOrder(start, found, returnToStart);
-      const ordered = order.map((idx, i) => Object.assign({}, found[idx], { id: 's' + (i + 1) + '_' + genId().slice(0, 6), status: 'pending', reason: '', doneAt: null }));
+      const ordered = plan.order.map((idx, i) => Object.assign({}, found[idx], { id: 's' + (i + 1) + '_' + genId().slice(0, 6), status: 'pending', reason: '', doneAt: null }));
+      const metrics = await routeMetrics({ stops: ordered, start, returnToStart }, start);
       const nowIso = new Date().toISOString();
       const doc = {
         driverId, driverName: driver ? driver.name : (state.session.name || ''), date: todayStr(), status: 'active',
-        fileName: d.fileName, start, returnToStart, stops: ordered, unmatched,
-        distanceKm: routeDistanceKm(start, ordered, returnToStart), createdAt: nowIso, updatedAt: nowIso,
+        fileName: d.fileName, start, returnToStart, unmatched, orderedBy: plan.source,
+        stops: metrics.stops, distanceKm: metrics.distanceKm, driveMin: metrics.driveMin, returnLegSec: metrics.returnLegSec,
+        geometry: metrics.geometry, metricsSource: metrics.metricsSource, createdAt: nowIso, updatedAt: nowIso,
       };
       const ref = await state.db.collection('routes').add(doc);
       state.routes = state.routes || [];
@@ -2559,6 +2718,7 @@
       renderView();
       toast(`Route ready: ${ordered.length} stops${unmatched.length ? `, ${unmatched.length} need checking` : ''}.`, unmatched.length ? 'err' : 'ok');
     } catch (e) {
+      console.error('Route planning failed', e);
       routeUi.busy = ''; renderView(); toast(e.message || 'Could not plan the route.', 'err');
     }
   }
@@ -2716,11 +2876,26 @@
       try {
         const pos = await getCurrentPosition();
         const here = { label: 'My location', lat: pos.lat, lng: pos.lng };
-        const order = optimiseOrder(here, pending, route.returnToStart);
-        const stops = done.concat(order.map((i) => pending[i]));
-        await saveRouteStops(route, { stops, distanceKm: Math.round((routeDistanceKm(route.start, done, false) + routeDistanceKm(here, order.map((i) => pending[i]), route.returnToStart)) * 10) / 10 });
+        el.textContent = 'Re-planning…';
+        const plan = await planStopOrder(here, pending, route.returnToStart);
+        const reordered = Object.assign({}, route, { stops: done.concat(plan.order.map((i) => pending[i])) });
+        const m = await routeMetrics(reordered, here);
+        await saveRouteStops(route, { stops: m.stops, distanceKm: m.distanceKm, driveMin: m.driveMin, returnLegSec: m.returnLegSec, geometry: m.geometry, metricsSource: m.metricsSource, orderedBy: plan.source });
         renderView(); toast('Remaining stops re-planned from where you are.', 'ok');
       } catch (e) { toast(e.message, 'err'); el.disabled = false; el.textContent = label; }
+    },
+    'route-stop-next': async (el) => {
+      const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
+      const stop = route.stops.find((s) => s.id === el.dataset.stop); if (!stop || stop.status !== 'pending') return;
+      const others = route.stops.filter((s) => s.id !== stop.id);
+      const firstPending = others.findIndex((s) => s.status === 'pending');
+      others.splice(firstPending < 0 ? others.length : firstPending, 0, stop);
+      el.disabled = true;
+      try {
+        const m = await routeMetrics(Object.assign({}, route, { stops: others }), routeAnchor(route));
+        await saveRouteStops(route, { stops: m.stops, distanceKm: m.distanceKm, driveMin: m.driveMin, returnLegSec: m.returnLegSec, geometry: m.geometry, metricsSource: m.metricsSource });
+        renderView(); window.scrollTo({ top: 0, behavior: 'smooth' }); toast('Moved to your next stop.', 'ok');
+      } catch (e) { el.disabled = false; toast(e.message, 'err'); }
     },
     'route-archive': async (el) => {
       const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
@@ -3248,7 +3423,8 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         }
         stops.splice(bestAt, 0, stop);
         const unmatched = route.unmatched.filter((_, i) => i !== idx);
-        await saveRouteStops(route, { stops, unmatched, distanceKm: routeDistanceKm(route.start, stops, route.returnToStart) });
+        const m = await routeMetrics(Object.assign({}, route, { stops }), routeAnchor(route));
+        await saveRouteStops(route, { stops: m.stops, unmatched, distanceKm: m.distanceKm, driveMin: m.driveMin, returnLegSec: m.returnLegSec, geometry: m.geometry, metricsSource: m.metricsSource });
         renderView(); toast(`Added as stop ${bestAt + 1}.`, 'ok');
       } catch (e) { toast(e.message, 'err'); }
     },
@@ -3451,6 +3627,134 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       renderView(); toast('Delivery settings saved.', 'ok');
     },
   };
+
+
+  // ---------------------------------------------------------------
+  // Address suggestions (works on every address box)
+  // ---------------------------------------------------------------
+  // Any text input whose name ends in "address" (or has data-address) gets a
+  // drop-down of Australian address suggestions from Photon, a free
+  // OpenStreetMap search made for search-as-you-type. Picking one fills the
+  // box; on a company form it also fills the clock-in site pin, and the
+  // address is saved for the route planner so it never needs looking up again.
+  const AU_STATES = { 'New South Wales': 'NSW', Victoria: 'VIC', Queensland: 'QLD', 'Western Australia': 'WA', 'South Australia': 'SA', Tasmania: 'TAS', 'Australian Capital Territory': 'ACT', 'Northern Territory': 'NT' };
+  const addrUi = { input: null, box: null, items: [], active: -1, timer: null, ctl: null, cache: new Map() };
+  const isAddressInput = (el) => el && el.tagName === 'INPUT' && !el.disabled && !el.readOnly && (el.type === 'text' || el.type === 'search' || !el.type) &&
+    (el.hasAttribute('data-address') || /address$/i.test(el.name || ''));
+  function addrLabel(p) {
+    const street = p.housenumber && p.street ? `${p.housenumber} ${p.street}` : p.street ? (p.name && p.name !== p.street ? `${p.name}, ${p.street}` : p.street) : (p.name || '');
+    const suburb = p.locality || p.district || p.city || p.county || '';
+    const st = AU_STATES[p.state] || p.state || '';
+    return [street, [suburb, st, p.postcode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+  }
+  async function addrFetch(q) {
+    const key = q.toLowerCase();
+    if (addrUi.cache.has(key)) return addrUi.cache.get(key);
+    if (addrUi.ctl) addrUi.ctl.abort();
+    addrUi.ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const url = 'https://photon.komoot.io/api/?' + new URLSearchParams({ q, limit: '7', lang: 'en', bbox: '112.9,-43.7,153.7,-10.6' }).toString();
+    const res = await fetch(url, addrUi.ctl ? { signal: addrUi.ctl.signal } : {});
+    if (!res.ok) throw new Error('suggestions unavailable');
+    const data = await res.json();
+    const seen = new Set();
+    const items = (data.features || []).filter((f) => !f.properties.countrycode || f.properties.countrycode === 'AU').map((f) => ({
+      label: addrLabel(f.properties), lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0],
+      exact: !!(f.properties.housenumber), type: f.properties.osm_value || f.properties.type || '',
+    })).filter((it) => it.label && !seen.has(it.label) && seen.add(it.label));
+    addrUi.cache.set(key, items);
+    return items;
+  }
+  function addrClose() {
+    if (addrUi.box) addrUi.box.remove();
+    if (addrUi.input) { addrUi.input.setAttribute('aria-expanded', 'false'); addrUi.input.removeAttribute('aria-activedescendant'); }
+    addrUi.box = null; addrUi.items = []; addrUi.active = -1;
+  }
+  function addrPosition() {
+    if (!addrUi.box || !addrUi.input) return;
+    const r = addrUi.input.getBoundingClientRect();
+    if (!r.width) { addrClose(); return; }
+    // Use the visible area (excludes a phone's on-screen keyboard) and open
+    // above the box when there isn't room below it.
+    const vv = window.visualViewport;
+    const viewH = vv ? vv.height + vv.offsetTop : window.innerHeight;
+    const below = viewH - r.bottom - 8, above = r.top - 8;
+    const width = Math.min(Math.max(r.width, 260), window.innerWidth - 16);
+    const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8));
+    const style = { left: left + 'px', width: width + 'px', top: '', bottom: '' };
+    if (below < 180 && above > below) {
+      style.bottom = (window.innerHeight - r.top + 4) + 'px';
+      style.maxHeight = Math.min(300, above) + 'px';
+    } else {
+      style.top = (r.bottom + 4) + 'px';
+      style.maxHeight = Math.min(300, Math.max(120, below)) + 'px';
+    }
+    Object.assign(addrUi.box.style, style);
+  }
+  function addrRender(items, input) {
+    addrUi.items = items; addrUi.active = -1;
+    if (!addrUi.box) {
+      addrUi.box = document.createElement('div');
+      addrUi.box.className = 'addr-suggest'; addrUi.box.id = 'addrSuggest'; addrUi.box.setAttribute('role', 'listbox');
+      addrUi.box.addEventListener('mousedown', (e) => e.preventDefault()); // keep focus in the input
+      document.body.appendChild(addrUi.box);
+    }
+    input.setAttribute('aria-controls', 'addrSuggest'); input.setAttribute('aria-expanded', 'true');
+    addrUi.box.innerHTML = items.length
+      ? items.map((it, i) => `<div class="addr-option" role="option" id="addrOpt${i}" data-index="${i}">${esc(it.label)}${it.exact ? '' : '<span class="addr-hint">street / area</span>'}</div>`).join('') + '<div class="addr-credit">Suggestions © OpenStreetMap</div>'
+      : '<div class="addr-empty">No matching addresses — keep typing, or enter it in full.</div>';
+    addrUi.box.querySelectorAll('.addr-option').forEach((el) => el.addEventListener('click', () => addrPick(Number(el.dataset.index))));
+    addrPosition();
+  }
+  function addrHighlight(i) {
+    const opts = addrUi.box ? addrUi.box.querySelectorAll('.addr-option') : [];
+    if (!opts.length) return;
+    addrUi.active = (i + opts.length) % opts.length;
+    opts.forEach((o, k) => o.setAttribute('aria-selected', k === addrUi.active ? 'true' : 'false'));
+    addrUi.input.setAttribute('aria-activedescendant', 'addrOpt' + addrUi.active);
+    opts[addrUi.active].scrollIntoView({ block: 'nearest' });
+  }
+  function addrPick(i) {
+    const it = addrUi.items[i]; const input = addrUi.input;
+    if (!it || !input) return;
+    input.value = it.label;
+    input.dataset.lat = it.lat; input.dataset.lng = it.lng;
+    const form = input.form || input.closest('form');
+    const pin = form && form.querySelector('input[name="siteCoords"]');
+    if (pin && input.name === 'siteAddress' && it.exact) { pin.value = Number(it.lat).toFixed(6) + ', ' + Number(it.lng).toFixed(6); toast('Site pin filled in from the address.', 'ok'); }
+    addrClose();
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    if (it.exact && state.session && ['admin', 'manager', 'staff', 'driver'].includes(state.session.role)) {
+      fetch('/api/route/geocache', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ items: [{ address: it.label, lat: it.lat, lng: it.lng, formatted: it.label, precision: 'house', partial: false }] }) }).catch(() => {});
+    }
+  }
+  function setupAddressSuggestions() {
+    document.addEventListener('input', (e) => {
+      const el = e.target;
+      if (!isAddressInput(el)) return;
+      addrUi.input = el; el.setAttribute('autocomplete', 'off'); el.setAttribute('aria-autocomplete', 'list');
+      delete el.dataset.lat; delete el.dataset.lng;
+      clearTimeout(addrUi.timer);
+      const q = el.value.trim();
+      if (q.length < 3) { addrClose(); return; }
+      addrUi.timer = setTimeout(async () => {
+        try { const items = await addrFetch(q); if (addrUi.input === el && document.activeElement === el && el.value.trim() === q) addrRender(items, el); }
+        catch (err) { if (err && err.name !== 'AbortError') addrClose(); }
+      }, 300);
+    });
+    document.addEventListener('keydown', (e) => {
+      if (!addrUi.box || e.target !== addrUi.input) return;
+      if (e.key === 'ArrowDown') { e.preventDefault(); addrHighlight(addrUi.active + 1); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); addrHighlight(addrUi.active - 1); }
+      else if (e.key === 'Enter' && addrUi.active >= 0) { e.preventDefault(); addrPick(addrUi.active); }
+      else if (e.key === 'Escape') { addrClose(); }
+    });
+    document.addEventListener('focusout', (e) => { if (e.target === addrUi.input) setTimeout(() => { if (document.activeElement !== addrUi.input) addrClose(); }, 150); });
+    window.addEventListener('resize', addrPosition);
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', addrPosition);
+    document.addEventListener('scroll', addrPosition, true);
+  }
+  setupAddressSuggestions();
 
   document.addEventListener('click', async (e) => {
     const target = e.target;
