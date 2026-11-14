@@ -126,6 +126,28 @@ Rules:
 - Fill postcode/state only when you are confident; otherwise leave them empty.
 - Put business/centre names in "place", not in "address".
 - If the message is not about an address, reply briefly and return "candidates":[].`;
+// ---- General in-app AI helper ----------------------------------------------
+const HELP_MODELS = ['@cf/meta/llama-3.3-70b-instruct-fp8-fast', '@cf/meta/llama-3.1-8b-instruct-fast'];
+const HELP_PROMPT = `You are the built-in assistant of "UMA Management", a web app an Australian delivery/labour business uses every day.
+Pages: Dashboard (today's totals), Daily Entry (enter each driver's deliveries per company), Records (past entries), Drivers, Companies (delivery companies and rates; labour sites and their clock-in locations), Labour (workers), Rate Cards, Labour Shifts, Driver Summary (pay per driver), Payments, Driver Submissions (drivers' own daily reports to approve), Delivery Blocks, Driver Assignments, Driver Performance, Routes (drivers' planned routes), Labour Logs (clock-in/out), Invoices (create and download PDF), Excel Export, Settings (business details, failure reasons, depot address).
+Drivers see: Route (upload the run sheet Excel or label photos -> "Plan my route"; tap a stop to Edit; "Fix with AI" or "Place pin" fixes a wrong location; Delivered/Failed per stop; Re-optimise), Today's Deliveries (submit counts), My Submissions.
+Labour see: Today (clock in/out, must be at the company's site), My Shifts, My Logs.
+You help with anything: how to do something in the app, reading or summarising what is on the user's screen, totals and quick calculations, writing messages to customers or staff, and general questions.
+You get the text of the page the user is looking at. Only use it and what the user tells you; never invent records, numbers or names. If you don't know, say so and say where in the app to find it.
+Be short and practical: plain English, at most about 6 short lines or a short list. Use Australian spelling.
+Reply ONLY with JSON: {"reply":"your answer","go":"page id to open or empty","fixAddress":false}
+- "go": only when the user asks to go somewhere or it clearly helps; use one id from the allowed page list you are given.
+- "fixAddress": true only when the user wants to fix or correct a stop's location/address on their route.`;
+function parseHelpReply(text: string, allowed: string[]) {
+  const start = text.indexOf('{'), end = text.lastIndexOf('}');
+  let data: any = null;
+  if (start >= 0 && end > start) { try { data = JSON.parse(text.slice(start, end + 1)); } catch { data = null; } }
+  if (!data) { const t = text.trim(); return t ? { reply: t.slice(0, 2500), go: '', fixAddress: false } : null; }
+  const reply = String(data.reply ?? '').trim().slice(0, 2500);
+  if (!reply) return null;
+  const go = allowed.includes(String(data.go || '')) ? String(data.go) : '';
+  return { reply, go, fixAddress: data.fixAddress === true };
+}
 function parseAddressReply(text: string) {
   const start = text.indexOf('{'), end = text.lastIndexOf('}');
   if (start < 0 || end <= start) return null;
@@ -463,6 +485,33 @@ async function api(request: Request, env: Env): Promise<Response> {
     }
     if (lastError === 'no-labels') return json({ labels: [] });
     return fail('Could not read this photo. Try a clearer photo or screenshot.', 502);
+  }
+  if (path === '/api/ai/chat' && method === 'POST') {
+    const account = await currentAccount(request, env);
+    if (!account) return fail('Sign in required.', 401);
+    if (!env.AI) return fail('AI is not switched on yet (Workers AI binding missing).', 503);
+    const body = await jsonBody(request);
+    const msgs: any[] = Array.isArray(body?.messages) ? body.messages.slice(-12) : [];
+    const chat = msgs.map((m: any) => ({ role: m?.role === 'assistant' ? 'assistant' : 'user', content: String(m?.content || '').slice(0, 2000) })).filter((m) => m.content);
+    if (!chat.length || chat[chat.length - 1].role !== 'user') return fail('Type a question.');
+    const pages: string[] = (Array.isArray(body?.pages) ? body.pages : []).map((x: unknown) => String(x || '').slice(0, 40)).slice(0, 40);
+    const pageName = String(body?.page?.name || '').slice(0, 60);
+    const pageText = String(body?.page?.text || '').replace(/\n{3,}/g, '\n\n').slice(0, 7000);
+    const today = new Date().toLocaleDateString('en-AU', { timeZone: 'Australia/Sydney', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+    const context = `User role: ${account.role}. Today: ${today}.\nAllowed page ids: ${pages.join(', ') || 'none'}.\nThe user is on the page "${pageName}". Text on their screen:\n"""\n${pageText}\n"""`;
+    const input = { messages: [{ role: 'system', content: HELP_PROMPT }, { role: 'system', content: context }, ...chat], max_tokens: 900, temperature: 0.3 };
+    let last = '';
+    for (const model of HELP_MODELS) {
+      try {
+        const parsed = parseHelpReply(aiText(await env.AI.run(model, input)), pages);
+        if (parsed) return json(parsed);
+        last = 'unparsed';
+      } catch (e: any) {
+        last = String(e?.message || e);
+        if (/limit|quota|neuron|4006/i.test(last)) return fail('Today\'s free AI allowance is used up. Try again tomorrow.', 429);
+      }
+    }
+    return fail('The AI helper could not answer just now. Please try again.', 502);
   }
   if (path === '/api/route/ai-address' && method === 'POST') {
     const account = await currentAccount(request, env);

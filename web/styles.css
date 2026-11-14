@@ -811,3 +811,16 @@ table.data tfoot td { background: var(--surface-2); border-top: 1px solid var(--
 .ai-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .pin-map { height: 50vh; min-height: 280px; border-radius: var(--radius); overflow: hidden; background: var(--surface-3); }
 .link-btn { background: none; border: 0; padding: 0; font: inherit; font-weight: 700; color: var(--navy); text-decoration: underline; cursor: pointer; }
+
+/* Leaflet's panes use z-index 400–1000; keep them inside the map so
+   pop-ups, menus and the keyboard bar always sit on top of it. */
+.leaflet-container { position: relative; z-index: 0; isolation: isolate; }
+.ai-fab { position: fixed; right: max(16px, env(safe-area-inset-right)); bottom: max(16px, calc(env(safe-area-inset-bottom) + 10px)); z-index: 80;
+  display: inline-flex; align-items: center; gap: 6px; min-height: 48px; padding: 0 16px; border: 1px solid var(--gold); border-radius: 999px;
+  background: var(--navy); color: #fff; font: inherit; font-weight: 700; box-shadow: var(--shadow-lift); cursor: pointer; }
+.ai-fab svg { color: var(--gold); }
+.ai-fab:hover, .ai-fab:focus-visible { background: var(--navy-2); }
+.ai-fab[hidden] { display: none; }
+.ai-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.ai-chat .ai-msg { white-space: pre-wrap; }
+#content { padding-bottom: 84px; }

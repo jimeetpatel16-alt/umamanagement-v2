@@ -2965,7 +2965,7 @@
         ${editable ? `<div class="route-tools">
           <button class="btn btn-sm btn-primary" data-action="route-stop-add" data-route="${route.id}">+ Add stop</button>
           <button class="btn btn-sm" data-action="route-photo-start" data-route="${route.id}">Add from photos</button>
-          <button class="btn btn-sm" data-action="route-ai-fix" data-route="${route.id}" data-kind="new">AI address help</button>
+          <button class="btn btn-sm" data-action="route-ai-fix" data-route="${route.id}" data-kind="new">Fix a location with AI</button>
           <button class="btn btn-sm" data-action="route-reorder-toggle" aria-pressed="${routeUi.reorder ? 'true' : 'false'}">${routeUi.reorder ? 'Done ordering' : 'Manually order'}</button>
           <button class="btn btn-sm" data-action="route-reverse" data-route="${route.id}">Reverse route</button>
           <button class="btn btn-sm" data-action="route-replan" data-route="${route.id}">Re-optimise</button>
@@ -3297,7 +3297,80 @@
 
   // ---- Fixing a stop's location: AI chat + place pin --------------------
   // target = { route, kind: 'unmatched' | 'stop' | 'new', index?, stopId? }
-  const aiFix = { target: null, original: '', messages: [], busy: false };
+  const aiFix = { target: null, original: '', messages: [], busy: false, pick: '', pickTouched: false };
+
+  // ---- AI helper on every page ----
+  // Answers questions about the app and about what is on the user's screen
+  // (it only sees the text of the page they are looking at), writes messages,
+  // does quick sums, and can open a page or the stop-location fixer.
+  const aiHelp = { messages: [], busy: false };
+  function aiPageSnapshot() {
+    const c = document.getElementById('content');
+    const item = NAV.find((n) => n.id === state.route);
+    let text = c ? c.innerText : '';
+    // Typed-in form values aren't part of innerText.
+    if (c) c.querySelectorAll('input[type=text], input[type=number], input[type=date], textarea, select').forEach((f) => {
+      const v = f.tagName === 'SELECT' ? (f.options[f.selectedIndex] || {}).text : f.value;
+      const label = f.getAttribute('aria-label') || f.name || f.placeholder || '';
+      if (v && label && f.type !== 'password') text += `\n[${label}: ${v}]`;
+    });
+    return { name: item ? item.label : state.route, text: text.replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n').slice(0, 7000) };
+  }
+  function aiAllowedPages() {
+    const role = state.session && state.session.role;
+    return NAV.filter((n) => VIEWS[n.id] && roleAllowed(n.id, role)).map((n) => n.id);
+  }
+  function aiHelpSuggestions() {
+    const r = state.route;
+    const list = ['What can I do on this page?', 'Summarise this page for me'];
+    if (r === 'driver-route' || r === 'routes') list.unshift("Fix a stop's location");
+    if (r === 'invoices') list.push('How do I download an invoice?');
+    if (r === 'labour-log') list.push("Why can't I clock in?");
+    if (r === 'entry' || r === 'records') list.push("What are today's totals?");
+    return list.slice(0, 4);
+  }
+  function renderAiHelp() {
+    openModal(`
+      <div class="modal-head"><h3>Ask AI</h3><button class="modal-close" data-action="modal-close" aria-label="Close">×</button></div>
+      <div class="ai-chat" id="aiHelpChat">
+        ${aiHelp.messages.length ? '' : `<div class="ai-msg ai-bot">Hi! Ask me anything — how to do something here, what's on this page, a quick total, or a message to write. I can see this page (<strong>${esc(aiPageSnapshot().name || '')}</strong>).</div>
+          <div class="ai-chips">${aiHelpSuggestions().map((q) => `<button class="btn btn-sm" data-action="ai-help-chip" data-q="${esc(q)}">${esc(q)}</button>`).join('')}</div>`}
+        ${aiHelp.messages.map((m) => m.role === 'user' ? `<div class="ai-msg ai-user">${esc(m.content)}</div>`
+          : `<div class="ai-msg ai-bot">${esc(m.content)}${m.go || m.fixAddress ? `<div class="ai-chips">
+              ${m.fixAddress ? '<button class="btn btn-sm btn-primary" data-action="ai-help-fix">Fix a stop\'s location</button>' : ''}
+              ${m.go ? `<button class="btn btn-sm" data-action="ai-help-go" data-view="${esc(m.go)}">Open ${esc((NAV.find((n) => n.id === m.go) || {}).label || m.go)}</button>` : ''}</div>` : ''}</div>`).join('')}
+        ${aiHelp.busy ? '<div class="ai-msg ai-bot ai-typing"><span></span><span></span><span></span></div>' : ''}
+      </div>
+      <form class="ai-input" data-onsubmit="ai-help-send">
+        <input type="text" name="text" placeholder="Ask anything…" autocomplete="off" ${aiHelp.busy ? 'disabled' : ''} aria-label="Message">
+        <button class="btn btn-primary" type="submit" ${aiHelp.busy ? 'disabled' : ''}>Send</button>
+      </form>
+      ${aiHelp.messages.length ? '<div class="ai-actions"><button class="btn btn-sm" data-action="ai-help-clear">New chat</button></div>' : ''}`, { wide: true });
+    const box = document.getElementById('aiHelpChat'); if (box) box.scrollTop = box.scrollHeight;
+  }
+  async function aiHelpAsk(text) {
+    if (/^fix a stop'?s location$/i.test(text.trim())) { aiHelpFix(); return; }
+    aiHelp.messages.push({ role: 'user', content: text });
+    aiHelp.busy = true; renderAiHelp();
+    try {
+      const res = await fetch('/api/ai/chat', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ page: aiPageSnapshot(), pages: aiAllowedPages(), messages: aiHelp.messages.map((m) => ({ role: m.role, content: m.content })) }) });
+      let body = {}; try { body = await res.json(); } catch (e) {}
+      if (!res.ok) throw new Error(body.error || 'The AI helper could not answer just now.');
+      aiHelp.messages.push({ role: 'assistant', content: body.reply, go: body.go && body.go !== state.route ? body.go : '', fixAddress: !!body.fixAddress });
+    } catch (e) {
+      aiHelp.messages.push({ role: 'assistant', content: e.message });
+    }
+    aiHelp.busy = false;
+    if (document.getElementById('aiHelpChat')) renderAiHelp();
+  }
+  function aiHelpFix() {
+    const btn = document.querySelector('#content [data-action="route-ai-fix"][data-kind="new"]');
+    if (btn) { closeModal(); btn.click(); return; }
+    const page = isDriverRole() ? 'driver-route' : 'routes';
+    aiHelp.messages.push({ role: 'assistant', content: isDriverRole() ? 'Open your Route first (plan it if you haven\'t yet), then I can fix any stop\'s location.' : 'Stop locations are fixed from the driver\'s route. Open Routes to see them.', go: page });
+    renderAiHelp();
+  }
   function fixTargetFrom(el) {
     return { route: el.dataset.route, kind: el.dataset.kind, index: el.dataset.index != null ? Number(el.dataset.index) : null, stopId: el.dataset.stop || null };
   }
@@ -3349,11 +3422,54 @@
       </span>
     </div>`;
   }
+  // In the general "Fix a location" chat the driver picks (or we guess)
+  // which stop is being fixed, so a match moves that stop instead of adding one.
+  function aiTarget() {
+    const t = aiFix.target; if (!t || t.kind !== 'new' || !aiFix.pick || aiFix.pick === 'new') return t;
+    const [k, v] = aiFix.pick.split(':');
+    return k === 'stop' ? { route: t.route, kind: 'stop', stopId: v, index: null } : { route: t.route, kind: 'unmatched', index: Number(v), stopId: null };
+  }
+  const ST_WORDS = new Set(['road', 'rd', 'street', 'st', 'avenue', 'ave', 'drive', 'dr', 'crescent', 'cres', 'place', 'pl', 'court', 'ct', 'parade', 'pde', 'highway', 'hwy', 'lane', 'close', 'circuit', 'cct', 'way', 'nsw', 'vic', 'qld', 'unit', 'shop', 'the', 'and']);
+  function addrTokens(a) {
+    const n = String(a || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+    const nums = n.match(/\b\d+\b/g) || [];
+    return { nums: new Set(nums), words: new Set(n.split(' ').filter((w) => w.length > 2 && !/^\d/.test(w) && !ST_WORDS.has(w))) };
+  }
+  function guessFixPick(route, texts) {
+    let best = '', bestScore = 0;
+    const items = [...(route.unmatched || []).map((u, i) => ['unmatched:' + i, u.address]), ...route.stops.map((x) => ['stop:' + x.id, x.address])];
+    texts.filter(Boolean).forEach((txt) => {
+      const a = addrTokens(txt);
+      items.forEach(([key, addr]) => {
+        const b = addrTokens(addr);
+        const numHit = [...a.nums].some((n) => b.nums.has(n));
+        const words = [...a.words].filter((w) => b.words.has(w)).length;
+        const score = (numHit ? 2 : 0) + words;
+        if (words && score > bestScore && (numHit || words >= 2)) { best = key; bestScore = score; }
+      });
+    });
+    return best;
+  }
+  function aiFixPickReady(allowNew) {
+    if (aiFix.target.kind !== 'new' || aiFix.pick || allowNew) return true;
+    toast('Choose which stop this is for first (at the top).', 'err');
+    const sel = document.getElementById('aiPick'); if (sel) { sel.focus(); sel.scrollIntoView({ block: 'center' }); }
+    return false;
+  }
   function renderAiFix() {
-    const t = aiFix.target; const { item } = fixTargetInfo(t);
+    const t = aiFix.target; const { route, item } = fixTargetInfo(t);
+    const picker = t.kind === 'new' && route ? `
+      <div class="field ai-pick" style="margin:0 0 10px;"><label class="field-label" for="aiPick">Which stop is this for?</label>
+        <select id="aiPick" data-onchange="ai-fix-pick">
+          <option value="">— Choose the stop to fix —</option>
+          ${(route.unmatched || []).map((u, i) => `<option value="unmatched:${i}" ${aiFix.pick === 'unmatched:' + i ? 'selected' : ''}>Not found: ${esc(u.address)}</option>`).join('')}
+          ${route.stops.map((x, i) => `<option value="stop:${x.id}" ${aiFix.pick === 'stop:' + x.id ? 'selected' : ''}>Stop ${i + 1}: ${esc(x.address)}</option>`).join('')}
+          <option value="new" ${aiFix.pick === 'new' ? 'selected' : ''}>+ Add as a new stop</option>
+        </select></div>` : '';
     openModal(`
       <div class="modal-head"><h3>Fix address with AI</h3><button class="modal-close" data-action="modal-close" aria-label="Close">×</button></div>
       ${item ? `<p class="helptext" style="margin:0 0 10px;">Stop: <strong>${esc(item.address)}</strong>${item.name ? ' · ' + esc(item.name) : ''}</p>` : ''}
+      ${picker}
       <div class="ai-chat" id="aiChat">
         ${aiFix.messages.map((m, mi) => m.role === 'user'
           ? `<div class="ai-msg ai-user">${esc(m.content)}</div>`
@@ -3365,8 +3481,8 @@
         <button class="btn btn-primary" type="submit" ${aiFix.busy ? 'disabled' : ''}>Send</button>
       </form>
       <div class="ai-actions">
-        <button class="btn btn-sm" data-action="route-pin-place" data-route="${t.route}" data-kind="${t.kind}" ${t.index != null ? `data-index="${t.index}"` : ''} ${t.stopId ? `data-stop="${t.stopId}"` : ''}>Place pin on map</button>
-        ${t.kind !== 'new' ? `<button class="btn btn-sm" data-action="ai-fix-here">I'm at this address now</button>` : ''}
+        <button class="btn btn-sm" data-action="ai-fix-pin-free">Place pin on map</button>
+        <button class="btn btn-sm" data-action="ai-fix-here">I'm at this address now</button>
       </div>`, { wide: true });
     const box = document.getElementById('aiChat'); if (box) box.scrollTop = box.scrollHeight;
     const inp = document.querySelector('.ai-input input'); if (inp && !aiFix.busy) inp.focus();
@@ -3421,6 +3537,10 @@
           : `The free map knows the street but not the house number, so the pin would sit somewhere on the street. Tap "Check pin on map" and drag it onto the right house — it's remembered after that.`;
       }
       aiFix.messages.push({ role: 'assistant', content: reply, matches });
+      if (aiFix.target.kind === 'new' && !aiFix.pickTouched && route) {
+        const g = guessFixPick(route, [text, ...(body.candidates || []).map((c) => c.address)]);
+        if (g) aiFix.pick = g;
+      }
     } catch (e) {
       aiFix.messages.push({ role: 'assistant', content: e.message + ' You can still place the pin on the map.', matches: null });
     }
@@ -3535,6 +3655,7 @@
     const role = state.session ? state.session.role : null;
     if (!roleAllowed(route, role)) { route = role === 'driver' ? 'driver-submit' : role === 'labour' ? 'labour-log' : 'dashboard'; }
     state.route = route;
+    const fab = document.getElementById('aiFab'); if (fab) fab.hidden = !state.session;
     document.getElementById('content').innerHTML = VIEWS[route]();
     if (document.getElementById('routeMap')) initRouteMap(); else if (routeMap) { try { routeMap.remove(); } catch (e) {} routeMap = null; }
     const topbarTitle = document.getElementById('topbar-title');
@@ -3711,24 +3832,33 @@
     },
     'route-ai-fix': (el) => {
       const t = fixTargetFrom(el); const { item } = fixTargetInfo(t);
-      aiFix.target = t; aiFix.messages = []; aiFix.busy = false;
+      aiFix.target = t; aiFix.messages = []; aiFix.busy = false; aiFix.pick = ''; aiFix.pickTouched = false;
       renderAiFix();
       if (item && item.address) aiFixAsk(item.address + (item.error ? ` (map search said: ${item.error})` : ''));
-      else aiFix.messages.push({ role: 'assistant', content: 'Paste or type the address the way it is written and I\'ll find it on the map.' }), renderAiFix();
+      else aiFix.messages.push({ role: 'assistant', content: 'Tell me the address that is in the wrong place (as it is written) and I\'ll find the right spot. Choose the stop above — or I\'ll match it for you.' }), renderAiFix();
     },
     'ai-fix-use': async (el) => {
       const m = aiFix.messages[Number(el.dataset.m)]; const c = m && m.matches && m.matches[Number(el.dataset.c)]; if (!c) return;
+      if (!aiFixPickReady()) return;
       el.disabled = true;
-      try { await applyFixedLocation(aiFix.target, { lat: c.lat, lng: c.lng, formatted: c.label, precision: c.approx ? (/estimated/.test(c.note || '') ? 'estimated' : 'street') : 'confirmed', partial: c.approx }, c.label); }
+      try { await applyFixedLocation(aiTarget(), { lat: c.lat, lng: c.lng, formatted: c.label, precision: c.approx ? (/estimated/.test(c.note || '') ? 'estimated' : 'street') : 'confirmed', partial: c.approx }, c.label); }
       catch (e) { el.disabled = false; toast(e.message, 'err'); }
     },
     'ai-fix-pin': (el) => {
       const m = aiFix.messages[Number(el.dataset.m)]; const c = m && m.matches && m.matches[Number(el.dataset.c)]; if (!c) return;
-      openPinPicker(aiFix.target, { start: { lat: c.lat, lng: c.lng }, label: c.label, note: c.note ? c.note.charAt(0).toUpperCase() + c.note.slice(1) : '' });
+      if (!aiFixPickReady()) return;
+      openPinPicker(aiTarget(), { start: { lat: c.lat, lng: c.lng }, label: c.label, note: c.note ? c.note.charAt(0).toUpperCase() + c.note.slice(1) : '' });
     },
+    'ai-help-open': () => { renderAiHelp(); },
+    'ai-help-chip': (el) => { aiHelpAsk(el.dataset.q || ''); },
+    'ai-help-clear': () => { aiHelp.messages = []; renderAiHelp(); },
+    'ai-help-go': (el) => { closeModal(); setRoute(el.dataset.view); },
+    'ai-help-fix': () => aiHelpFix(),
+    'ai-fix-pin-free': () => { if (aiFixPickReady(true)) openPinPicker(aiTarget()); },
     'ai-fix-here': async (el) => {
+      if (!aiFixPickReady()) return;
       el.disabled = true; el.textContent = 'Getting your location…';
-      try { const pos = await getCurrentPosition(); await applyFixedLocation(aiFix.target, { lat: pos.lat, lng: pos.lng, precision: 'here', partial: false }); }
+      try { const pos = await getCurrentPosition(); await applyFixedLocation(aiTarget(), { lat: pos.lat, lng: pos.lng, precision: 'here', partial: false }); }
       catch (e) { el.disabled = false; el.textContent = "I'm at this address now"; toast(e.message, 'err'); }
     },
     'route-pin-place': (el) => { openPinPicker(fixTargetFrom(el)); },
@@ -4273,6 +4403,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   `);
 
   const CHANGE_HANDLERS = {
+    'ai-fix-pick': (el) => { aiFix.pick = el.value; aiFix.pickTouched = true; },
     'route-photos': async (el) => {
       const files = [...(el.files || [])];
       el.value = '';
@@ -4366,6 +4497,10 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   };
 
   const SUBMIT_HANDLERS = {
+    'ai-help-send': async (form) => {
+      const text = String(new FormData(form).get('text') || '').trim(); if (!text || aiHelp.busy) return;
+      await aiHelpAsk(text);
+    },
     'ai-fix-send': async (form) => {
       const text = String(new FormData(form).get('text') || '').trim(); if (!text || aiFix.busy) return;
       await aiFixAsk(text);
