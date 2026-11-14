@@ -113,6 +113,32 @@ function parseLabels(text: string) {
   });
 }
 
+// ---- Route planner: AI address helper ------------------------------------
+const ADDRESS_MODELS = ['@cf/meta/llama-3.3-70b-instruct-fp8-fast', '@cf/google/gemma-3-12b-it'];
+const ADDRESS_PROMPT = `You help an Australian delivery driver fix addresses so a map search can find them.
+The driver pastes an address (often messy: typos, words split across lines like "stre et", business names, unit numbers, missing state/postcode, ALL CAPS) or asks a question about it.
+Reply ONLY with JSON in this exact shape:
+{"reply":"one or two short friendly sentences for the driver","candidates":[{"address":"unit/shop and street number + street name, e.g. Shop 14, 68 O'Connell Street","suburb":"Kingswood","state":"NSW","postcode":"2747","place":"business or building name if any"}]}
+Rules:
+- Give 1 to 3 candidates, most likely first. Use proper spelling and full street types (St -> Street, Rd -> Road, Cres -> Crescent, Dr -> Drive, Ave -> Avenue, Pde -> Parade, Cct -> Circuit).
+- Keep the house/unit numbers exactly; never invent a number that is not in the text.
+- If the suburb exists in several states, prefer the one near the driver's area; you may give the other as a later candidate.
+- Fill postcode/state only when you are confident; otherwise leave them empty.
+- Put business/centre names in "place", not in "address".
+- If the message is not about an address, reply briefly and return "candidates":[].`;
+function parseAddressReply(text: string) {
+  const start = text.indexOf('{'), end = text.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  let data: any;
+  try { data = JSON.parse(text.slice(start, end + 1)); } catch { return null; }
+  const clean = (v: unknown, max = 160) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+  const candidates = (Array.isArray(data?.candidates) ? data.candidates : []).filter((c: any) => c && clean(c.address)).slice(0, 3).map((c: any) => ({
+    address: clean(c.address), suburb: clean(c.suburb, 80), state: clean(c.state, 10).toUpperCase(),
+    postcode: (clean(c.postcode, 10).match(/\d{4}/) || [''])[0], place: clean(c.place, 120),
+  }));
+  return { reply: clean(data?.reply, 600) || (candidates.length ? 'Here is my best guess:' : 'I could not work out an address from that.'), candidates };
+}
+
 // ---- Route planner: address lookup ---------------------------------------
 // Addresses are turned into map points with the Google Geocoding API (key kept
 // as the GOOGLE_MAPS_API_KEY secret). Every successful lookup is cached in the
@@ -393,10 +419,12 @@ async function api(request: Request, env: Env): Promise<Response> {
       const lat = Number(item?.lat), lng = Number(item?.lng);
       if (!address || !Number.isFinite(lat) || !Number.isFinite(lng) || !inAustralia(lat, lng)) continue;
       const key = await geoKey(address);
-      if (await readDoc(env, 'geocache', key)) continue; // never overwrite an existing answer
+      // Existing answers are kept, unless a person confirmed a better one
+      // (picked from the AI helper or placed the pin on the map).
+      if (!item?.replace && await readDoc(env, 'geocache', key)) continue;
       await saveDocument(env, 'geocache', key, {
         lat, lng, formatted: String(item?.formatted || address).slice(0, 300), precision: String(item?.precision || '').slice(0, 40),
-        partial: !!item?.partial, query: address, source: 'osm', savedBy: account.id,
+        partial: !!item?.partial, query: address, source: item?.replace ? 'confirmed' : 'osm', savedBy: account.id,
       }, 'set');
       saved++;
     }
@@ -435,6 +463,30 @@ async function api(request: Request, env: Env): Promise<Response> {
     }
     if (lastError === 'no-labels') return json({ labels: [] });
     return fail('Could not read this photo. Try a clearer photo or screenshot.', 502);
+  }
+  if (path === '/api/route/ai-address' && method === 'POST') {
+    const account = await currentAccount(request, env);
+    if (!account) return fail('Sign in required.', 401);
+    if (!['admin', 'manager', 'staff', 'driver'].includes(account.role)) return fail('Forbidden.', 403);
+    if (!env.AI) return fail('AI is not switched on yet (Workers AI binding missing).', 503);
+    const body = await jsonBody(request);
+    const msgs: any[] = Array.isArray(body?.messages) ? body.messages.slice(-10) : [];
+    const area = String(body?.area || '').slice(0, 120);
+    const chat = msgs.map((m: any) => ({ role: m?.role === 'assistant' ? 'assistant' : 'user', content: String(m?.content || '').slice(0, 1500) })).filter((m) => m.content);
+    if (!chat.length) return fail('Type the address to fix.');
+    const input = { messages: [{ role: 'system', content: ADDRESS_PROMPT + (area ? `\nThe driver is working around: ${area}. Prefer suburbs near there.` : '') }, ...chat], max_tokens: 700, temperature: 0.2 };
+    let last = '';
+    for (const model of ADDRESS_MODELS) {
+      try {
+        const parsed = parseAddressReply(aiText(await env.AI.run(model, input)));
+        if (parsed) return json(parsed);
+        last = 'unparsed';
+      } catch (e: any) {
+        last = String(e?.message || e);
+        if (/limit|quota|neuron|4006/i.test(last)) return fail('Today\'s free AI allowance is used up. Try again tomorrow, or place the pin on the map.', 429);
+      }
+    }
+    return fail('The AI helper could not answer just now. Try again, or place the pin on the map.', 502);
   }
   if (path === '/api/route/address-note' && method === 'POST') {
     const account = await currentAccount(request, env);

@@ -2598,7 +2598,23 @@
   // the Worker and saved, so each address is only ever looked up once.
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let lastOsmCall = 0;
+  // The driver's working area (route start or today's stops). Lookups are
+  // kept within AREA_KM of it so a suburb name that exists in several states
+  // (e.g. Kingswood NSW / SA / QLD) lands in the right one.
+  const AREA_KM = 80;
+  let geoArea = null;
+  const nearArea = (p) => !geoArea || !p || !Number.isFinite(Number(p.lat)) || kmBetween(geoArea, { lat: Number(p.lat), lng: Number(p.lng) }) <= AREA_KM;
+  function areaFromRoute(route) {
+    if (route && route.start && Number.isFinite(route.start.lat)) return { lat: route.start.lat, lng: route.start.lng };
+    const pts = ((route && route.stops) || []).filter((x) => Number.isFinite(x.lat));
+    if (!pts.length) return null;
+    const mid = (arr) => arr.slice().sort((a, b) => a - b)[Math.floor(arr.length / 2)];
+    return { lat: mid(pts.map((x) => x.lat)), lng: mid(pts.map((x) => x.lng)) };
+  }
   async function osmSearch(params) {
+    if (geoArea) {
+      params = Object.assign({ viewbox: `${(geoArea.lng - 0.75).toFixed(4)},${(geoArea.lat + 0.65).toFixed(4)},${(geoArea.lng + 0.75).toFixed(4)},${(geoArea.lat - 0.65).toFixed(4)}`, bounded: '1' }, params);
+    }
     const wait = lastOsmCall + 1100 - Date.now();
     if (wait > 0) await sleep(wait);
     lastOsmCall = Date.now();
@@ -2607,7 +2623,7 @@
     if (res.status === 429) throw new Error('The free address service is busy. Wait a minute and try again.');
     if (!res.ok) throw new Error('The free address service did not respond. Try again shortly.');
     const list = await res.json();
-    return Array.isArray(list) && list.length ? list[0] : null;
+    return Array.isArray(list) ? list.find((h) => nearArea({ lat: h.lat, lng: h.lon })) || null : null;
   }
   // Run sheets write units many ways ("Unit 428, 50A Jacqui Ave",
   // "206/20C Hasluck St", "4B Hasluck St, Unit 706"). Map search finds the
@@ -2637,13 +2653,16 @@
     if (wait > 0) await sleep(wait);
     lastPhotonCall = Date.now();
     try {
-      const res = await fetch('https://photon.komoot.io/api/?' + new URLSearchParams({ q, limit: '5', lang: 'en', bbox: '112.9,-43.7,153.7,-10.6' }).toString());
+      const params = { q, limit: '8', lang: 'en', bbox: '112.9,-43.7,153.7,-10.6' };
+      if (geoArea) Object.assign(params, { lat: geoArea.lat.toFixed(5), lon: geoArea.lng.toFixed(5), location_bias_scale: '0.5' });
+      const res = await fetch('https://photon.komoot.io/api/?' + new URLSearchParams(params).toString());
       if (!res.ok) return [];
       const data = await res.json();
       const sub = String(area.suburb || '').toLowerCase(), pc = String(area.postcode || '');
       return (data.features || []).filter((f) => {
         const p = f.properties || {};
         if (p.countrycode && p.countrycode !== 'AU') return false;
+        if (!nearArea({ lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0] })) return false;
         if (!sub && !pc) return true;
         const places = [p.locality, p.district, p.city, p.name, p.county].filter(Boolean).map((x) => String(x).toLowerCase());
         return (pc && String(p.postcode || '') === pc) || (sub && places.some((x) => x === sub || x.includes(sub)));
@@ -2715,6 +2734,10 @@
       if (!res.ok) throw new Error(body.error || 'Address lookup failed.');
       out.push(...body.results);
     }
+    // A remembered location far from today's area was probably the wrong
+    // suburb (another state) — look it up again near the driver.
+    const replace = new Set();
+    out.forEach((r, i) => { if (r && !r.error && !nearArea(r)) { replace.add(i); out[i] = { error: 'far', lookupInBrowser: true, access: r.access }; } });
     const misses = out.map((r, i) => (r && r.lookupInBrowser ? i : -1)).filter((i) => i >= 0);
     const saved = [];
     let done = addresses.length - misses.length;
@@ -2728,7 +2751,7 @@
         for (let k = m; k < misses.length; k++) out[misses[k]] = { error: e.message };
         break;
       }
-      if (!out[i].error) saved.push(Object.assign({ address: addresses[i] }, out[i]));
+      if (!out[i].error) saved.push(Object.assign({ address: addresses[i], replace: replace.has(i) }, out[i]));
       done++;
       if (onProgress) onProgress(done, addresses.length, misses.length - m - 1);
     }
@@ -2822,7 +2845,7 @@
       <span class="route-num"${colour ? ` style="background:${colour};color:#fff;"` : ''}>${i + 1}</span>
       <div class="route-stop-body">
         <div class="route-stop-addr">${esc(s.address)}</div>
-        ${s.partial ? `<div class="helptext route-approx">Approximate pin (street only) — check the house number</div>` : ''}
+        ${s.partial ? `<div class="helptext route-approx">Approximate pin (street only) — check the house number${editable ? ` · <button class="link-btn" data-action="route-pin-place" data-route="${route.id}" data-kind="stop" data-stop="${s.id}">Fix pin</button>` : ''}</div>` : ''}
         <div class="helptext">${[s.name ? esc(s.name) : '', s.refs && s.refs.length ? esc(s.refs.slice(0, 3).join(', ')) + (s.refs.length > 3 ? '…' : '') : ''].filter(Boolean).join(' · ')}</div>
         ${stopChips(s, etas)}
         ${s.access ? `<div class="helptext route-access">Access: ${esc(s.access)}</div>` : ''}
@@ -2880,7 +2903,7 @@
           ${unmatched.map((u, i) => `
             <form class="route-fix" data-onsubmit="route-fix-address" data-route="${route.id}" data-index="${i}">
               <div class="field" style="flex:1;"><label class="field-label">${esc(u.name || 'Stop')}${u.refs && u.refs.length ? ' · ' + esc(u.refs[0]) : ''} — ${esc(u.error || 'Not found')}</label><input type="text" name="address" value="${esc(u.address)}" ${editable ? '' : 'disabled'}></div>
-              ${editable ? `<button class="btn btn-sm btn-primary" type="submit">Find</button><button class="btn btn-sm" type="button" data-action="route-unmatched-remove" data-route="${route.id}" data-index="${i}">Remove</button>` : ''}
+              ${editable ? `<button class="btn btn-sm btn-primary" type="submit">Find</button><button class="btn btn-sm" type="button" data-action="route-ai-fix" data-route="${route.id}" data-kind="unmatched" data-index="${i}">Fix with AI</button><button class="btn btn-sm" type="button" data-action="route-pin-place" data-route="${route.id}" data-kind="unmatched" data-index="${i}">Place pin</button><button class="btn btn-sm" type="button" data-action="route-unmatched-remove" data-route="${route.id}" data-index="${i}">Remove</button>` : ''}
             </form>`).join('')}
         </div>` : ''}
       <div class="card">
@@ -2888,6 +2911,7 @@
         ${editable ? `<div class="route-tools">
           <button class="btn btn-sm btn-primary" data-action="route-stop-add" data-route="${route.id}">+ Add stop</button>
           <button class="btn btn-sm" data-action="route-photo-start" data-route="${route.id}">Add from photos</button>
+          <button class="btn btn-sm" data-action="route-ai-fix" data-route="${route.id}" data-kind="new">AI address help</button>
           <button class="btn btn-sm" data-action="route-reorder-toggle" aria-pressed="${routeUi.reorder ? 'true' : 'false'}">${routeUi.reorder ? 'Done ordering' : 'Manually order'}</button>
           <button class="btn btn-sm" data-action="route-reverse" data-route="${route.id}">Reverse route</button>
           <button class="btn btn-sm" data-action="route-replan" data-route="${route.id}">Re-optimise</button>
@@ -3145,7 +3169,8 @@
       <div class="modal-head"><h3>Edit stop</h3><button class="modal-close" data-action="modal-close" aria-label="Close">×</button></div>
       <form class="stop-edit" data-onsubmit="route-stop-save" data-route="${route.id}" data-stop="${stop.id}">
         <div class="field"><label class="field-label">Address</label><input type="text" name="address" value="${esc(stop.address)}" autocomplete="off"></div>
-        <p class="helptext" style="margin:-4px 0 12px;">Change the address by typing and picking from the list. The pin moves when you save.</p>
+        <p class="helptext" style="margin:-4px 0 8px;">Change the address by typing and picking from the list. The pin moves when you save.</p>
+        <div class="ai-actions" style="margin:0 0 12px;"><button class="btn btn-sm" type="button" data-action="route-ai-fix" data-route="${route.id}" data-kind="stop" data-stop="${stop.id}">Fix with AI</button><button class="btn btn-sm" type="button" data-action="route-pin-place" data-route="${route.id}" data-kind="stop" data-stop="${stop.id}">Adjust pin on map</button></div>
         <div class="field"><label class="field-label">Notes</label><textarea name="notes" rows="2" placeholder="Anything that helps with this stop">${esc(stop.notes || '')}</textarea></div>
         <div class="field"><label class="field-label">Access instructions</label><input type="text" name="access" value="${esc(stop.access || '')}" placeholder="Gate code, buzzer, where to leave it…"></div>
         <label class="check-row"><input type="checkbox" name="rememberAccess"> Remember for this address (shows next time)</label>
@@ -3215,6 +3240,141 @@
     const [g] = await geocodeForRoute([address]);
     return g;
   }
+
+  // ---- Fixing a stop's location: AI chat + place pin --------------------
+  // target = { route, kind: 'unmatched' | 'stop' | 'new', index?, stopId? }
+  const aiFix = { target: null, original: '', messages: [], busy: false };
+  function fixTargetFrom(el) {
+    return { route: el.dataset.route, kind: el.dataset.kind, index: el.dataset.index != null ? Number(el.dataset.index) : null, stopId: el.dataset.stop || null };
+  }
+  function fixTargetInfo(t) {
+    const route = state.routes.find((r) => r.id === t.route);
+    if (!route) return {};
+    if (t.kind === 'unmatched') return { route, item: (route.unmatched || [])[t.index] };
+    if (t.kind === 'stop') return { route, item: route.stops.find((x) => x.id === t.stopId) };
+    return { route, item: null };
+  }
+  // Puts the stop at the chosen point, re-plans times and remembers the
+  // point for this address so it is found automatically next time.
+  async function applyFixedLocation(t, loc, newAddress) {
+    const { route, item } = fixTargetInfo(t);
+    if (!route) return;
+    const stops = route.stops.slice(); let unmatched = (route.unmatched || []).slice(); let at = -1;
+    const pos = { lat: Number(loc.lat), lng: Number(loc.lng), formatted: loc.formatted || '', precision: loc.precision || 'confirmed', partial: !!loc.partial };
+    if (t.kind === 'unmatched' && item) {
+      const stop = Object.assign({}, item, pos, { id: 's' + genId(), status: 'pending', reason: '', doneAt: null });
+      delete stop.error;
+      at = insertCheapest(route, stops, stop);
+      unmatched = unmatched.filter((_, i) => i !== t.index);
+    } else if (t.kind === 'stop' && item) {
+      const i = stops.findIndex((x) => x.id === item.id);
+      stops[i] = Object.assign({}, item, pos);
+    } else {
+      const stop = { id: 's' + genId(), address: newAddress || loc.formatted, name: '', phone: '', email: '', notes: '', access: '', refs: [], parcels: 1,
+        stopType: 'delivery', placement: 'auto', status: 'pending', reason: '', doneAt: null };
+      Object.assign(stop, pos);
+      at = insertCheapest(route, stops, stop);
+    }
+    await applyStops(route, stops, { unmatched });
+    const remember = item ? item.address : (newAddress || '');
+    if (remember && !pos.partial) {
+      fetch('/api/route/geocache', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ items: [{ address: remember, lat: pos.lat, lng: pos.lng, formatted: pos.formatted || remember, precision: pos.precision, partial: false, replace: true }] }) }).catch(() => {});
+    }
+    closeModal(); renderView();
+    toast(t.kind === 'stop' ? 'Location updated.' : `Added as stop ${at + 1}.`, 'ok');
+  }
+  function candidateCard(c, i, mi) {
+    return `<button class="ai-match" data-action="ai-fix-use" data-m="${mi}" data-c="${i}">
+      <span class="ai-match-addr">${esc(c.label)}</span>
+      <span class="helptext">${c.km != null ? c.km.toFixed(1) + ' km from your start' : ''}${c.approx ? ' · street only — check the house number' : ''}</span>
+      <span class="ai-match-use">Use this</span>
+    </button>`;
+  }
+  function renderAiFix() {
+    const t = aiFix.target; const { item } = fixTargetInfo(t);
+    openModal(`
+      <div class="modal-head"><h3>Fix address with AI</h3><button class="modal-close" data-action="modal-close" aria-label="Close">×</button></div>
+      ${item ? `<p class="helptext" style="margin:0 0 10px;">Stop: <strong>${esc(item.address)}</strong>${item.name ? ' · ' + esc(item.name) : ''}</p>` : ''}
+      <div class="ai-chat" id="aiChat">
+        ${aiFix.messages.map((m, mi) => m.role === 'user'
+          ? `<div class="ai-msg ai-user">${esc(m.content)}</div>`
+          : `<div class="ai-msg ai-bot">${esc(m.content)}${m.matches ? (m.matches.length ? `<div class="ai-matches">${m.matches.map((c, i) => candidateCard(c, i, mi)).join('')}</div>` : '<p class="helptext" style="margin:8px 0 0;">No map match found near you for that. Add the suburb or postcode, or place the pin yourself.</p>') : ''}</div>`).join('')}
+        ${aiFix.busy ? '<div class="ai-msg ai-bot ai-typing"><span></span><span></span><span></span></div>' : ''}
+      </div>
+      <form class="ai-input" data-onsubmit="ai-fix-send">
+        <input type="text" name="text" placeholder="Type the address or a correction…" autocomplete="off" ${aiFix.busy ? 'disabled' : ''} aria-label="Message">
+        <button class="btn btn-primary" type="submit" ${aiFix.busy ? 'disabled' : ''}>Send</button>
+      </form>
+      <div class="ai-actions">
+        <button class="btn btn-sm" data-action="route-pin-place" data-route="${t.route}" data-kind="${t.kind}" ${t.index != null ? `data-index="${t.index}"` : ''} ${t.stopId ? `data-stop="${t.stopId}"` : ''}>Place pin on map</button>
+        ${t.kind !== 'new' ? `<button class="btn btn-sm" data-action="ai-fix-here">I'm at this address now</button>` : ''}
+      </div>`, { wide: true });
+    const box = document.getElementById('aiChat'); if (box) box.scrollTop = box.scrollHeight;
+    const inp = document.querySelector('.ai-input input'); if (inp && !aiFix.busy) inp.focus();
+  }
+  async function mapMatchesFor(cands) {
+    const out = []; const seen = new Set();
+    for (const c of cands) {
+      const q = [c.address, [c.suburb, c.state, c.postcode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+      let feats = await photonSearch(q, { suburb: c.suburb, postcode: c.postcode });
+      if (!feats.length) feats = await photonSearch(q, {});
+      feats.slice(0, 3).forEach((f) => {
+        const p = f.properties || {}; const [lng, lat] = f.geometry.coordinates;
+        const label = addrLabel(p);
+        if (!label || seen.has(label)) return; seen.add(label);
+        out.push({ label, lat, lng, approx: !p.housenumber, km: geoArea ? kmBetween(geoArea, { lat, lng }) : null, typed: q });
+      });
+      if (!feats.length) {
+        try {
+          const hit = await osmSearch({ q });
+          if (hit && !seen.has(q)) { seen.add(q); const r = osmResult(hit, q); out.push({ label: q, lat: r.lat, lng: r.lng, approx: r.partial, km: geoArea ? kmBetween(geoArea, r) : null, typed: q }); }
+        } catch (e) { /* busy: skip */ }
+      }
+    }
+    return out.slice(0, 6);
+  }
+  async function aiFixAsk(text) {
+    aiFix.messages.push({ role: 'user', content: text });
+    aiFix.busy = true; renderAiFix();
+    const { route } = fixTargetInfo(aiFix.target);
+    geoArea = areaFromRoute(route);
+    const areaText = route && route.stops.length ? [...new Set(route.stops.map((x) => (x.parts && x.parts.suburb) || '').filter(Boolean))].slice(0, 4).join(', ') : '';
+    try {
+      const res = await fetch('/api/route/ai-address', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ area: areaText, messages: aiFix.messages.map((m) => ({ role: m.role, content: m.content })) }) });
+      let body = {}; try { body = await res.json(); } catch (e) {}
+      if (!res.ok) throw new Error(body.error || 'The AI helper could not answer just now.');
+      const matches = await mapMatchesFor(body.candidates || []);
+      aiFix.messages.push({ role: 'assistant', content: body.reply || 'Here is what I found:', matches });
+    } catch (e) {
+      aiFix.messages.push({ role: 'assistant', content: e.message + ' You can still place the pin on the map.', matches: null });
+    }
+    aiFix.busy = false;
+    if (document.getElementById('aiChat')) renderAiFix();
+  }
+  async function openPinPicker(t) {
+    const { route, item } = fixTargetInfo(t);
+    const startAt = item && Number.isFinite(item.lat) ? item : areaFromRoute(route) || { lat: -33.87, lng: 151.21 };
+    openModal(`
+      <div class="modal-head"><h3>Place the pin</h3><button class="modal-close" data-action="modal-close" aria-label="Close">×</button></div>
+      <p class="helptext" style="margin:0 0 8px;">${item ? `<strong>${esc(item.address)}</strong> — ` : ''}drag the pin (or tap the map) to the right house. It's remembered for next time.</p>
+      <div id="pinMap" class="pin-map"></div>
+      ${t.kind === 'new' ? `<div class="field" style="margin-top:10px;"><label class="field-label">Address for this stop</label><input type="text" id="pinNewAddress" placeholder="e.g. 3 Mersey Crescent, Schofields"></div>` : ''}
+      <div class="ai-actions">
+        <button class="btn" data-action="pin-here">Move pin to where I am</button>
+        <button class="btn btn-primary" data-action="pin-save" data-route="${t.route}" data-kind="${t.kind}" ${t.index != null ? `data-index="${t.index}"` : ''} ${t.stopId ? `data-stop="${t.stopId}"` : ''}>Save pin</button>
+      </div>`, { wide: true });
+    let L; try { L = await loadLeaflet(); } catch (e) { toast('Map could not load.', 'err'); return; }
+    const el = document.getElementById('pinMap'); if (!el) return;
+    const map = L.map(el).setView([startAt.lat, startAt.lng], item && Number.isFinite(item.lat) ? 17 : 13);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+    const marker = L.marker([startAt.lat, startAt.lng], { draggable: true, icon: L.divIcon({ className: 'route-pin is-next', html: '<span>★</span>', iconSize: [30, 30] }) }).addTo(map);
+    map.on('click', (e) => marker.setLatLng(e.latlng));
+    pinState.marker = marker; pinState.map = map;
+    setTimeout(() => map.invalidateSize(), 150);
+  }
+  const pinState = { marker: null, map: null };
   async function saveRouteStops(route, patch) {
     Object.assign(route, patch, { updatedAt: new Date().toISOString() });
     await state.db.doc('routes/' + route.id).update(Object.assign({}, patch, { updatedAt: route.updatedAt }));
@@ -3237,22 +3397,36 @@
         try { const pos = await getCurrentPosition(); start = { label: 'My location', lat: pos.lat, lng: pos.lng }; }
         catch (e) { routeUi.busy = ''; renderView(); toast(e.message + ' Or choose "An address" as the start.', 'err'); return; }
       }
+      if (startMode === 'address') {
+        routeUi.busy = 'Finding the start address…'; renderView();
+        geoArea = null;
+        const [sg] = await geocodeForRoute([startAddress]);
+        if (!sg || sg.error) { routeUi.busy = ''; renderView(); toast('Start address: ' + ((sg && sg.error) || 'not found') + '. Try "My current location" instead.', 'err'); return; }
+        start = { label: startAddress, lat: sg.lat, lng: sg.lng };
+      }
+      geoArea = { lat: start.lat, lng: start.lng };
       routeUi.busy = `Finding ${stops.length} addresses…`; renderView();
-      const lookups = await geocodeForRoute(stops.map((s) => s.address).concat(startMode === 'address' ? [startAddress] : []), (done, total, left) => {
+      const lookups = await geocodeForRoute(stops.map((s) => s.address), (done, total, left) => {
         routeUi.busy = `Finding addresses… ${done} of ${total}` + (left > 3 ? ` (about ${Math.ceil(left * 1.1)} seconds left — saved addresses are instant next time)` : '');
         const p = document.querySelector('.route-spinner + p'); if (p) p.textContent = routeUi.busy;
-      }, stops.map((s) => s.parts).concat(startMode === 'address' ? [null] : []));
-      if (startMode === 'address') {
-        const s = lookups.pop();
-        if (s.error) { routeUi.busy = ''; renderView(); toast('Start address: ' + s.error, 'err'); return; }
-        start = { label: startAddress, lat: s.lat, lng: s.lng };
-      }
+      }, stops.map((s) => s.parts));
       const found = [], unmatched = [];
       stops.forEach((s, i) => {
         const g = lookups[i];
         if (g && !g.error) found.push(Object.assign({}, s, { lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: g.partial, access: s.access || g.access || '' }));
         else unmatched.push(Object.assign({}, s, { error: g ? g.error : 'Not found' }));
       });
+      // Anything still far from the rest of the route is probably the wrong place.
+      if (found.length >= 4) {
+        const mid = (arr) => arr.slice().sort((a, b) => a - b)[Math.floor(arr.length / 2)];
+        const centre = { lat: mid(found.map((x) => x.lat)), lng: mid(found.map((x) => x.lng)) };
+        const typical = mid(found.map((x) => kmBetween(centre, x)));
+        const limit = Math.max(30, typical * 4);
+        for (let i = found.length - 1; i >= 0; i--) {
+          const km = kmBetween(centre, found[i]);
+          if (km > limit) { const f = found.splice(i, 1)[0]; unmatched.push(Object.assign({}, f, { error: `Looks far away (${Math.round(km)} km from your other stops) — check` })); }
+        }
+      }
       if (!found.length) { routeUi.busy = ''; renderView(); toast(unmatched.length ? unmatched[0].error + ' — check the address column is right.' : 'No addresses found.', 'err'); return; }
       routeUi.busy = 'Checking real driving times between stops…'; renderView();
       const plan = await planStopOrder(start, found, returnToStart, (done, total) => {
@@ -3442,6 +3616,7 @@
       const route = state.routes.find((r) => r.id === ph.target); if (!route) { routeUi.photo = null; renderView(); return; }
       el.disabled = true; el.textContent = 'Finding addresses…';
       try {
+        geoArea = areaFromRoute(route);
         const res = await geocodeForRoute(labels.map(labelFullAddress), (done, total) => { el.textContent = `Finding addresses… ${Math.min(done, total)} of ${total}`; },
           labels.map((l) => ({ street: l.address, suburb: l.suburb, state: l.state, postcode: l.postcode })));
         const stops = route.stops.slice(); const unmatched = (route.unmatched || []).slice(); let added = 0;
@@ -3457,6 +3632,39 @@
         routeUi.photo = null; renderView();
         toast(`Added ${added} stop${added === 1 ? '' : 's'} from photos${labels.length - added ? `, ${labels.length - added} need checking` : ''}.`, labels.length - added ? 'err' : 'ok');
       } catch (e) { el.disabled = false; el.textContent = 'Try again'; toast(e.message, 'err'); }
+    },
+    'route-ai-fix': (el) => {
+      const t = fixTargetFrom(el); const { item } = fixTargetInfo(t);
+      aiFix.target = t; aiFix.messages = []; aiFix.busy = false;
+      renderAiFix();
+      if (item && item.address) aiFixAsk(item.address + (item.error ? ` (map search said: ${item.error})` : ''));
+      else aiFix.messages.push({ role: 'assistant', content: 'Paste or type the address the way it is written and I\'ll find it on the map.' }), renderAiFix();
+    },
+    'ai-fix-use': async (el) => {
+      const m = aiFix.messages[Number(el.dataset.m)]; const c = m && m.matches && m.matches[Number(el.dataset.c)]; if (!c) return;
+      el.disabled = true;
+      try { await applyFixedLocation(aiFix.target, { lat: c.lat, lng: c.lng, formatted: c.label, precision: c.approx ? 'street' : 'confirmed', partial: c.approx }, c.label); }
+      catch (e) { el.disabled = false; toast(e.message, 'err'); }
+    },
+    'ai-fix-here': async (el) => {
+      el.disabled = true; el.textContent = 'Getting your location…';
+      try { const pos = await getCurrentPosition(); await applyFixedLocation(aiFix.target, { lat: pos.lat, lng: pos.lng, precision: 'here', partial: false }); }
+      catch (e) { el.disabled = false; el.textContent = "I'm at this address now"; toast(e.message, 'err'); }
+    },
+    'route-pin-place': (el) => { openPinPicker(fixTargetFrom(el)); },
+    'pin-here': async (el) => {
+      el.disabled = true;
+      try { const pos = await getCurrentPosition(); if (pinState.marker) { pinState.marker.setLatLng([pos.lat, pos.lng]); pinState.map.setView([pos.lat, pos.lng], 18); } }
+      catch (e) { toast(e.message, 'err'); } finally { el.disabled = false; }
+    },
+    'pin-save': async (el) => {
+      if (!pinState.marker) return;
+      const t = fixTargetFrom(el); const ll = pinState.marker.getLatLng();
+      const newAddr = t.kind === 'new' ? String((document.getElementById('pinNewAddress') || {}).value || '').trim() : '';
+      if (t.kind === 'new' && !newAddr) { toast('Type the address for this stop first.', 'err'); return; }
+      el.disabled = true;
+      try { await applyFixedLocation(t, { lat: ll.lat, lng: ll.lng, precision: 'manual', partial: false, formatted: newAddr }, newAddr); }
+      catch (e) { el.disabled = false; toast(e.message, 'err'); }
     },
     'route-stop-edit': (el) => {
       const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
@@ -3509,6 +3717,7 @@
       const list = route.unmatched;
       el.disabled = true; const label = el.textContent;
       try {
+        geoArea = areaFromRoute(route);
         const res = await geocodeForRoute(list.map((u) => u.address), (done, total) => { el.textContent = `Checking ${Math.min(done, total)} of ${total}…`; }, list.map((u) => u.parts || null));
         const stops = route.stops.slice(); const still = []; let added = 0, approx = 0;
         list.forEach((u, i) => {
@@ -4077,6 +4286,10 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   };
 
   const SUBMIT_HANDLERS = {
+    'ai-fix-send': async (form) => {
+      const text = String(new FormData(form).get('text') || '').trim(); if (!text || aiFix.busy) return;
+      await aiFixAsk(text);
+    },
     'route-plan': async (form) => { await planRoute(form); },
     'route-stop-save': async (form) => {
       const route = state.routes.find((r) => r.id === form.dataset.route); if (!route) return;
@@ -4095,6 +4308,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         const newAddress = get('address');
         let moved = false;
         if (newAddress && newAddress !== old.address) {
+          geoArea = areaFromRoute(route);
           const g = await lookupOne(addressInput);
           if (!g || g.error) { toast((g && g.error) || 'Address not found', 'err'); btn.disabled = false; btn.textContent = 'Save'; return; }
           Object.assign(stop, { address: newAddress, lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: !!g.partial, parts: null });
@@ -4127,6 +4341,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const fd = new FormData(form); const get = (k) => String(fd.get(k) || '').trim();
       const btn = form.querySelector('button[type="submit"]'); btn.disabled = true; btn.textContent = 'Finding address…';
       try {
+        geoArea = areaFromRoute(route);
         const g = await lookupOne(form.querySelector('input[name="address"]'));
         if (!g || g.error) { toast((g && g.error) || 'Address not found', 'err'); btn.disabled = false; btn.textContent = 'Add to route'; return; }
         const stop = { id: 's' + genId(), address: get('address'), name: get('name'), phone: get('phone'), email: '', notes: get('notes'), access: g.access || '', refs: [],
@@ -4151,6 +4366,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       const idx = Number(form.dataset.index); const u = (route.unmatched || [])[idx]; if (!u) return;
       const address = String(new FormData(form).get('address') || '').trim(); if (!address) return;
       try {
+        geoArea = areaFromRoute(route);
         const [g] = await geocodeForRoute([address]);
         if (g.error) { toast(/not found/i.test(g.error) ? g.error + ' — try adding the suburb and postcode.' : g.error, 'err'); return; }
         const stop = Object.assign({}, u, { address, lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: g.partial, id: 's' + genId(), status: 'pending', reason: '', doneAt: null });
