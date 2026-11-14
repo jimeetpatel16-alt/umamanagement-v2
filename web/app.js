@@ -2647,6 +2647,55 @@
     const exact = !forceApprox && (['house', 'building', 'residential', 'apartments', 'commercial', 'retail', 'industrial', 'office', 'shop', 'amenity'].includes(type) || /^\d/.test(String(hit.name || '')));
     return { lat: Number(hit.lat), lng: Number(hit.lon), formatted: String(hit.display_name || address).replace(/, Australia$/, ''), precision: type, partial: !exact };
   }
+  // The free map often has a street but not every house number on it.
+  // Estimate where a number sits from the numbered houses OpenStreetMap does
+  // know on that street (Overpass, free): between the nearest lower and higher
+  // numbers, or next to the nearest one.
+  const ST_TYPES = { road: 'rd', street: 'st', avenue: 'ave?', drive: 'dr', crescent: 'cres', place: 'pl', court: 'ct', parade: 'pde', highway: 'hwy', lane: 'la?ne?', close: 'cl', circuit: 'cct', boulevard: 'bv?d', terrace: 'tce', way: 'wy', grove: 'gr', square: 'sq', esplanade: 'esp', parkway: 'pwy', rise: 'ri', mews: 'mw' };
+  function streetPattern(name) {
+    const words = String(name || '').trim().replace(/[.,]/g, '').split(/\s+/).filter(Boolean);
+    if (!words.length) return '';
+    const last = words[words.length - 1].toLowerCase();
+    let type = null;
+    for (const [full, ab] of Object.entries(ST_TYPES)) if (last === full || new RegExp('^' + ab + '$').test(last)) type = `(${full}|${ab})`;
+    const base = (type ? words.slice(0, -1) : words).map((w) => w.replace(/[^A-Za-z0-9'-]/g, '').replace(/'/g, ".?")).join(' +');
+    return '^' + base + (type ? ' +' + type : '') + '$';
+  }
+  const houseEstCache = new Map(); let lastOverpass = 0;
+  async function estimateHouse(street, num, near) {
+    const n = parseInt(num, 10); const pat = streetPattern(street);
+    if (!n || !pat || !near) return null;
+    const key = pat + '@' + near.lat.toFixed(2) + ',' + near.lng.toFixed(2);
+    let pts = houseEstCache.get(key);
+    if (!pts) {
+      const wait = lastOverpass + 1100 - Date.now(); if (wait > 0) await sleep(wait); lastOverpass = Date.now();
+      const q = `[out:json][timeout:20];nwr["addr:street"~"${pat}",i]["addr:housenumber"](around:3500,${near.lat.toFixed(5)},${near.lng.toFixed(5)});out center tags;`;
+      try {
+        const res = await fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: new URLSearchParams({ data: q }) });
+        if (!res.ok) return null;
+        const data = await res.json();
+        pts = (data.elements || []).map((e) => ({ n: parseInt(String((e.tags || {})['addr:housenumber']).replace(/^.*?(\d+)[^\d]*$/, '$1'), 10), lat: e.lat != null ? e.lat : e.center && e.center.lat, lng: e.lon != null ? e.lon : e.center && e.center.lon }))
+          .filter((p) => p.n > 0 && Number.isFinite(p.lat) && Number.isFinite(p.lng));
+        houseEstCache.set(key, pts);
+      } catch (e) { return null; }
+    }
+    if (!pts.length) return null;
+    const exact = pts.find((p) => p.n === n);
+    if (exact) return { lat: exact.lat, lng: exact.lng, how: 'house', note: '' };
+    const pick = (list) => {
+      const lo = list.filter((p) => p.n < n).sort((a, b) => b.n - a.n)[0];
+      const hi = list.filter((p) => p.n > n).sort((a, b) => a.n - b.n)[0];
+      return { lo, hi };
+    };
+    let { lo, hi } = pick(pts.filter((p) => p.n % 2 === n % 2)); // same side of the road first
+    if (!lo && !hi) ({ lo, hi } = pick(pts));
+    if (lo && hi && kmBetween(lo, hi) < 3) {
+      const f = (n - lo.n) / (hi.n - lo.n);
+      return { lat: lo.lat + (hi.lat - lo.lat) * f, lng: lo.lng + (hi.lng - lo.lng) * f, how: 'between', note: `between No. ${lo.n} and ${hi.n}` };
+    }
+    const one = lo && hi ? (n - lo.n <= hi.n - n ? lo : hi) : lo || hi;
+    return { lat: one.lat, lng: one.lng, how: 'near', note: `next to No. ${one.n}` };
+  }
   let lastPhotonCall = 0;
   async function photonSearch(q, area) {
     const wait = lastPhotonCall + 350 - Date.now();
@@ -2721,6 +2770,11 @@
       // Street only (new estates often have the street mapped but not the houses).
       const st = canStructure ? await osmSearch(structured(h.name)) : await osmSearch({ q: freeText(h.name) });
       if (st) approx = osmResult(st, address, true);
+    }
+    if (approx && h.num && h.name) {
+      const est = await estimateHouse(h.name, h.num, approx);
+      if (est && est.how === 'house') return { lat: est.lat, lng: est.lng, formatted: `${h.num}${h.letter} ${h.name}${tail ? ', ' + tail : ''}`, precision: 'house', partial: false, unit };
+      if (est) Object.assign(approx, { lat: est.lat, lng: est.lng, precision: 'estimated', estimate: est.note });
     }
     if (approx) return Object.assign(approx, { unit });
     return { error: 'Address not found' };
@@ -3285,11 +3339,15 @@
     toast(t.kind === 'stop' ? 'Location updated.' : `Added as stop ${at + 1}.`, 'ok');
   }
   function candidateCard(c, i, mi) {
-    return `<button class="ai-match" data-action="ai-fix-use" data-m="${mi}" data-c="${i}">
+    const info = [c.km != null ? c.km.toFixed(1) + ' km from your start' : '', c.note || ''].filter(Boolean).join(' · ');
+    return `<div class="ai-match${c.approx ? ' is-approx' : ''}">
       <span class="ai-match-addr">${esc(c.label)}</span>
-      <span class="helptext">${c.km != null ? c.km.toFixed(1) + ' km from your start' : ''}${c.approx ? ' · street only — check the house number' : ''}</span>
-      <span class="ai-match-use">Use this</span>
-    </button>`;
+      ${info ? `<span class="helptext">${esc(info)}</span>` : ''}
+      <span class="ai-match-btns">
+        <button class="btn btn-sm ${c.approx ? '' : 'btn-primary'}" data-action="ai-fix-use" data-m="${mi}" data-c="${i}">Use this</button>
+        <button class="btn btn-sm ${c.approx ? 'btn-primary' : ''}" data-action="ai-fix-pin" data-m="${mi}" data-c="${i}">${c.approx ? 'Check pin on map' : 'See on map'}</button>
+      </span>
+    </div>`;
   }
   function renderAiFix() {
     const t = aiFix.target; const { item } = fixTargetInfo(t);
@@ -3319,16 +3377,24 @@
       const q = [c.address, [c.suburb, c.state, c.postcode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
       let feats = await photonSearch(q, { suburb: c.suburb, postcode: c.postcode });
       if (!feats.length) feats = await photonSearch(q, {});
-      feats.slice(0, 3).forEach((f) => {
-        const p = f.properties || {}; const [lng, lat] = f.geometry.coordinates;
-        const label = addrLabel(p);
-        if (!label || seen.has(label)) return; seen.add(label);
-        out.push({ label, lat, lng, approx: !p.housenumber, km: geoArea ? kmBetween(geoArea, { lat, lng }) : null, typed: q });
-      });
+      const h = splitHouse(c.address || '');
+      for (const f of feats.slice(0, 3)) {
+        const p = f.properties || {}; let [lng, lat] = f.geometry.coordinates;
+        let label = addrLabel(p); let approx = !p.housenumber; let note = '';
+        if (approx && h.num && p.street) {
+          // Keep the driver's house number; place it from neighbouring houses.
+          label = addrLabel(Object.assign({}, p, { housenumber: h.num + h.letter }));
+          const est = await estimateHouse(p.street, h.num, { lat, lng });
+          if (est) { lat = est.lat; lng = est.lng; approx = est.how !== 'house'; note = est.how === 'house' ? '' : `estimated ${est.note}`; }
+          else note = `No. ${h.num} isn't on the free map — pin is on the street`;
+        } else if (approx) note = 'street only — check the house number';
+        if (!label || seen.has(label)) continue; seen.add(label);
+        out.push({ label, lat, lng, approx, note, km: geoArea ? kmBetween(geoArea, { lat, lng }) : null, typed: q });
+      }
       if (!feats.length) {
         try {
           const hit = await osmSearch({ q });
-          if (hit && !seen.has(q)) { seen.add(q); const r = osmResult(hit, q); out.push({ label: q, lat: r.lat, lng: r.lng, approx: r.partial, km: geoArea ? kmBetween(geoArea, r) : null, typed: q }); }
+          if (hit && !seen.has(q)) { seen.add(q); const r = osmResult(hit, q); out.push({ label: q, lat: r.lat, lng: r.lng, approx: r.partial, note: r.partial ? 'approximate — check the pin' : '', km: geoArea ? kmBetween(geoArea, r) : null, typed: q }); }
         } catch (e) { /* busy: skip */ }
       }
     }
@@ -3346,35 +3412,45 @@
       let body = {}; try { body = await res.json(); } catch (e) {}
       if (!res.ok) throw new Error(body.error || 'The AI helper could not answer just now.');
       const matches = await mapMatchesFor(body.candidates || []);
-      aiFix.messages.push({ role: 'assistant', content: body.reply || 'Here is what I found:', matches });
+      let reply = body.reply || 'Here is what I found:';
+      // Be straight about it when the map only knows the street.
+      if (matches.length && matches.every((x) => x.approx)) {
+        const best = matches[0];
+        reply = /estimated/.test(best.note || '')
+          ? `The free map knows this street but not that exact house, so I've estimated the spot (${best.note.replace(/^estimated /, '')}). Tap "Check pin on map" to drag it onto the right house — it's remembered after that.`
+          : `The free map knows the street but not the house number, so the pin would sit somewhere on the street. Tap "Check pin on map" and drag it onto the right house — it's remembered after that.`;
+      }
+      aiFix.messages.push({ role: 'assistant', content: reply, matches });
     } catch (e) {
       aiFix.messages.push({ role: 'assistant', content: e.message + ' You can still place the pin on the map.', matches: null });
     }
     aiFix.busy = false;
     if (document.getElementById('aiChat')) renderAiFix();
   }
-  async function openPinPicker(t) {
+  async function openPinPicker(t, opts) {
+    opts = opts || {};
     const { route, item } = fixTargetInfo(t);
-    const startAt = item && Number.isFinite(item.lat) ? item : areaFromRoute(route) || { lat: -33.87, lng: 151.21 };
+    const startAt = opts.start || (item && Number.isFinite(item.lat) ? item : areaFromRoute(route) || { lat: -33.87, lng: 151.21 });
+    pinState.label = opts.label || '';
     openModal(`
       <div class="modal-head"><h3>Place the pin</h3><button class="modal-close" data-action="modal-close" aria-label="Close">×</button></div>
-      <p class="helptext" style="margin:0 0 8px;">${item ? `<strong>${esc(item.address)}</strong> — ` : ''}drag the pin (or tap the map) to the right house. It's remembered for next time.</p>
+      <p class="helptext" style="margin:0 0 8px;">${opts.label || item ? `<strong>${esc(opts.label || item.address)}</strong> — ` : ''}${opts.note ? esc(opts.note) + '. ' : ''}drag the pin (or tap the map) to the right house. It's remembered for next time.</p>
       <div id="pinMap" class="pin-map"></div>
-      ${t.kind === 'new' ? `<div class="field" style="margin-top:10px;"><label class="field-label">Address for this stop</label><input type="text" id="pinNewAddress" placeholder="e.g. 3 Mersey Crescent, Schofields"></div>` : ''}
+      ${t.kind === 'new' ? `<div class="field" style="margin-top:10px;"><label class="field-label">Address for this stop</label><input type="text" id="pinNewAddress" value="${esc(opts.label || '')}" placeholder="e.g. 3 Mersey Crescent, Schofields"></div>` : ''}
       <div class="ai-actions">
         <button class="btn" data-action="pin-here">Move pin to where I am</button>
         <button class="btn btn-primary" data-action="pin-save" data-route="${t.route}" data-kind="${t.kind}" ${t.index != null ? `data-index="${t.index}"` : ''} ${t.stopId ? `data-stop="${t.stopId}"` : ''}>Save pin</button>
       </div>`, { wide: true });
     let L; try { L = await loadLeaflet(); } catch (e) { toast('Map could not load.', 'err'); return; }
     const el = document.getElementById('pinMap'); if (!el) return;
-    const map = L.map(el).setView([startAt.lat, startAt.lng], item && Number.isFinite(item.lat) ? 17 : 13);
+    const map = L.map(el).setView([startAt.lat, startAt.lng], opts.start || (item && Number.isFinite(item.lat)) ? 18 : 13);
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
     const marker = L.marker([startAt.lat, startAt.lng], { draggable: true, icon: L.divIcon({ className: 'route-pin is-next', html: '<span>★</span>', iconSize: [30, 30] }) }).addTo(map);
     map.on('click', (e) => marker.setLatLng(e.latlng));
     pinState.marker = marker; pinState.map = map;
     setTimeout(() => map.invalidateSize(), 150);
   }
-  const pinState = { marker: null, map: null };
+  const pinState = { marker: null, map: null, label: '' };
   async function saveRouteStops(route, patch) {
     Object.assign(route, patch, { updatedAt: new Date().toISOString() });
     await state.db.doc('routes/' + route.id).update(Object.assign({}, patch, { updatedAt: route.updatedAt }));
@@ -3643,8 +3719,12 @@
     'ai-fix-use': async (el) => {
       const m = aiFix.messages[Number(el.dataset.m)]; const c = m && m.matches && m.matches[Number(el.dataset.c)]; if (!c) return;
       el.disabled = true;
-      try { await applyFixedLocation(aiFix.target, { lat: c.lat, lng: c.lng, formatted: c.label, precision: c.approx ? 'street' : 'confirmed', partial: c.approx }, c.label); }
+      try { await applyFixedLocation(aiFix.target, { lat: c.lat, lng: c.lng, formatted: c.label, precision: c.approx ? (/estimated/.test(c.note || '') ? 'estimated' : 'street') : 'confirmed', partial: c.approx }, c.label); }
       catch (e) { el.disabled = false; toast(e.message, 'err'); }
+    },
+    'ai-fix-pin': (el) => {
+      const m = aiFix.messages[Number(el.dataset.m)]; const c = m && m.matches && m.matches[Number(el.dataset.c)]; if (!c) return;
+      openPinPicker(aiFix.target, { start: { lat: c.lat, lng: c.lng }, label: c.label, note: c.note ? c.note.charAt(0).toUpperCase() + c.note.slice(1) : '' });
     },
     'ai-fix-here': async (el) => {
       el.disabled = true; el.textContent = 'Getting your location…';
@@ -3663,7 +3743,7 @@
       const newAddr = t.kind === 'new' ? String((document.getElementById('pinNewAddress') || {}).value || '').trim() : '';
       if (t.kind === 'new' && !newAddr) { toast('Type the address for this stop first.', 'err'); return; }
       el.disabled = true;
-      try { await applyFixedLocation(t, { lat: ll.lat, lng: ll.lng, precision: 'manual', partial: false, formatted: newAddr }, newAddr); }
+      try { await applyFixedLocation(t, { lat: ll.lat, lng: ll.lng, precision: 'manual', partial: false, formatted: newAddr || pinState.label }, newAddr || pinState.label); }
       catch (e) { el.disabled = false; toast(e.message, 'err'); }
     },
     'route-stop-edit': (el) => {

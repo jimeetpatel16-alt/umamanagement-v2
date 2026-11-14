@@ -795,8 +795,10 @@ table.data tfoot td { background: var(--surface-2); border-top: 1px solid var(--
 .ai-user { align-self: flex-end; background: var(--navy); color: #fff; border-bottom-right-radius: 4px; }
 .ai-bot { align-self: flex-start; background: var(--surface-3); color: var(--ink); border-bottom-left-radius: 4px; }
 .ai-matches { display: grid; gap: 8px; margin-top: 10px; }
-.ai-match { display: grid; gap: 2px; text-align: left; padding: 10px 12px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: #fff; cursor: pointer; font: inherit; min-height: 44px; }
-.ai-match:hover, .ai-match:focus-visible { border-color: var(--gold); background: var(--gold-soft); }
+.ai-match { display: grid; gap: 4px; text-align: left; padding: 10px 12px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: #fff; }
+.ai-match.is-approx { border-color: var(--gold); }
+.ai-match-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.ai-match-btns .btn { min-height: 40px; }
 .ai-match-addr { font-weight: 600; }
 .ai-match-use { justify-self: start; margin-top: 4px; font-size: .78rem; font-weight: 700; color: var(--navy); }
 .ai-typing { display: flex; gap: 4px; }
