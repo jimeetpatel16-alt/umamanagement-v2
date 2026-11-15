@@ -83,9 +83,9 @@ const STAFF_PAGE_READ: Record<string, string[]> = {
   invoices: ['invoices', 'labourShifts', 'labourLogs', 'labour'], export: ['labourShifts', 'labourLogs', 'labour', 'driverSubmissions'],
 };
 const STAFF_PAGE_WRITE: Record<string, string[]> = {
-  entry: ['days'], records: ['days'], drivers: ['drivers'], companies: ['companies'], labour: ['labour', 'labourShifts'], 'rate-cards': ['rateCards'],
+  entry: ['days', 'drivers'], records: ['days', 'drivers'], drivers: ['drivers'], companies: ['companies'], labour: ['labour', 'labourShifts'], 'rate-cards': ['rateCards'],
   'labour-shifts': ['labourShifts'], summary: ['days', 'driverSubmissions'], payments: ['days', 'drivers'], 'driver-submissions': ['driverSubmissions', 'days'],
-  'delivery-blocks': ['deliveryBlocks'], 'driver-assignments': ['driverAssignments'], routes: ['routes', 'routePhotos'], 'labour-logs': ['labourLogs'], invoices: ['invoices'],
+  'delivery-blocks': ['deliveryBlocks'], 'driver-assignments': ['driverAssignments'], routes: ['routes', 'routePhotos'], 'labour-logs': ['labourLogs'], invoices: ['invoices', 'labourLogs'],
 };
 // Numbering counters Staff may bump in Settings (payment/labour/invoice refs).
 const STAFF_SETTINGS_KEYS = ['nextPaymentNumber', 'nextLabourNumber', 'nextInvoiceNumber'];
@@ -97,6 +97,17 @@ function staffPages(account: Account) {
 function staffCanRead(account: Account, collection: string) {
   if (STAFF_BASE_READ.includes(collection)) return true;
   return staffPages(account).some((p) => (STAFF_PAGE_READ[p] || []).includes(collection) || (STAFF_PAGE_WRITE[p] || []).includes(collection));
+}
+// Driver and Labour app logins can be set up by Admin, Managers, and Staff who
+// look after the Drivers / Labour page. Admin, Manager and Staff logins stay
+// Admin-only.
+function canManagePortalLogin(account: Account, role: unknown) {
+  const r = String(role || '').trim().toLowerCase();
+  if (account.role === 'admin') return true;
+  if (r !== 'labour' && r !== 'driver') return false;
+  if (account.role === 'manager') return true;
+  if (account.role === 'staff') return staffPages(account).includes(r === 'labour' ? 'labour' : 'drivers');
+  return false;
 }
 function staffCanWrite(account: Account, collection: string) {
   return staffPages(account).some((p) => (STAFF_PAGE_WRITE[p] || []).includes(collection));
@@ -306,7 +317,7 @@ async function listDocs(env: Env, collection: string): Promise<Array<{ id: strin
 }
 function visibleToAccount(collection: string, row: { id: string; data: any }, account: Account, ownDriver: any, ownLabour: any) {
   if (['admin', 'manager', 'staff'].includes(account.role)) {
-    if (collection === 'staff' && account.role !== 'admin' && row.id !== account.id) return false;
+    if (collection === 'staff' && account.role !== 'admin' && row.id !== account.id) return canManagePortalLogin(account, row.data?.role);
     if (collection === 'auditLog' && account.role !== 'admin') return false;
     if (account.role === 'staff') return staffCanRead(account, collection);
     return true;
@@ -361,11 +372,15 @@ function canWrite(account: Account, collection: string, method: string) {
   const verb = String(method || '').trim().toUpperCase();
 
   if (role === 'admin') return true;
-  if (role === 'manager') return !['staff', 'auditlog'].includes(target);
+  // Change history is append-only: everyone who makes a change records it.
+  if (target === 'auditlog') return verb === 'POST';
+  // Portal logins: checked against the login's role in the routes below.
+  if (target === 'staff' && ['manager', 'staff'].includes(role)) return verb !== 'DELETE';
+  if (role === 'manager') return true;
   if (role === 'staff') {
     if (target === 'settings') return ['PUT', 'PATCH'].includes(verb); // numbering counters only, see below
     const name = Array.from(COLLECTIONS).find((c) => c.toLowerCase() === target) || '';
-    return !['staff', 'auditLog'].includes(name) && staffCanWrite(account, name);
+    return staffCanWrite(account, name);
   }
   // Driver/Labour updates are permitted only for their own records; record
   // ownership is checked in the update route below.
@@ -635,9 +650,11 @@ async function api(request: Request, env: Env): Promise<Response> {
     if (!canWrite(account, collection, method)) return fail('You do not have permission to create this record.', 403);
     const body = await jsonBody(request);
     const newId = String(body?.id || uid());
-    if (collection === 'staff' && account.role !== 'admin') return fail('Only Admin can create accounts.', 403);
-    if (account.role === 'driver' && body?.driverId !== account.driverId) return fail('Submission does not belong to this Driver account.', 403);
-    if (account.role === 'labour' && body?.labourId !== account.labourId) return fail('Record does not belong to this Labour account.', 403);
+    if (collection === 'staff' && !canManagePortalLogin(account, body?.role)) return fail('Only Admin can create Admin, Manager or Staff logins.', 403);
+    if (collection === 'staff' && account.role !== 'admin') delete body.pages;
+    if (collection === 'auditLog') { body.changedBy = account.name; body.changedById = account.id; body.changedAt = now(); }
+    if (account.role === 'driver' && collection !== 'auditLog' && body?.driverId !== account.driverId) return fail('Submission does not belong to this Driver account.', 403);
+    if (account.role === 'labour' && collection !== 'auditLog' && body?.labourId !== account.labourId) return fail('Record does not belong to this Labour account.', 403);
     if (account.role === 'labour' && collection === 'labourLogs' && body?.clockInAt) {
       const siteError = await labourSiteError(env, String(ownLabour?.companyId || body?.companyId || ''), body?.clockInLocation, 'clock in');
       if (siteError) return fail(siteError, 403);
@@ -653,8 +670,14 @@ async function api(request: Request, env: Env): Promise<Response> {
       });
       return fail('You do not have permission to update this record.', 403);
     }
-    if (collection === 'staff' && account.role !== 'admin') return fail('Only Admin can update accounts.', 403);
     let body = await jsonBody(request);
+    if (collection === 'staff' && account.role !== 'admin') {
+      const target = await readDoc(env, 'staff', id);
+      if (!target || !canManagePortalLogin(account, target.role) || (body?.role && String(body.role).toLowerCase() !== String(target.role).toLowerCase())) {
+        return fail('Only Admin can change Admin, Manager or Staff logins.', 403);
+      }
+      delete body.pages; delete body.role;
+    }
     if (account.role === 'staff' && collection === 'settings') {
       // Keep everything as it is; only the numbering counters can move.
       const existing = (await readDoc(env, 'settings', id)) || {};

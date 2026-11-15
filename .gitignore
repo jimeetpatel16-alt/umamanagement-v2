@@ -2,3 +2,6 @@
 **/.wrangler/
 .env
 .DS_Store
+
+# old local backups
+web/app.js.before-*

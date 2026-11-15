@@ -212,7 +212,6 @@
     if (c.rateType === 'per_parcel') return rate * (Number(parcels) || 0);
     return rate;
   }
-  function rateTypeLabel(rateType) { return (RATE_TYPES.find((r) => r.value === rateType) || RATE_TYPES[0]).label; }
   function finalPay(rec) { return (Number(rec.baseRate) || 0) + (Number(rec.bonus) || 0) + (Number(rec.adjustment) || 0); }
   function formatPrefix(fmt, number, dateStr) {
     const padded = String(number).padStart(4, '0');
@@ -244,7 +243,6 @@
     return `<p class="helptext" style="margin-bottom:10px;">Showing the latest ${cap.shown.length} of ${cap.total} — narrow with the filters above to see the rest.</p>`;
   }
   function activeDrivers() { return state.drivers.filter((d) => d.active !== false); }
-  function activeStaff() { return state.staff.filter((s) => s.active !== false); }
   function activeCompanies() { return state.companies.filter((c) => c.active !== false); }
   // Daily Entry / Bulk Add / Driver Submissions only ever deal with delivery
   // work, so their company pickers are scoped to "Delivery Contract" type
@@ -550,7 +548,6 @@
   function isAdmin() { return state.session && state.session.role === 'admin'; }
   function isManager() { return state.session && state.session.role === 'manager'; }
   function isDriverRole() { return state.session && state.session.role === 'driver'; }
-  function isLabourRole() { return state.session && state.session.role === 'labour'; }
   function isAdminOrManager() { return isAdmin() || isManager(); }
   function currentDriverId() { return state.session ? state.session.driverId || null : null; }
   function currentLabourId() { return state.session ? state.session.labourId || null : null; }
@@ -593,6 +590,7 @@
     sb.innerHTML = `
       <div class="brand"><div class="brand-mark">UM</div><div class="brand-text">${esc(state.settings.businessName || 'UMA Management')}<small>Operations</small></div></div>
       ${navHtml()}
+      ${state.session ? `<button class="nav-link nav-ai" data-action="ai-help-open"><span class="ic" aria-hidden="true">✦</span>Ask AI</button>` : ''}
       <div id="staffbox">
         <div class="avatar">${esc((state.session && state.session.name || '?').slice(0, 2).toUpperCase())}</div>
         <div class="who">
@@ -2713,16 +2711,30 @@
     return { lat: one.lat, lng: one.lng, how: 'near', note: `next to No. ${one.n}` };
   }
   let lastPhotonCall = 0;
+  // Requests are spaced (shared queue, so parallel callers still take turns)
+  // and answers are reused for the same text.
+  let photonTurn = Promise.resolve();
+  const photonCache = new Map();
+  function photonSlot() {
+    const t = photonTurn.then(async () => { const wait = lastPhotonCall + 300 - Date.now(); if (wait > 0) await sleep(wait); lastPhotonCall = Date.now(); });
+    photonTurn = t.catch(() => {});
+    return t;
+  }
   async function photonSearch(q, area) {
-    const wait = lastPhotonCall + 350 - Date.now();
-    if (wait > 0) await sleep(wait);
-    lastPhotonCall = Date.now();
+    area = area || {};
     try {
       const params = { q, limit: '8', lang: 'en', bbox: '112.9,-43.7,153.7,-10.6' };
       if (geoArea) Object.assign(params, { lat: geoArea.lat.toFixed(5), lon: geoArea.lng.toFixed(5), location_bias_scale: '0.5' });
-      const res = await fetch('https://photon.komoot.io/api/?' + new URLSearchParams(params).toString());
-      if (!res.ok) return [];
-      const data = await res.json();
+      const key = new URLSearchParams(params).toString();
+      let data = photonCache.get(key);
+      if (!data) {
+        await photonSlot();
+        const res = await fetch('https://photon.komoot.io/api/?' + key);
+        if (!res.ok) return [];
+        data = await res.json();
+        if (photonCache.size > 400) photonCache.clear();
+        photonCache.set(key, data);
+      }
       const sub = String(area.suburb || '').toLowerCase(), pc = String(area.postcode || '');
       return (data.features || []).filter((f) => {
         const p = f.properties || {};
@@ -2737,7 +2749,7 @@
   // Tries, in order: the address as given (unit removed), without a letter on
   // the house number (50A → 50), a second free search (Photon), and finally
   // the street itself — returned as an approximate pin rather than "not found".
-  async function osmLookup(address, parts) {
+  async function osmLookup(address, parts, opts) {
     const fromParts = parts && parts.street;
     const { rest, unit } = splitUnit(fromParts ? parts.street : address);
     const area = fromParts ? { suburb: parts.suburb || '', state: parts.state || '', postcode: parts.postcode || '' } : {};
@@ -2759,6 +2771,16 @@
       return p;
     };
     const canStructure = !!(area.suburb || area.postcode);
+    if (opts && opts.quick) {
+      // Fast pass: one Photon search, accept only an exact house-number match.
+      const want = h.num ? h.num.toLowerCase() : '';
+      if (!want) return null;
+      const ph = await photonSearch((oneBox ? rest : tail ? `${streetPart}, ${tail}` : streetPart), area);
+      const ex = ph.find((f) => String(f.properties.housenumber || '').toLowerCase().replace(/[^0-9a-z]/g, '').replace(/[a-z]$/, '') === want);
+      if (!ex) return null;
+      const [lng, lat] = ex.geometry.coordinates;
+      return { lat, lng, formatted: addrLabel(ex.properties), precision: 'house', partial: false, unit };
+    }
     const freeText = (street) => (oneBox ? rest.replace(streetPart, street) : tail ? `${street}, ${tail}` : street);
     const attempts = [];
     if (canStructure) attempts.push(() => osmSearch(structured(streetPart)));
@@ -2812,18 +2834,33 @@
     const saved = [];
     let done = addresses.length - misses.length;
     if (onProgress) onProgress(done, addresses.length, misses.length);
-    for (let m = 0; m < misses.length; m++) {
-      const i = misses[m];
+    // Quick pass first: several fast Photon searches at once. Only the
+    // addresses it can't place exactly go through the slower careful lookup.
+    const slow = [];
+    for (let m = 0; m < misses.length; m += 3) {
+      const group = misses.slice(m, m + 3);
+      const found = await Promise.all(group.map((i) => osmLookup(addresses[i], partsList ? partsList[i] : null, { quick: true }).catch(() => null)));
+      group.forEach((i, k) => {
+        const r = found[k];
+        if (r && nearArea(r)) {
+          if (out[i] && out[i].access) r.access = out[i].access;
+          out[i] = r; saved.push(Object.assign({ address: addresses[i], replace: replace.has(i) }, r)); done++;
+        } else slow.push(i);
+      });
+      if (onProgress) onProgress(done, addresses.length, misses.length - m - group.length + slow.length);
+    }
+    for (let m = 0; m < slow.length; m++) {
+      const i = slow[m];
       const savedAccess = out[i] && out[i].access;
       try { out[i] = await osmLookup(addresses[i], partsList ? partsList[i] : null); if (savedAccess) out[i].access = savedAccess; }
       catch (e) {
         // Stop asking a busy service; leave the rest for the driver to retry.
-        for (let k = m; k < misses.length; k++) out[misses[k]] = { error: e.message };
+        for (let k = m; k < slow.length; k++) out[slow[k]] = { error: e.message };
         break;
       }
       if (!out[i].error) saved.push(Object.assign({ address: addresses[i], replace: replace.has(i) }, out[i]));
       done++;
-      if (onProgress) onProgress(done, addresses.length, misses.length - m - 1);
+      if (onProgress) onProgress(done, addresses.length, slow.length - m - 1);
     }
     if (saved.length) {
       fetch('/api/route/geocache', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ items: saved }) }).catch(() => {});
@@ -3022,18 +3059,18 @@
   // Tall screenshots are read in overlapping pieces so small text stays readable.
   function photoTiles(file) {
     return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onerror = () => reject(new Error('Could not open this photo'));
-      reader.onload = () => {
+      const url = URL.createObjectURL(file);
+      {
         const img = new Image();
-        img.onerror = () => reject(new Error('This photo format can\'t be opened. Try a screenshot or JPEG.'));
+        img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('This photo format can\'t be opened. Try a screenshot or JPEG.')); };
         img.onload = () => {
+          URL.revokeObjectURL(url);
           const W = img.width, H = img.height;
           const piece = (sy, sh, maxW) => {
             const sc = Math.min(1, maxW / W);
             const c = document.createElement('canvas'); c.width = Math.round(W * sc); c.height = Math.round(sh * sc);
             c.getContext('2d').drawImage(img, 0, sy, W, sh, 0, 0, c.width, c.height);
-            return c.toDataURL('image/jpeg', 0.8);
+            return c.toDataURL('image/jpeg', 0.78);
           };
           const tiles = [];
           // Normal phone screenshots (up to ~2.6× taller than wide) are read whole.
@@ -3048,9 +3085,8 @@
           c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
           resolve({ tiles, thumb: c.toDataURL('image/jpeg', 0.7) });
         };
-        img.src = reader.result;
-      };
-      reader.readAsDataURL(file);
+        img.src = url;
+      }
     });
   }
   function routePhotoReview() {
@@ -3095,32 +3131,44 @@
         </div>
       </div>`;
   }
-  let photoQueueRunning = false;
-  async function runPhotoQueue() {
-    if (photoQueueRunning) return; photoQueueRunning = true;
+  // Reads up to 3 photos at the same time (and all pieces of a tall
+  // screenshot together), redrawing the page at most a few times a second.
+  const PHOTO_WORKERS = 3;
+  let photoWorkers = 0, photoRedraw = 0;
+  function photoRender() {
+    if (photoRedraw) return;
+    photoRedraw = setTimeout(() => { photoRedraw = 0; if (state.route === 'driver-route' || state.route === 'routes') renderView(); }, 250);
+  }
+  async function readPhotoTile(tile) {
+    const res = await fetch('/api/route/read-label', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ image: tile }) });
+    let body = {}; try { body = await res.json(); } catch (e) {}
+    if (!res.ok) throw new Error(body.error || 'Could not read this photo.');
+    return body.labels || [];
+  }
+  async function photoWorker() {
+    photoWorkers++;
     try {
       while (routeUi.photo) {
         const it = routeUi.photo.items.find((x) => x.status === 'queued');
         if (!it) break;
-        it.status = 'reading'; it.error = ''; it.labels = []; renderView();
-        let stopAll = '';
-        for (const tile of it.tiles || []) {
-          try {
-            const res = await fetch('/api/route/read-label', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ image: tile }) });
-            let body = {}; try { body = await res.json(); } catch (e) {}
-            if (!res.ok) throw new Error(body.error || 'Could not read this photo.');
-            (body.labels || []).forEach((l) => it.labels.push(Object.assign({ stop: '', place: '', suburb: '', state: '', postcode: '', name: '', phone: '', tracking: '', notes: '', confidence: 'medium' }, l)));
-          } catch (e) {
-            it.error = e.message;
-            if (/allowance|not switched on/i.test(e.message)) { stopAll = e.message; break; }
-          }
-        }
+        it.status = 'reading'; it.error = ''; it.labels = []; photoRender();
+        const results = await Promise.allSettled((it.tiles || []).map(readPhotoTile));
+        results.forEach((r) => {
+          if (r.status === 'fulfilled') r.value.forEach((l) => it.labels.push(Object.assign({ stop: '', place: '', suburb: '', state: '', postcode: '', name: '', phone: '', tracking: '', notes: '', confidence: 'medium' }, l)));
+          else it.error = r.reason && r.reason.message || 'Could not read this photo.';
+        });
         it.status = it.labels.length ? 'done' : 'error';
         if (it.labels.length) { it.error = ''; delete it.tiles; }
-        if (stopAll) { routeUi.photo.items.filter((x) => x.status === 'queued').forEach((x) => { x.status = 'error'; x.error = stopAll; }); toast(stopAll, 'err'); }
-        renderView();
+        if (!it.labels.length && /allowance|not switched on/i.test(it.error || '')) {
+          routeUi.photo.items.filter((x) => x.status === 'queued').forEach((x) => { x.status = 'error'; x.error = it.error; });
+          toast(it.error, 'err');
+        }
+        photoRender();
       }
-    } finally { photoQueueRunning = false; }
+    } finally { photoWorkers--; if (!photoWorkers) photoRender(); }
+  }
+  function runPhotoQueue() {
+    while (photoWorkers < PHOTO_WORKERS && routeUi.photo && routeUi.photo.items.some((x) => x.status === 'queued')) photoWorker();
   }
   // Notes carry the courier's stop number and any business name, e.g. "Stop 8-2 · Caddens Medical Centre".
   function labelNotes(l) {
@@ -3865,7 +3913,11 @@
       if (!aiFixPickReady()) return;
       openPinPicker(aiTarget(), { start: { lat: c.lat, lng: c.lng }, label: c.label, note: c.note ? c.note.charAt(0).toUpperCase() + c.note.slice(1) : '' });
     },
-    'ai-help-open': () => { renderAiHelp(); },
+    'ai-help-open': () => {
+      const mn = document.getElementById('mobilenav'); if (mn) mn.classList.add('hidden');
+      const bd = document.getElementById('drawer-backdrop'); if (bd) bd.classList.add('hidden');
+      renderAiHelp();
+    },
     'ai-help-chip': (el) => { aiHelpAsk(el.dataset.q || ''); },
     'ai-help-clear': () => { aiHelp.messages = []; renderAiHelp(); },
     'ai-help-go': (el) => { closeModal(); setRoute(el.dataset.view); },
@@ -4345,29 +4397,6 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
           <div class="modal-actions"><button type="button" class="btn" data-action="modal-close">Cancel</button><button class="btn btn-primary" type="submit">Save</button></div>
         </form>`);
     },
-    'staff-toggle-role': async (el) => {
-      // Cycles plain staff logins through admin/manager/staff. Never touches
-      // a 'labour' role here — those are only created via the Labour page
-      // and stay tied to their labourId.
-      const s = state.staff.find((x) => x.id === el.dataset.id);
-      if (!s) { toast('Account not found. Refresh and try again.', 'err'); return; }
-      if (s.role === 'labour') { toast('This is a labour portal login — manage it from the Labour page.', 'err'); return; }
-      if (s.role === 'driver') { toast('This is a driver portal login — manage it from the Drivers page.', 'err'); return; }
-      const next = s.role === 'admin' ? 'manager' : s.role === 'manager' ? 'staff' : 'admin';
-      await state.db.doc('staff/' + el.dataset.id).update({ role: next });
-      await loadStaff();
-      if (state.session && state.session.staffId === s.id) {
-        const updatedSelf = state.staff.find((x) => x.id === s.id);
-        if (updatedSelf && updatedSelf.active !== false) {
-          state.session = sessionFromStaff(updatedSelf);
-          if (!state.remoteDb) persistSession(state.session);
-          if (!roleAllowed(state.route, state.session.role)) state.route = homeRoute(state.session.role);
-          history.replaceState(null, '', location.pathname + location.search + '#' + state.route);
-          renderSidebar();
-        }
-      }
-      renderView();
-    },
     'staff-deactivate': async (el) => {
       await state.db.doc('staff/' + el.dataset.id).update({ active: false });
       await loadStaff();
@@ -4420,7 +4449,6 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     },
 
     // Mobile nav
-    'open-drawer': () => { document.getElementById('mobilenav').classList.remove('hidden'); document.getElementById('drawer-backdrop').classList.remove('hidden'); },
     'entry-date-today': () => { state.entryDate = todayStr(); loadEntryRowsForDate(); renderView(); },
   };
 
@@ -4441,14 +4469,15 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       if (!files.length) return;
       if (!routeUi.photo) routeUi.photo = { target: 'new', items: [] };
       if (routeUi.photo.items.length + files.length > 150) { toast('Up to 150 photos at a time.', 'err'); return; }
+      if (files.length > 1) toast(`${files.length} photos added — reading them now.`, 'ok');
       for (const f of files) {
         try {
           const { tiles, thumb } = await photoTiles(f);
           routeUi.photo.items.push({ id: 'p' + genId(), tiles, thumb, status: 'queued', labels: [] });
+          runPhotoQueue(); photoRender();
         } catch (e) { toast(`${f.name || 'Photo'}: ${e.message}`, 'err'); }
       }
-      if (files.length > 1) toast(`${files.length} photos added — reading them now.`, 'ok');
-      renderView(); runPhotoQueue();
+      renderView();
     },
     'route-photo-edit': (el) => {
       const it = routeUi.photo && routeUi.photo.items.find((x) => x.id === el.dataset.item); if (!it) return;
@@ -5157,8 +5186,6 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     // backward-compat fallback for labour saved before the single-rate model
     return Number(labour.deliveryPayRate) || Number(labour.warehousePayRate) || 0;
   }
-  function labourRateForType(company) { return companyBillRate(company); }
-  function labourPayRateForType(labour) { return labourPayRate(labour); }
 
   // =================================================================
   // Rate Cards — per-company, per-labour-category, effective-dated rate
@@ -5812,9 +5839,6 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     const pending = state.labourLogs.filter((g) => g.status === 'Pending').length;
     if (!pending) return '';
     return `<li><span><strong class="tnum">${pending}</strong> labour log${pending === 1 ? '' : 's'} to approve</span><button class="btn btn-sm" data-action="nav" data-route="labour-logs">Review</button></li>`;
-  }
-  function todaysMatchedShift(labourId, today) {
-    return state.labourShifts.find((s) => s.labourId === labourId && s.date === today && s.published);
   }
   function fmtTimeHuman(iso) {
     if (!iso) return '';
@@ -6561,9 +6585,6 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     if (status === 'Rejected') return '<span class="pill pill-cancelled">Rejected</span>';
     if (status === 'InProgress') return '<span class="pill pill-other">In progress</span>';
     return '<span class="pill pill-pending">Pending</span>';
-  }
-  function todaysDriverAssignment(driverId, dateStr) {
-    return state.driverAssignments.find((a) => a.driverId === driverId && a.date === dateStr) || null;
   }
   // Assigned-for-today drivers who haven't even started work yet — flagged on
   // the Dashboard and the Driver Submissions page so a no-show is caught the
