@@ -16,6 +16,7 @@ type Account = {
   driverId?: string | null;
   labourId?: string | null;
   companyId?: string | null;
+  pages?: string[] | null;
 };
 
 type StoredDoc = { collection: string; doc_id: string; data_json: string; created_at: string; updated_at: string };
@@ -64,7 +65,41 @@ function getCookie(request: Request, name: string) {
   return (request.headers.get('cookie') || '').split(';').map((part) => part.trim()).find((part) => part.startsWith(`${name}=`))?.slice(name.length + 1);
 }
 function safeAccount(id: string, data: any): Account {
-  return { id, name: String(data.name || 'User'), mobile: String(data.mobile || ''), role: String(data.role || 'staff').trim().toLowerCase(), active: data.active !== false && data.active !== 0, driverId: data.driverId || null, labourId: data.labourId || null, companyId: data.companyId || null };
+  return { id, name: String(data.name || 'User'), mobile: String(data.mobile || ''), role: String(data.role || 'staff').trim().toLowerCase(), active: data.active !== false && data.active !== 0, driverId: data.driverId || null, labourId: data.labourId || null, companyId: data.companyId || null, pages: Array.isArray(data.pages) ? data.pages.map(String) : null };
+}
+// ---- Staff page access --------------------------------------------------
+// Admin chooses which pages each Staff login can use (Settings -> Access).
+// The server only lets Staff read and change the data those pages need.
+const STAFF_PAGES = ['dashboard', 'entry', 'records', 'drivers', 'companies', 'labour', 'rate-cards', 'labour-shifts', 'summary', 'payments',
+  'driver-submissions', 'delivery-blocks', 'driver-assignments', 'driver-performance', 'routes', 'labour-logs', 'invoices', 'export'];
+const STAFF_DEFAULT_PAGES = ['dashboard', 'entry', 'records'];
+// Lookup lists every Staff page needs to show names (no bank or pay details).
+const STAFF_BASE_READ = ['settings', 'drivers', 'companies', 'days', 'rateCards', 'deliveryBlocks'];
+const STAFF_PAGE_READ: Record<string, string[]> = {
+  dashboard: ['driverSubmissions', 'labourLogs', 'labourShifts', 'labour'], entry: [], records: [], drivers: [], companies: ['labour'],
+  labour: ['labour', 'labourShifts'], 'rate-cards': [], 'labour-shifts': ['labourShifts', 'labour'], summary: ['driverSubmissions'], payments: [],
+  'driver-submissions': ['driverSubmissions', 'driverAssignments'], 'delivery-blocks': [], 'driver-assignments': ['driverAssignments'],
+  'driver-performance': ['driverSubmissions', 'driverAssignments'], routes: ['routes', 'routePhotos'], 'labour-logs': ['labourLogs', 'labour', 'labourShifts'],
+  invoices: ['invoices', 'labourShifts', 'labourLogs', 'labour'], export: ['labourShifts', 'labourLogs', 'labour', 'driverSubmissions'],
+};
+const STAFF_PAGE_WRITE: Record<string, string[]> = {
+  entry: ['days'], records: ['days'], drivers: ['drivers'], companies: ['companies'], labour: ['labour', 'labourShifts'], 'rate-cards': ['rateCards'],
+  'labour-shifts': ['labourShifts'], summary: ['days', 'driverSubmissions'], payments: ['days', 'drivers'], 'driver-submissions': ['driverSubmissions', 'days'],
+  'delivery-blocks': ['deliveryBlocks'], 'driver-assignments': ['driverAssignments'], routes: ['routes', 'routePhotos'], 'labour-logs': ['labourLogs'], invoices: ['invoices'],
+};
+// Numbering counters Staff may bump in Settings (payment/labour/invoice refs).
+const STAFF_SETTINGS_KEYS = ['nextPaymentNumber', 'nextLabourNumber', 'nextInvoiceNumber'];
+const BANK_SETTINGS = /bank|bsb|account|abn|tfn/i;
+function staffPages(account: Account) {
+  const list = account.pages ? account.pages.filter((p) => STAFF_PAGES.includes(p)) : STAFF_DEFAULT_PAGES;
+  return list;
+}
+function staffCanRead(account: Account, collection: string) {
+  if (STAFF_BASE_READ.includes(collection)) return true;
+  return staffPages(account).some((p) => (STAFF_PAGE_READ[p] || []).includes(collection) || (STAFF_PAGE_WRITE[p] || []).includes(collection));
+}
+function staffCanWrite(account: Account, collection: string) {
+  return staffPages(account).some((p) => (STAFF_PAGE_WRITE[p] || []).includes(collection));
 }
 async function readDoc(env: Env, collection: string, id: string) {
   const row = await env.DB.prepare('SELECT data_json FROM app_documents WHERE collection=? AND doc_id=?').bind(collection, id).first<{ data_json: string }>();
@@ -254,7 +289,7 @@ async function currentAccount(request: Request, env: Env): Promise<Account | nul
   if (!profile || profile.active === false || profile.active === 0) return null;
   return safeAccount(session.staff_id, profile);
 }
-function accountResponse(account: Account) { return { id: account.id, name: account.name, mobile: account.mobile, role: account.role, active: account.active, driverId: account.driverId, labourId: account.labourId, companyId: account.companyId }; }
+function accountResponse(account: Account) { return { id: account.id, name: account.name, mobile: account.mobile, role: account.role, active: account.active, driverId: account.driverId, labourId: account.labourId, companyId: account.companyId, pages: account.role === 'staff' ? staffPages(account) : null }; }
 async function createSession(request: Request, env: Env, account: Account) {
   const token = `${uid()}${uid()}`;
   const days = Math.min(30, Math.max(1, Number(env.SESSION_DAYS) || 7));
@@ -273,7 +308,7 @@ function visibleToAccount(collection: string, row: { id: string; data: any }, ac
   if (['admin', 'manager', 'staff'].includes(account.role)) {
     if (collection === 'staff' && account.role !== 'admin' && row.id !== account.id) return false;
     if (collection === 'auditLog' && account.role !== 'admin') return false;
-    if (collection === 'invoices' && account.role === 'staff') return false;
+    if (account.role === 'staff') return staffCanRead(account, collection);
     return true;
   }
   if (collection === 'staff') return row.id === account.id;
@@ -308,7 +343,14 @@ function visibleToAccount(collection: string, row: { id: string; data: any }, ac
 // ABN or rate details).
 const PUBLIC_SETTINGS = ['businessName', 'failureReasons', 'routeDepotAddress'];
 function publicView(collection: string, data: any, account: Account) {
-  if (collection !== 'settings' || ['admin', 'manager', 'staff'].includes(account.role)) return data;
+  if (collection === 'settings' && account.role === 'staff') {
+    // Staff never see bank/ABN details unless they look after invoices.
+    if (staffPages(account).includes('invoices')) return data;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(data || {})) if (!BANK_SETTINGS.test(k)) out[k] = v;
+    return out;
+  }
+  if (collection !== 'settings' || ['admin', 'manager'].includes(account.role)) return data;
   const out: Record<string, unknown> = {};
   for (const k of PUBLIC_SETTINGS) if (data && k in data) out[k] = data[k];
   return out;
@@ -320,7 +362,11 @@ function canWrite(account: Account, collection: string, method: string) {
 
   if (role === 'admin') return true;
   if (role === 'manager') return !['staff', 'auditlog'].includes(target);
-  if (role === 'staff') return !['staff', 'auditlog', 'settings'].includes(target);
+  if (role === 'staff') {
+    if (target === 'settings') return ['PUT', 'PATCH'].includes(verb); // numbering counters only, see below
+    const name = Array.from(COLLECTIONS).find((c) => c.toLowerCase() === target) || '';
+    return !['staff', 'auditLog'].includes(name) && staffCanWrite(account, name);
+  }
   // Driver/Labour updates are permitted only for their own records; record
   // ownership is checked in the update route below.
   if (role === 'driver') return ['driversubmissions', 'routes', 'routephotos'].includes(target) && ['POST', 'PATCH', 'PUT'].includes(verb);
@@ -608,7 +654,14 @@ async function api(request: Request, env: Env): Promise<Response> {
       return fail('You do not have permission to update this record.', 403);
     }
     if (collection === 'staff' && account.role !== 'admin') return fail('Only Admin can update accounts.', 403);
-    const body = await jsonBody(request);
+    let body = await jsonBody(request);
+    if (account.role === 'staff' && collection === 'settings') {
+      // Keep everything as it is; only the numbering counters can move.
+      const existing = (await readDoc(env, 'settings', id)) || {};
+      const next: Record<string, unknown> = { ...existing };
+      for (const k of STAFF_SETTINGS_KEYS) if (body && Number.isFinite(Number(body[k])) && Number(body[k]) >= Number(existing[k] || 0)) next[k] = Number(body[k]);
+      body = next;
+    }
     if (String(account.role).trim().toLowerCase() === 'driver' && ['driverSubmissions', 'routes', 'routePhotos'].includes(collection)) {
       const existing = await readDoc(env, collection, id);
       if (!existing || existing.driverId !== account.driverId) return fail('Record does not belong to this Driver account.', 403);

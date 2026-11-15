@@ -159,6 +159,7 @@
       role: VALID_ROLES.has(String(staffMember.role || '').trim().toLowerCase()) ? String(staffMember.role).trim().toLowerCase() : 'staff',
       driverId: staffMember.driverId || null,
       labourId: staffMember.labourId || null,
+      pages: Array.isArray(staffMember.pages) ? staffMember.pages.slice() : null,
     };
   }
 
@@ -557,10 +558,25 @@
   // hash navigation (renderView), so a role can never reach a page by typing
   // a hash even though the link was hidden for them. This is still UI-level
   // only (no server-side rule enforcement is possible on this platform).
+  // Pages Admin can give a Staff login (Settings -> Access). Staff without a
+  // saved list get the starter set. The server enforces the same list.
+  const STAFF_PAGES = ['dashboard', 'entry', 'records', 'drivers', 'companies', 'labour', 'rate-cards', 'labour-shifts', 'summary', 'payments',
+    'driver-submissions', 'delivery-blocks', 'driver-assignments', 'driver-performance', 'routes', 'labour-logs', 'invoices', 'export'];
+  const STAFF_DEFAULT_PAGES = ['dashboard', 'entry', 'records'];
+  function staffPageList(pages) {
+    return Array.isArray(pages) ? pages.filter((p) => STAFF_PAGES.includes(p)) : STAFF_DEFAULT_PAGES.slice();
+  }
   function roleAllowed(route, role) {
     const nav = NAV.find((n) => n.id === route);
     if (!nav || !nav.roles) return true;
+    if (role === 'staff') return staffPageList(state.session && state.session.pages).includes(route);
     return nav.roles.includes(role);
+  }
+  function homeRoute(role) {
+    if (role === 'driver') return 'driver-submit';
+    if (role === 'labour') return 'labour-log';
+    const first = NAV.find((n) => VIEWS[n.id] && roleAllowed(n.id, role));
+    return first ? first.id : 'dashboard';
   }
 
   function navHtml() {
@@ -1690,11 +1706,11 @@
       <tr>
         <td>${esc(st.name)}</td>
         <td>${esc(st.mobile || '—')}</td>
-        <td>${esc(st.role)}</td>
+        <td>${esc(st.role)}${st.role === 'staff' ? `<div class="helptext">${staffPageList(st.pages).map((id) => esc((NAV.find((n) => n.id === id) || {}).label || id)).join(', ') || 'No pages'}</div>` : ''}</td>
         <td>${st.active !== false ? '<span class="pill pill-paid">Active</span>' : '<span class="pill pill-cancelled">Inactive</span>'}</td>
         <td>
           <button class="btn btn-sm" data-action="staff-reset-pin" data-id="${st.id}">Reset PIN</button>
-          ${st.role === 'labour' || st.role === 'driver' ? '' : `<button class="btn btn-sm" data-action="staff-toggle-role" data-id="${st.id}">Cycle role</button>`}
+          ${st.role === 'labour' || st.role === 'driver' ? '' : `<button class="btn btn-sm" data-action="staff-access" data-id="${st.id}">Role &amp; access</button>`}
           ${st.active !== false ? `<button class="btn btn-sm btn-danger" data-action="staff-deactivate" data-id="${st.id}">Deactivate</button>` : `<button class="btn btn-sm" data-action="staff-reactivate" data-id="${st.id}">Reactivate</button>`}
           ${isAdmin() && (!state.session || st.id !== state.session.staffId) ? `<button class="btn btn-sm btn-danger" data-action="staff-delete-account" data-id="${st.id}">Delete login</button>` : ''}
         </td>
@@ -3653,7 +3669,7 @@
   function renderView() {
     let route = VIEWS[state.route] ? state.route : 'dashboard';
     const role = state.session ? state.session.role : null;
-    if (!roleAllowed(route, role)) { route = role === 'driver' ? 'driver-submit' : role === 'labour' ? 'labour-log' : 'dashboard'; }
+    if (!roleAllowed(route, role)) { route = homeRoute(role); }
     state.route = route;
     const fab = document.getElementById('aiFab'); if (fab) fab.hidden = !state.session;
     document.getElementById('content').innerHTML = VIEWS[route]();
@@ -4314,6 +4330,21 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;"><button type="button" class="btn" data-action="modal-close">Cancel</button><button type="submit" class="btn btn-primary">Save</button></div>
       </form>
     `),
+    'staff-access': (el) => {
+      const s = state.staff.find((x) => x.id === el.dataset.id); if (!s) return;
+      const pages = staffPageList(s.pages);
+      openModal(`
+        <div class="modal-head"><h3>Role &amp; access — ${esc(s.name)}</h3><button class="modal-close" data-action="modal-close" aria-label="Close">×</button></div>
+        <form data-onsubmit="staff-access-save" data-id="${s.id}" class="access-form">
+          <div class="field"><label class="field-label">Role</label>
+            ${choiceGroup('role', ['staff', 'manager', 'admin'], s.role, ['Staff', 'Manager', 'Admin'])}
+            <p class="helptext">Admin: everything. Manager: everything except Settings and logins. Staff: only the pages you tick below.</p></div>
+          <div class="field access-pages"><label class="field-label">Pages this Staff login can use</label>
+            <div class="access-grid">${STAFF_PAGES.map((id) => { const n = NAV.find((x) => x.id === id); return `<label class="check-row"><input type="checkbox" name="pages" value="${id}" ${pages.includes(id) ? 'checked' : ''}><span>${esc(n ? n.label : id)}</span></label>`; }).join('')}</div>
+            <p class="helptext">Bank and ABN details stay hidden unless Invoices is ticked. Settings and logins are Admin only.</p></div>
+          <div class="modal-actions"><button type="button" class="btn" data-action="modal-close">Cancel</button><button class="btn btn-primary" type="submit">Save</button></div>
+        </form>`);
+    },
     'staff-toggle-role': async (el) => {
       // Cycles plain staff logins through admin/manager/staff. Never touches
       // a 'labour' role here — those are only created via the Labour page
@@ -4330,7 +4361,7 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         if (updatedSelf && updatedSelf.active !== false) {
           state.session = sessionFromStaff(updatedSelf);
           if (!state.remoteDb) persistSession(state.session);
-          if (!roleAllowed(state.route, state.session.role)) state.route = 'dashboard';
+          if (!roleAllowed(state.route, state.session.role)) state.route = homeRoute(state.session.role);
           history.replaceState(null, '', location.pathname + location.search + '#' + state.route);
           renderSidebar();
         }
@@ -4497,6 +4528,28 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
   };
 
   const SUBMIT_HANDLERS = {
+    'staff-access-save': async (form) => {
+      const s = state.staff.find((x) => x.id === form.dataset.id); if (!s) return;
+      const fd = new FormData(form);
+      const role = String(fd.get('role') || s.role);
+      const pages = fd.getAll('pages').map(String).filter((p) => STAFF_PAGES.includes(p));
+      if (role === 'staff' && !pages.length) { toast('Tick at least one page for this Staff login.', 'err'); return; }
+      if (state.session && s.id === state.session.staffId && role !== 'admin') {
+        const ok = await confirmDialog('This is your own login. You will lose Admin access. Continue?', { okLabel: 'Change my role', danger: true });
+        if (!ok) return;
+      }
+      try { await state.db.doc('staff/' + s.id).update({ role, pages }); }
+      catch (e) { toast(e.message || 'Could not save.', 'err'); return; }
+      await loadStaff(); closeModal();
+      if (state.session && state.session.staffId === s.id) {
+        const me = state.staff.find((x) => x.id === s.id);
+        if (me) { state.session = sessionFromStaff(me); if (!state.remoteDb) persistSession(state.session); }
+        if (!roleAllowed(state.route, state.session.role)) state.route = homeRoute(state.session.role);
+        renderSidebar();
+      }
+      toast(`${s.name}: ${role === 'staff' ? pages.length + ' page' + (pages.length === 1 ? '' : 's') : role}.`, 'ok');
+      renderView();
+    },
     'ai-help-send': async (form) => {
       const text = String(new FormData(form).get('text') || '').trim(); if (!text || aiHelp.busy) return;
       await aiHelpAsk(text);

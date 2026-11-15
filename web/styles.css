@@ -824,3 +824,6 @@ table.data tfoot td { background: var(--surface-2); border-top: 1px solid var(--
 .ai-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .ai-chat .ai-msg { white-space: pre-wrap; }
 #content { padding-bottom: 84px; }
+.access-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 4px 14px; margin: 6px 0 8px; }
+.access-grid .check-row { margin: 0; min-height: 40px; }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
