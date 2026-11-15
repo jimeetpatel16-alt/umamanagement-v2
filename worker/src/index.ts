@@ -119,6 +119,9 @@ async function readDoc(env: Env, collection: string, id: string) {
 }
 // ---- Route planner: reading parcel labels with AI ------------------------
 const LABEL_MODELS = ['@cf/meta/llama-4-scout-17b-16e-instruct', '@cf/google/gemma-3-12b-it'];
+// Second look for labels whose address couldn't be confirmed: a different
+// vision model (strong at reading text), then the others.
+const LABEL_MODELS_SECOND = ['@cf/mistralai/mistral-small-3.1-24b-instruct', '@cf/google/gemma-3-12b-it', '@cf/meta/llama-4-scout-17b-16e-instruct'];
 const LABEL_PROMPT = `You read Australian parcel deliveries from photos. The photo is EITHER a parcel label OR a screenshot of a courier app's delivery task list (often several tasks per screenshot, each with a stop number like "8-1", a tracking number like "AMZ0001682231", a name, a masked phone and an address).
 Return ONLY JSON, no other text, exactly in this shape:
 {"labels":[{"stop":"stop/sequence number as shown e.g. 8-1","tracking":"tracking / consignment / barcode number","name":"recipient name","phone":"phone number exactly as shown","place":"business or building name if any, e.g. Caddens Medical Centre","address":"street address only, with unit/shop, e.g. Shop 14, 68 O'Connell Street","suburb":"","state":"NSW|VIC|QLD|WA|SA|TAS|ACT|NT or empty","postcode":"4 digits or empty","notes":"delivery instructions if any","confidence":"high|medium|low"}]}
@@ -128,6 +131,11 @@ Rules:
 - Words can be broken across lines (e.g. "sh opping", "stre et."): join them back ("shopping", "street").
 - Put a business/building/centre name in "place", NOT in "address". "address" must start with the unit/shop or street number.
 - Copy text as printed; never invent missing parts (leave them empty).
+- Read numbers digit by digit (house, unit, postcode, stop). Watch for look-alikes: 1/7, 3/8, 5/6/8, 0/8/9, l/1, O/0, rn/m. Postcodes are exactly 4 digits.
+- "address" = unit/shop (if any) + house number + street name + street type, e.g. "2/14 Smith Street". Suburb, state and postcode go in their own fields, never in "address".
+- The suburb is the place name on the line with the state/postcode (e.g. "BLAXLAND NSW 2774" -> suburb Blaxland, state NSW, postcode 2774).
+- Australian suburbs are real places: spell them correctly when the print is clear; if unsure, copy exactly and set confidence "low".
+- Never merge two deliveries into one, and never split one delivery into two.
 - If nothing readable, return {"labels":[]}.`;
 function aiText(out: any): string {
   if (out == null) return '';
@@ -173,26 +181,81 @@ Rules:
 - Put business/centre names in "place", not in "address".
 - If the message is not about an address, reply briefly and return "candidates":[].`;
 // ---- General in-app AI helper ----------------------------------------------
-const HELP_MODELS = ['@cf/meta/llama-3.3-70b-instruct-fp8-fast', '@cf/meta/llama-3.1-8b-instruct-fast'];
+const HELP_MODELS = ['@cf/meta/llama-3.3-70b-instruct-fp8-fast', '@cf/meta/llama-4-scout-17b-16e-instruct', '@cf/meta/llama-3.1-8b-instruct-fast'];
+// Things the assistant can do for the user. The app only offers the ones the
+// user's role can use, and every one is shown as a button the user must tap.
+const HELP_ACTIONS = ['open_page', 'add_stop', 'mark_stop', 'reoptimise', 'fix_location', 'add_driver', 'clock_in', 'clock_out', 'start_work', 'finish_work'];
 const HELP_PROMPT = `You are the built-in assistant of "UMA Management", a web app an Australian delivery/labour business uses every day.
-Pages: Dashboard (today's totals), Daily Entry (enter each driver's deliveries per company), Records (past entries), Drivers, Companies (delivery companies and rates; labour sites and their clock-in locations), Labour (workers), Rate Cards, Labour Shifts, Driver Summary (pay per driver), Payments, Driver Submissions (drivers' own daily reports to approve), Delivery Blocks, Driver Assignments, Driver Performance, Routes (drivers' planned routes), Labour Logs (clock-in/out), Invoices (create and download PDF), Excel Export, Settings (business details, failure reasons, depot address).
-Drivers see: Route (upload the run sheet Excel or label photos -> "Plan my route"; tap a stop to Edit; "Fix with AI" or "Place pin" fixes a wrong location; Delivered/Failed per stop; Re-optimise), Today's Deliveries (submit counts), My Submissions.
-Labour see: Today (clock in/out, must be at the company's site), My Shifts, My Logs.
+Pages: Dashboard (today's totals), Daily Entry (enter each driver's deliveries per company), Records (past entries), Drivers, Companies (delivery companies and rates; labour sites and their clock-in locations), Labour (workers), Rate Cards, Labour Shifts, Driver Summary (pay per driver), Payments, Driver Submissions (drivers' daily reports to approve), Delivery Blocks, Driver Assignments, Driver Performance, Routes (drivers' planned routes), Labour Logs (clock-in/out), Invoices (create and download PDF), Excel Export, Settings (business details, failure reasons, depot address, logins and staff access).
+Drivers: Route (upload the run sheet Excel or label photos -> "Plan my route"; each stop has Delivered / Failed / Edit / Do next; "Fix with AI" or "Place pin" fixes a wrong location; Re-optimise), Today's Deliveries (Start work, then Finish work with delivered/failed counts), My Submissions.
+Labour: Today (Clock in / Clock out — must be at the company's site), My Shifts, My Logs.
 You help with anything: how to do something in the app, reading or summarising what is on the user's screen, totals and quick calculations, writing messages to customers or staff, and general questions.
-You get the text of the page the user is looking at. Only use it and what the user tells you; never invent records, numbers or names. If you don't know, say so and say where in the app to find it.
-Be short and practical: plain English, at most about 6 short lines or a short list. Use Australian spelling.
-Reply ONLY with JSON: {"reply":"your answer","go":"page id to open or empty","fixAddress":false}
-- "go": only when the user asks to go somewhere or it clearly helps; use one id from the allowed page list you are given.
-- "fixAddress": true only when the user wants to fix or correct a stop's location/address on their route.`;
-function parseHelpReply(text: string, allowed: string[]) {
+You are given the text of the page the user is looking at. Use only that and what the user says; never invent records, numbers, names or stop numbers. If something isn't on the screen, say where in the app to find it.
+Be short and practical: plain English, at most about 6 short lines or a short list. Australian spelling.
+
+You can also DO things for the user. Add them to "actions" (only ones in the allowed list you are given) and say in "reply" what will happen; the user taps a button to confirm each one.
+- {"do":"open_page","page":"<page id>"}
+- {"do":"add_stop","address":"full address","name":"","phone":"","notes":""}
+- {"do":"mark_stop","stop":<stop number as shown on screen>,"result":"delivered"|"failed","reason":"why it failed, if failed"}
+- {"do":"reoptimise"}  (re-order the route for the shortest drive)
+- {"do":"fix_location","stop":<stop number or 0 if unknown>}  (when a stop's pin/address is wrong or not found)
+- {"do":"add_driver","name":"","vehicle":"Car|Van|Truck|Bike"}
+- {"do":"clock_in"} / {"do":"clock_out"}  (labour)
+- {"do":"start_work"} / {"do":"finish_work","delivered":<number>,"failed":<number>}  (drivers)
+Only add an action when the user asks for it to be done (e.g. "mark 12 delivered", "add a stop", "clock me in"). For questions, just answer.
+
+Reply ONLY with JSON: {"reply":"your answer","actions":[]}`;
+const HELP_SCHEMA = {
+  type: 'object',
+  properties: {
+    reply: { type: 'string' },
+    actions: { type: 'array', items: { type: 'object', properties: {
+      do: { type: 'string' }, page: { type: 'string' }, address: { type: 'string' }, name: { type: 'string' }, phone: { type: 'string' }, notes: { type: 'string' },
+      stop: { type: 'number' }, result: { type: 'string' }, reason: { type: 'string' }, vehicle: { type: 'string' }, delivered: { type: 'number' }, failed: { type: 'number' },
+    }, required: ['do'] } },
+  },
+  required: ['reply'],
+};
+function looseJson(text: string): any {
   const start = text.indexOf('{'), end = text.lastIndexOf('}');
-  let data: any = null;
-  if (start >= 0 && end > start) { try { data = JSON.parse(text.slice(start, end + 1)); } catch { data = null; } }
-  if (!data) { const t = text.trim(); return t ? { reply: t.slice(0, 2500), go: '', fixAddress: false } : null; }
-  const reply = String(data.reply ?? '').trim().slice(0, 2500);
+  if (start < 0 || end <= start) return null;
+  const raw = text.slice(start, end + 1);
+  try { return JSON.parse(raw); } catch { /* try to repair */ }
+  try { return JSON.parse(raw.replace(/[\u0000-\u001f]+/g, (m) => m.replace(/\n/g, '\\n').replace(/\r/g, '').replace(/\t/g, ' '))); } catch { /* fall through */ }
+  const m = raw.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/s);
+  return m ? { reply: m[1].replace(/\\n/g, '\n').replace(/\\"/g, '"') } : null;
+}
+function cleanAction(a: any, allowedPages: string[], allowedActions: string[]) {
+  if (!a || typeof a !== 'object') return null;
+  const kind = String(a.do || a.action || a.type || '').trim().toLowerCase();
+  if (!HELP_ACTIONS.includes(kind) || !allowedActions.includes(kind)) return null;
+  const str = (v: unknown, n = 200) => String(v ?? '').trim().slice(0, n);
+  const num = (v: unknown) => (Number.isFinite(Number(v)) ? Math.max(0, Math.round(Number(v))) : 0);
+  switch (kind) {
+    case 'open_page': return allowedPages.includes(str(a.page, 40)) ? { do: kind, page: str(a.page, 40) } : null;
+    case 'add_stop': return str(a.address) ? { do: kind, address: str(a.address), name: str(a.name, 80), phone: str(a.phone, 30), notes: str(a.notes) } : null;
+    case 'mark_stop': return num(a.stop) ? { do: kind, stop: num(a.stop), result: /fail/i.test(str(a.result, 20)) ? 'failed' : 'delivered', reason: str(a.reason, 120) } : null;
+    case 'fix_location': return { do: kind, stop: num(a.stop) };
+    case 'add_driver': return str(a.name, 80) ? { do: kind, name: str(a.name, 80), vehicle: str(a.vehicle, 20) } : null;
+    case 'finish_work': return { do: kind, delivered: num(a.delivered), failed: num(a.failed) };
+    default: return { do: kind };
+  }
+}
+function parseHelpReply(text: string, allowedPages: string[], allowedActions: string[]) {
+  const data = looseJson(text);
+  if (!data) {
+    const t = text.trim();
+    if (!t || t.startsWith('{')) return null;
+    return { reply: t.slice(0, 2500), actions: [] };
+  }
+  const reply = String(data.reply ?? data.answer ?? '').trim().slice(0, 2500);
   if (!reply) return null;
-  const go = allowed.includes(String(data.go || '')) ? String(data.go) : '';
-  return { reply, go, fixAddress: data.fixAddress === true };
+  const list: any[] = Array.isArray(data.actions) ? data.actions.slice(0, 4) : [];
+  // Older reply shape.
+  if (data.go) list.push({ do: 'open_page', page: data.go });
+  if (data.fixAddress === true) list.push({ do: 'fix_location', stop: 0 });
+  const actions = list.map((a) => cleanAction(a, allowedPages, allowedActions)).filter(Boolean);
+  return { reply, actions };
 }
 function parseAddressReply(text: string) {
   const start = text.indexOf('{'), end = text.lastIndexOf('}');
@@ -224,7 +287,7 @@ async function geocodeOne(env: Env, address: string): Promise<GeoResult> {
   const key = await geoKey(address);
   const cached = await readDoc(env, 'geocache', key);
   if (cached && Number.isFinite(cached.lat) && Number.isFinite(cached.lng)) {
-    return { lat: cached.lat, lng: cached.lng, formatted: cached.formatted || address, precision: cached.precision || '', partial: !!cached.partial };
+    return { lat: cached.lat, lng: cached.lng, formatted: cached.formatted || address, precision: cached.precision || '', partial: !!cached.partial, source: cached.source || '', retried: !!cached.retried } as GeoResult;
   }
   // Free mode (default): the phone looks the address up on OpenStreetMap and
   // sends the answer back to /api/route/geocache. Google is used only if a
@@ -507,7 +570,9 @@ async function api(request: Request, env: Env): Promise<Response> {
       if (!item?.replace && await readDoc(env, 'geocache', key)) continue;
       await saveDocument(env, 'geocache', key, {
         lat, lng, formatted: String(item?.formatted || address).slice(0, 300), precision: String(item?.precision || '').slice(0, 40),
-        partial: !!item?.partial, query: address, source: item?.replace ? 'confirmed' : 'osm', savedBy: account.id,
+        partial: !!item?.partial, query: address, savedBy: account.id, retried: !!item?.retried,
+        // 'confirmed' = a person picked or pinned it; 'nsw' = official NSW address list.
+        source: item?.confirmed || (item?.replace && !item?.auto) ? 'confirmed' : item?.source === 'nsw' ? 'nsw' : 'osm',
       }, 'set');
       saved++;
     }
@@ -520,6 +585,7 @@ async function api(request: Request, env: Env): Promise<Response> {
     if (!env.AI) return fail('Photo reading is not switched on yet (Workers AI binding missing).', 503);
     const body = await jsonBody(request);
     const image = String(body?.image || '');
+    const models = Number(body?.pass) === 2 ? LABEL_MODELS_SECOND : LABEL_MODELS;
     if (!/^data:image\/(jpeg|png|webp);base64,/.test(image)) return fail('Send a JPEG, PNG or WebP photo.');
     if (image.length > 2_000_000) return fail('Photo is too large. Try again with a smaller photo.');
     const input = {
@@ -533,7 +599,7 @@ async function api(request: Request, env: Env): Promise<Response> {
       max_tokens: 1500, temperature: 0,
     };
     let lastError = '';
-    for (const model of LABEL_MODELS) {
+    for (const model of models) {
       try {
         const labels = parseLabels(aiText(await env.AI.run(model, input)));
         if (labels.length) return json({ labels, model });
@@ -556,23 +622,29 @@ async function api(request: Request, env: Env): Promise<Response> {
     const chat = msgs.map((m: any) => ({ role: m?.role === 'assistant' ? 'assistant' : 'user', content: String(m?.content || '').slice(0, 2000) })).filter((m) => m.content);
     if (!chat.length || chat[chat.length - 1].role !== 'user') return fail('Type a question.');
     const pages: string[] = (Array.isArray(body?.pages) ? body.pages : []).map((x: unknown) => String(x || '').slice(0, 40)).slice(0, 40);
+    const can: string[] = (Array.isArray(body?.can) ? body.can : []).map((x: unknown) => String(x || '')).filter((x: string) => HELP_ACTIONS.includes(x));
     const pageName = String(body?.page?.name || '').slice(0, 60);
-    const pageText = String(body?.page?.text || '').replace(/\n{3,}/g, '\n\n').slice(0, 7000);
+    const pageText = String(body?.page?.text || '').replace(/\n{3,}/g, '\n\n').slice(0, 6000);
     const today = new Date().toLocaleDateString('en-AU', { timeZone: 'Australia/Sydney', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
-    const context = `User role: ${account.role}. Today: ${today}.\nAllowed page ids: ${pages.join(', ') || 'none'}.\nThe user is on the page "${pageName}". Text on their screen:\n"""\n${pageText}\n"""`;
-    const input = { messages: [{ role: 'system', content: HELP_PROMPT }, { role: 'system', content: context }, ...chat], max_tokens: 900, temperature: 0.3 };
+    const context = `User: ${account.name} (role: ${account.role}). Today: ${today}.\nAllowed page ids: ${pages.join(', ') || 'none'}.\nAllowed actions right now: ${can.join(', ') || 'none (just answer)'}.\nThe user is on the page "${pageName}". Text on their screen:\n"""\n${pageText}\n"""`;
+    const base = { messages: [{ role: 'system', content: HELP_PROMPT }, { role: 'system', content: context }, ...chat], max_tokens: 900, temperature: 0.2 };
     let last = '';
     for (const model of HELP_MODELS) {
-      try {
-        const parsed = parseHelpReply(aiText(await env.AI.run(model, input)), pages);
-        if (parsed) return json(parsed);
-        last = 'unparsed';
-      } catch (e: any) {
-        last = String(e?.message || e);
-        if (/limit|quota|neuron|4006/i.test(last)) return fail('Today\'s free AI allowance is used up. Try again tomorrow.', 429);
+      for (const structured of [true, false]) {
+        try {
+          const input = structured ? { ...base, response_format: { type: 'json_schema', json_schema: HELP_SCHEMA } } : base;
+          const parsed = parseHelpReply(aiText(await env.AI.run(model as any, input as any)), pages, can);
+          if (parsed) return json({ ...parsed, model });
+          last = 'unparsed';
+        } catch (e: any) {
+          last = String(e?.message || e);
+          console.warn('ai chat failed', model, structured, last);
+          if (/limit|quota|neuron|4006|daily/i.test(last)) return fail('Today\'s free AI allowance is used up (it resets at 11am Sydney time). The rest of the app still works.', 429);
+          if (!structured) break; // try the next model
+        }
       }
     }
-    return fail('The AI helper could not answer just now. Please try again.', 502);
+    return fail('The AI helper could not answer just now. Please try again in a moment.', 502);
   }
   if (path === '/api/route/ai-address' && method === 'POST') {
     const account = await currentAccount(request, env);

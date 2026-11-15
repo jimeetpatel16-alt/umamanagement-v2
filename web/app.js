@@ -2749,6 +2749,55 @@
   // Tries, in order: the address as given (unit removed), without a letter on
   // the house number (50A → 50), a second free search (Photon), and finally
   // the street itself — returned as an approximate pin rather than "not found".
+  // ---- NSW Government address list (free, official, every NSW address) ----
+  // NSW Spatial Services "Address Location" service: exact house points,
+  // accepts Rd/St short forms and fixes a wrong suburb from the postcode.
+  const NSW_ADDRESS_URL = 'https://maps.six.nsw.gov.au/services/public/Address_Location';
+  const STREET_TYPE_WORDS = new Set(['road', 'rd', 'street', 'st', 'avenue', 'ave', 'av', 'drive', 'dr', 'drv', 'crescent', 'cres', 'cr', 'place', 'pl', 'court', 'ct', 'parade', 'pde', 'highway', 'hwy', 'lane', 'ln', 'la', 'close', 'cl', 'circuit', 'cct', 'cir', 'boulevard', 'blvd', 'bvd', 'terrace', 'tce', 'way', 'wy', 'grove', 'gr', 'gv', 'square', 'sq', 'esplanade', 'esp', 'parkway', 'pwy', 'rise', 'mews', 'circle', 'crt', 'glade', 'gld', 'green', 'grn', 'loop', 'row', 'walk', 'wk', 'chase', 'ch', 'link', 'promenade', 'prom', 'track', 'trk', 'view', 'vw', 'vista', 'ridge', 'rdg', 'heights', 'hts', 'approach', 'app', 'access', 'gardens', 'gdns', 'retreat', 'outlook', 'pass', 'path', 'pathway', 'quay', 'reserve', 'entrance', 'concourse', 'cove', 'end', 'firetrail', 'gate', 'hill', 'mall', 'mead', 'nook', 'arcade', 'avenue', 'bend', 'brace', 'brae', 'break', 'broadway', 'causeway', 'centre', 'corso', 'crossing', 'dale', 'elbow', 'expressway', 'freeway', 'front', 'gap', 'glen', 'grange', 'haven', 'junction', 'key', 'knoll', 'lookout', 'meander', 'motorway', 'parklands', 'plaza', 'point', 'pocket', 'port', 'rest', 'ramble', 'run', 'serviceway', 'spur', 'strand', 'subway', 'tarn', 'turn', 'valley', 'vale', 'waters', 'wharf', 'wynd', 'yard']);
+  function isStreetType(w) { return STREET_TYPE_WORDS.has(String(w || '').toLowerCase().replace(/\./g, '')); }
+  function inNswArea(state, near) {
+    if (state && String(state).toUpperCase() !== 'NSW' && !/new south wales/i.test(state)) return false;
+    const p = near || geoArea;
+    if (p && (p.lng < 140.9 || p.lng > 153.7 || p.lat > -28.1 || p.lat < -37.6)) return false;
+    return true;
+  }
+  const nswCache = new Map();
+  let nswDownUntil = 0; // set when the NSW service can't be reached
+  const titleCase = (t) => String(t || '').toLowerCase().replace(/(^|[\s'-])([a-z])/g, (m, a, b) => a + b.toUpperCase());
+  async function nswLookup(num, letter, streetName, suburb, postcode) {
+    const words = String(streetName || '').replace(/[.,]/g, ' ').trim().split(/\s+/).filter(Boolean);
+    if (!num || !words.length || !(suburb || postcode)) return null;
+    let type = '';
+    if (words.length > 1 && isStreetType(words[words.length - 1])) type = words.pop();
+    const params = { houseNumber: String(num) + String(letter || ''), roadName: words.join(' ').toUpperCase(), roadType: type.toUpperCase(),
+      suburb: String(suburb || '').toUpperCase().trim(), postCode: String(postcode || '').trim(), projection: 'EPSG:4326' };
+    const key = new URLSearchParams(params).toString();
+    if (nswCache.has(key)) return nswCache.get(key);
+    let out = null;
+    try {
+      const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 8000);
+      const res = await fetch(NSW_ADDRESS_URL + '?' + key, { signal: ctl.signal });
+      clearTimeout(timer);
+      if (res.ok) {
+        const data = await res.json();
+        const r = data && data.addressResult; const a = r && r.addresses && r.addresses[0];
+        if (a && a.addressPoint && Number.isFinite(Number(a.addressPoint.centreY))) {
+          const how = (r.searchMethod && r.searchMethod.methodDescriptions) || [];
+          const closest = how.some((m) => /closest/i.test(m));
+          out = {
+            lat: Number(a.addressPoint.centreY), lng: Number(a.addressPoint.centreX),
+            formatted: `${a.houseNumberString} ${titleCase(a.roadName)} ${titleCase(a.roadType)}, ${titleCase(a.suburbName)} NSW ${a.postCode}`.replace(/\s+/g, ' '),
+            precision: closest ? 'estimated' : 'house', partial: closest, source: 'nsw',
+            estimate: closest ? `nearest numbered address (${a.houseNumberString})` : '',
+            suburb: titleCase(a.suburbName), postcode: String(a.postCode || ''),
+          };
+        }
+      } else { nswDownUntil = Date.now() + 60000; return null; }
+    } catch (e) { nswDownUntil = Date.now() + 60000; return null; }
+    if (nswCache.size > 500) nswCache.clear();
+    nswCache.set(key, out);
+    return out;
+  }
   async function osmLookup(address, parts, opts) {
     const fromParts = parts && parts.street;
     const { rest, unit } = splitUnit(fromParts ? parts.street : address);
@@ -2757,10 +2806,22 @@
       // Whole address in one box: pull a trailing "SUBURB NSW 2762" off for checks.
       const m = rest.match(/,\s*([A-Za-z][A-Za-z\s'-]+?)\s+(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\b\.?\s*(\d{4})?\s*$/i);
       if (m) Object.assign(area, { suburb: m[1].trim(), state: m[2].toUpperCase(), postcode: m[3] || '' });
+      else {
+        // "144 Old Bathurst Rd Blaxland NSW 2774" / "... Blaxland 2774" (no comma)
+        const w = rest.replace(/,/g, ' ').trim().split(/\s+/);
+        const pc = /^\d{4}$/.test(w[w.length - 1] || '') ? w.pop() : '';
+        const st = /^(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)$/i.test(w[w.length - 1] || '') ? w.pop().toUpperCase() : '';
+        const ti = w.findIndex((x, i) => i > 1 && isStreetType(x) && i < w.length - 1);
+        if (ti > 0 && (pc || st || w.length - ti - 1 <= 3)) {
+          Object.assign(area, { suburb: w.slice(ti + 1).join(' '), state: st, postcode: pc });
+          area.splitAt = w.slice(0, ti + 1).join(' ');
+        } else if (pc && !st) area.postcode = pc;
+      }
     }
     // oneBox: suburb/postcode came from the address text itself, not separate columns.
     const oneBox = !(fromParts && (parts.suburb || parts.postcode));
-    const streetPart = oneBox && area.suburb ? rest.split(',')[0].trim() : rest;
+    const streetPart = area.splitAt || (oneBox && area.suburb ? rest.split(',')[0].trim() : rest);
+    delete area.splitAt;
     const tail = [area.suburb, area.state, area.postcode].filter(Boolean).join(' ');
     const h = splitHouse(streetPart);
     const structured = (street) => {
@@ -2771,6 +2832,14 @@
       return p;
     };
     const canStructure = !!(area.suburb || area.postcode);
+    opts = opts || {};
+    const nswOk = h.num && inNswArea(area.state);
+    let nswApprox = null;
+    if (nswOk && canStructure) {
+      const n = await nswLookup(h.num, h.letter, h.name, area.suburb, area.postcode);
+      if (n && !n.partial) return Object.assign(n, { unit });
+      nswApprox = n;
+    }
     if (opts && opts.quick) {
       // Fast pass: one Photon search, accept only an exact house-number match.
       const want = h.num ? h.num.toLowerCase() : '';
@@ -2800,6 +2869,22 @@
       const [lng, lat] = exactP.geometry.coordinates;
       return { lat, lng, formatted: addrLabel(exactP.properties), precision: 'house', partial: false };
     }
+    if (nswOk && photon.length) {
+      // The free map knows roughly where it is: ask the NSW list again with
+      // the suburb/postcode it found (fixes missing or misspelt suburbs).
+      const tried = new Set([String(area.suburb || '').toLowerCase() + '|' + String(area.postcode || '')]);
+      for (const f of photon.slice(0, 3)) {
+        const p = f.properties || {};
+        const sub = p.locality || p.district || p.city || '', pc = String(p.postcode || '');
+        const k = sub.toLowerCase() + '|' + pc;
+        if ((!sub && !pc) || tried.has(k)) continue;
+        tried.add(k);
+        const n = await nswLookup(h.num, h.letter, h.name, sub, pc);
+        if (n && !n.partial) return Object.assign(n, { unit });
+        if (n && !nswApprox) nswApprox = n;
+      }
+    }
+    if (nswApprox) return Object.assign(nswApprox, { unit });
     if (!approx && photon.length) {
       const [lng, lat] = photon[0].geometry.coordinates;
       approx = { lat, lng, formatted: addrLabel(photon[0].properties), precision: photon[0].properties.osm_value || 'street', partial: true };
@@ -2829,7 +2914,13 @@
     // A remembered location far from today's area was probably the wrong
     // suburb (another state) — look it up again near the driver.
     const replace = new Set();
-    out.forEach((r, i) => { if (r && !r.error && !nearArea(r)) { replace.add(i); out[i] = { error: 'far', lookupInBrowser: true, access: r.access }; } });
+    out.forEach((r, i) => {
+      if (!r || r.error) return;
+      // Far away (probably the wrong state), or saved earlier only roughly
+      // (street level) before the NSW address list was used: look again.
+      const rough = r.partial && r.source !== 'nsw' && !['manual', 'confirmed'].includes(r.precision) && !r.retried;
+      if (!nearArea(r) || rough) { replace.add(i); out[i] = { error: 'far', lookupInBrowser: true, access: r.access, previous: rough ? r : null }; }
+    });
     const misses = out.map((r, i) => (r && r.lookupInBrowser ? i : -1)).filter((i) => i >= 0);
     const saved = [];
     let done = addresses.length - misses.length;
@@ -2837,14 +2928,14 @@
     // Quick pass first: several fast Photon searches at once. Only the
     // addresses it can't place exactly go through the slower careful lookup.
     const slow = [];
-    for (let m = 0; m < misses.length; m += 3) {
-      const group = misses.slice(m, m + 3);
+    for (let m = 0; m < misses.length; m += 5) {
+      const group = misses.slice(m, m + 5);
       const found = await Promise.all(group.map((i) => osmLookup(addresses[i], partsList ? partsList[i] : null, { quick: true }).catch(() => null)));
       group.forEach((i, k) => {
         const r = found[k];
         if (r && nearArea(r)) {
           if (out[i] && out[i].access) r.access = out[i].access;
-          out[i] = r; saved.push(Object.assign({ address: addresses[i], replace: replace.has(i) }, r)); done++;
+          out[i] = r; saved.push(Object.assign({ address: addresses[i], replace: replace.has(i), auto: true }, r)); done++;
         } else slow.push(i);
       });
       if (onProgress) onProgress(done, addresses.length, misses.length - m - group.length + slow.length);
@@ -2852,13 +2943,18 @@
     for (let m = 0; m < slow.length; m++) {
       const i = slow[m];
       const savedAccess = out[i] && out[i].access;
-      try { out[i] = await osmLookup(addresses[i], partsList ? partsList[i] : null); if (savedAccess) out[i].access = savedAccess; }
+      const prev = out[i] && out[i].previous;
+      try {
+        out[i] = await osmLookup(addresses[i], partsList ? partsList[i] : null); if (savedAccess) out[i].access = savedAccess;
+        // A second try that is no better keeps the earlier answer (and isn't tried again).
+        if (prev && (out[i].error || out[i].partial)) out[i] = Object.assign({}, prev, { retried: true });
+      }
       catch (e) {
         // Stop asking a busy service; leave the rest for the driver to retry.
         for (let k = m; k < slow.length; k++) out[slow[k]] = { error: e.message };
         break;
       }
-      if (!out[i].error) saved.push(Object.assign({ address: addresses[i], replace: replace.has(i) }, out[i]));
+      if (!out[i].error) saved.push(Object.assign({ address: addresses[i], replace: replace.has(i), auto: true, retried: !!out[i].partial || !!out[i].retried }, out[i]));
       done++;
       if (onProgress) onProgress(done, addresses.length, slow.length - m - 1);
     }
@@ -3079,6 +3175,9 @@
           if (H > W * 2.6) {
             const tileH = Math.round(W * 2), step = Math.round(W * 1.2);
             for (let y = 0; y < H; y += step) { const sh = Math.min(tileH, H - y); tiles.push(piece(y, sh, 1100)); if (y + sh >= H) break; }
+          } else if (Math.max(W, H) >= 1800) {
+            // Camera photo of a label: keep more detail so small print reads well.
+            tiles.push(piece(0, H, Math.round(1600 * W / Math.max(W, H))));
           } else tiles.push(piece(0, H, H > W ? 1100 : 1400));
           const sc = 160 / Math.max(W, H); const c = document.createElement('canvas');
           c.width = Math.max(1, Math.round(W * sc)); c.height = Math.max(1, Math.round(H * sc));
@@ -3091,7 +3190,7 @@
   }
   function routePhotoReview() {
     const ph = routeUi.photo;
-    const reading = ph.items.filter((it) => it.status === 'reading' || it.status === 'queued').length;
+    const reading = ph.items.filter((it) => it.status === 'reading' || it.status === 'queued' || it.status === 'checking').length;
     const labels = photoLabels();
     const failed = ph.items.filter((it) => it.status === 'error' || (it.status === 'done' && !(it.labels || []).length));
     return `
@@ -3099,14 +3198,14 @@
         <h2 style="margin:0 0 4px;">${ph.target === 'new' ? 'Stops from parcel photos' : 'Add stops from parcel photos'}</h2>
         <p class="helptext" style="margin:0 0 12px;">Take or choose photos of the delivery labels. AI reads the address, name, phone and tracking number — check each one before adding.</p>
         ${photoInputs(ph.items.length ? 'Add more photos' : 'Choose label photos')}
-        ${reading ? `<div class="photo-progress"><div class="route-spinner" aria-hidden="true"></div><span>Reading photo ${ph.items.length - reading + 1} of ${ph.items.length}…</span></div>` : ''}
+        ${reading ? `<div class="photo-progress"><div class="route-spinner" aria-hidden="true"></div><span>${ph.items.some((x) => x.status === 'checking') ? 'Double-checking addresses' : 'Reading photos'} — ${ph.items.length - reading} of ${ph.items.length} done…</span></div>` : ''}
         ${labels.length ? `<p class="eyebrow" style="margin:16px 0 8px;">${labels.length} label${labels.length > 1 ? 's' : ''} read</p>
           <div class="photo-list">${labels.map(({ it, l, j }) => `
             <div class="photo-row ${l.confidence === 'low' ? 'is-low' : ''}">
               <img src="${it.thumb}" alt="Label photo" class="photo-thumb">
               <div class="photo-fields">
                 ${l.stop ? `<span class="photo-stop">Stop ${esc(l.stop)}</span>` : ''}
-                ${l.confidence === 'low' ? '<p class="helptext route-approx" style="margin:0 0 4px;">Hard to read — please check</p>' : ''}
+                ${l.verified ? `<p class="helptext photo-ok" style="margin:0 0 4px;">✓ Found in the NSW address list${l.secondLook ? ' (read again to confirm)' : ''}</p>` : l.verified === false ? '<p class="helptext route-approx" style="margin:0 0 4px;">Not in the NSW address list — check the number, street and suburb</p>' : l.confidence === 'low' ? '<p class="helptext route-approx" style="margin:0 0 4px;">Hard to read — please check</p>' : ''}
                 ${l.place ? `<input type="text" value="${esc(l.place)}" placeholder="Business / building" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="place" aria-label="Business or building">` : ''}
                 <input type="text" name="address" value="${esc(l.address)}" placeholder="Street address" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="address" aria-label="Street address">
                 <div class="photo-grid">
@@ -3139,12 +3238,43 @@
     if (photoRedraw) return;
     photoRedraw = setTimeout(() => { photoRedraw = 0; if (state.route === 'driver-route' || state.route === 'routes') renderView(); }, 250);
   }
-  async function readPhotoTile(tile) {
-    const res = await fetch('/api/route/read-label', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ image: tile }) });
-    let body = {}; try { body = await res.json(); } catch (e) {}
-    if (!res.ok) throw new Error(body.error || 'Could not read this photo.');
-    return body.labels || [];
+  // One request per photo piece, with a 60-second limit and one automatic
+  // retry, so a slow answer can't leave a photo stuck on "reading".
+  async function readPhotoTile(tile, pass) {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 60000);
+      try {
+        const res = await fetch('/api/route/read-label', { method: 'POST', credentials: 'same-origin', signal: ctl.signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ image: tile, pass: pass || 1 }) });
+        let body = {}; try { body = await res.json(); } catch (e) {}
+        if (!res.ok) {
+          const err = new Error(body.error || 'Could not read this photo.');
+          if (res.status === 429 || res.status === 503 || res.status === 400) throw Object.assign(err, { final: true });
+          throw err;
+        }
+        return body.labels || [];
+      } catch (e) {
+        lastErr = e.name === 'AbortError' ? new Error('Reading took too long. Tap Retry.') : e;
+        if (e.final) break;
+      } finally { clearTimeout(timer); }
+    }
+    throw lastErr;
   }
+  const BLANK_LABEL = { stop: '', place: '', suburb: '', state: '', postcode: '', name: '', phone: '', tracking: '', notes: '', confidence: 'medium' };
+  // Checks a label against the official NSW address list. On a match the
+  // suburb/postcode are corrected from the list.
+  async function verifyLabel(l) {
+    const { rest } = splitUnit(String(l.address || ''));
+    const h = splitHouse(rest.trim());
+    if (!h.num || !(l.suburb || l.postcode) || !inNswArea(l.state)) { l.verified = null; return l; }
+    const n = await nswLookup(h.num, h.letter, h.name, l.suburb, l.postcode);
+    if (n && !n.partial) {
+      l.verified = true; l.suburb = n.suburb || l.suburb; l.postcode = n.postcode || l.postcode; l.state = 'NSW';
+      l.geo = { lat: n.lat, lng: n.lng, formatted: n.formatted, precision: 'house', partial: false, source: 'nsw' };
+    } else l.verified = nswDownUntil > Date.now() ? null : false; // service down: don't re-read for nothing
+    return l;
+  }
+  const labelKey = (l) => String(l.tracking || l.stop || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   async function photoWorker() {
     photoWorkers++;
     try {
@@ -3152,11 +3282,30 @@
         const it = routeUi.photo.items.find((x) => x.status === 'queued');
         if (!it) break;
         it.status = 'reading'; it.error = ''; it.labels = []; photoRender();
-        const results = await Promise.allSettled((it.tiles || []).map(readPhotoTile));
+        const results = await Promise.allSettled((it.tiles || []).map((t) => readPhotoTile(t, 1)));
         results.forEach((r) => {
-          if (r.status === 'fulfilled') r.value.forEach((l) => it.labels.push(Object.assign({ stop: '', place: '', suburb: '', state: '', postcode: '', name: '', phone: '', tracking: '', notes: '', confidence: 'medium' }, l)));
+          if (r.status === 'fulfilled') r.value.forEach((l) => it.labels.push(Object.assign({}, BLANK_LABEL, l)));
           else it.error = r.reason && r.reason.message || 'Could not read this photo.';
         });
+        if (it.labels.length) {
+          await Promise.all(it.labels.map(verifyLabel));
+          // Any address not in the official list? Have a second AI model read
+          // the photo again and keep whichever reading is confirmed.
+          const unsure = it.labels.filter((l) => l.verified === false || l.confidence === 'low');
+          if (unsure.length && it.tiles && it.tiles.length) {
+            it.status = 'checking'; photoRender();
+            const again = await Promise.allSettled(it.tiles.map((t) => readPhotoTile(t, 2)));
+            const second = [];
+            again.forEach((r) => { if (r.status === 'fulfilled') r.value.forEach((l) => second.push(Object.assign({}, BLANK_LABEL, l))); });
+            await Promise.all(second.map(verifyLabel));
+            unsure.forEach((l) => {
+              const idx = it.labels.indexOf(l);
+              const k = labelKey(l);
+              const alt = second.find((x) => x.verified && k && labelKey(x) === k) || (second.length === it.labels.length ? second[idx] : null);
+              if (alt && alt.verified) it.labels[idx] = Object.assign({}, l, { address: alt.address, suburb: alt.suburb, postcode: alt.postcode, state: alt.state, verified: true, geo: alt.geo, confidence: 'medium', secondLook: true });
+            });
+          }
+        }
         it.status = it.labels.length ? 'done' : 'error';
         if (it.labels.length) { it.error = ''; delete it.tiles; }
         if (!it.labels.length && /allowance|not switched on/i.test(it.error || '')) {
@@ -3400,9 +3549,7 @@
         ${aiHelp.messages.length ? '' : `<div class="ai-msg ai-bot">Hi! Ask me anything — how to do something here, what's on this page, a quick total, or a message to write. I can see this page (<strong>${esc(aiPageSnapshot().name || '')}</strong>).</div>
           <div class="ai-chips">${aiHelpSuggestions().map((q) => `<button class="btn btn-sm" data-action="ai-help-chip" data-q="${esc(q)}">${esc(q)}</button>`).join('')}</div>`}
         ${aiHelp.messages.map((m) => m.role === 'user' ? `<div class="ai-msg ai-user">${esc(m.content)}</div>`
-          : `<div class="ai-msg ai-bot">${esc(m.content)}${m.go || m.fixAddress ? `<div class="ai-chips">
-              ${m.fixAddress ? '<button class="btn btn-sm btn-primary" data-action="ai-help-fix">Fix a stop\'s location</button>' : ''}
-              ${m.go ? `<button class="btn btn-sm" data-action="ai-help-go" data-view="${esc(m.go)}">Open ${esc((NAV.find((n) => n.id === m.go) || {}).label || m.go)}</button>` : ''}</div>` : ''}</div>`).join('')}
+          : `<div class="ai-msg ai-bot${m.error ? ' ai-error' : ''}">${esc(m.content)}${m.error ? `<div class="ai-chips"><button class="btn btn-sm" data-action="ai-help-retry">Try again</button></div>` : ''}${(m.actions || []).length ? `<div class="ai-chips">${m.actions.map((a, j) => `<button class="btn btn-sm ${a.done ? '' : 'btn-primary'}" data-action="ai-help-do" data-m="${aiHelp.messages.indexOf(m)}" data-a="${j}" ${a.done ? 'disabled' : ''}>${a.done ? '✓ ' : ''}${esc(aiActionLabel(a))}</button>`).join('')}</div>` : ''}</div>`).join('')}
         ${aiHelp.busy ? '<div class="ai-msg ai-bot ai-typing"><span></span><span></span><span></span></div>' : ''}
       </div>
       <form class="ai-input" data-onsubmit="ai-help-send">
@@ -3412,19 +3559,113 @@
       ${aiHelp.messages.length ? '<div class="ai-actions"><button class="btn btn-sm" data-action="ai-help-clear">New chat</button></div>' : ''}`, { wide: true });
     const box = document.getElementById('aiHelpChat'); if (box) box.scrollTop = box.scrollHeight;
   }
+  // What the assistant may do on this screen (shown as buttons to confirm).
+  function aiCurrentRoute() {
+    const b = document.querySelector('#content [data-action="route-replan"]');
+    return b ? (state.routes || []).find((r) => r.id === b.dataset.route) || null : null;
+  }
+  function aiCan() {
+    const role = state.session && state.session.role;
+    const can = ['open_page'];
+    if (aiCurrentRoute()) can.push('add_stop', 'mark_stop', 'reoptimise', 'fix_location');
+    if (role === 'driver') can.push('start_work', 'finish_work');
+    if (role === 'labour') can.push('clock_in', 'clock_out');
+    if (roleAllowed('drivers', role) && role !== 'driver') can.push('add_driver');
+    return can;
+  }
+  function aiActionLabel(a) {
+    const page = (id) => (NAV.find((n) => n.id === id) || {}).label || id;
+    switch (a.do) {
+      case 'open_page': return 'Open ' + page(a.page);
+      case 'add_stop': return 'Add stop: ' + a.address;
+      case 'mark_stop': return `Mark stop ${a.stop} ${a.result}`;
+      case 'reoptimise': return 'Re-optimise the route';
+      case 'fix_location': return a.stop ? `Fix stop ${a.stop}'s location` : "Fix a stop's location";
+      case 'add_driver': return 'Add driver ' + a.name;
+      case 'clock_in': return 'Clock me in';
+      case 'clock_out': return 'Clock me out';
+      case 'start_work': return 'Start work';
+      case 'finish_work': return 'Fill in Finish work';
+      default: return a.do;
+    }
+  }
+  const waitFor = async (sel, ms) => { const end = Date.now() + (ms || 3000); while (Date.now() < end) { const el = document.querySelector(sel); if (el) return el; await sleep(80); } return null; };
+  async function aiDoAction(a) {
+    const route = aiCurrentRoute();
+    const stopAt = (n) => route && route.stops[n - 1];
+    const goTo = async (page, sel) => { if (state.route !== page) setRoute(page); return sel ? waitFor('#content ' + sel) : null; };
+    closeModal();
+    switch (a.do) {
+      case 'open_page': if (aiAllowedPages().includes(a.page)) setRoute(a.page); return;
+      case 'reoptimise': { const b = document.querySelector('#content [data-action="route-replan"]'); if (b) b.click(); return; }
+      case 'mark_stop': {
+        const st = stopAt(a.stop); if (!st) throw new Error(`There's no stop ${a.stop} on this route.`);
+        if (st.status !== 'pending') throw new Error(`Stop ${a.stop} is already marked ${st.status}.`);
+        const b = document.querySelector(`#content [data-action="${a.result === 'failed' ? 'route-stop-fail' : 'route-stop-done'}"][data-stop="${st.id}"]`);
+        if (!b) throw new Error(`Couldn't find stop ${a.stop} on screen.`);
+        b.click();
+        if (a.result === 'failed' && a.reason) { const note = await waitFor('#modal-root form input[name="note"]'); if (note) note.value = a.reason; }
+        return;
+      }
+      case 'add_stop': {
+        const b = document.querySelector('#content [data-action="route-stop-add"]'); if (!b) throw new Error('Open your route first.');
+        b.click();
+        const f = await waitFor('#modal-root form[data-onsubmit="route-stop-add-save"]'); if (!f) return;
+        ['address', 'name', 'phone', 'notes'].forEach((k) => { if (a[k] && f.elements[k]) f.elements[k].value = a[k]; });
+        toast('Check the details and press Add to route.', 'ok');
+        return;
+      }
+      case 'fix_location': {
+        const st = a.stop ? stopAt(a.stop) : null;
+        const el = document.createElement('button');
+        Object.assign(el.dataset, st ? { route: route.id, kind: 'stop', stop: st.id } : { route: route ? route.id : '', kind: 'new' });
+        ACTIONS['route-ai-fix'](el);
+        return;
+      }
+      case 'add_driver': {
+        driverModal(null);
+        const f = await waitFor('#modal-root form[data-onsubmit="driver-save"]'); if (!f) return;
+        f.elements.name.value = a.name;
+        const v = [...f.elements.vehicleType.options].find((o) => o.value.toLowerCase() === String(a.vehicle || '').toLowerCase()); if (v) f.elements.vehicleType.value = v.value;
+        toast('Check the details and press Save.', 'ok');
+        return;
+      }
+      case 'clock_in': case 'clock_out': {
+        const f = await goTo('labour-log', `form[data-onsubmit="labour-${a.do === 'clock_in' ? 'clock-in' : 'clock-out'}"]`);
+        if (!f) throw new Error(a.do === 'clock_in' ? "You can't clock in right now (already clocked in, or no shift today)." : "You're not clocked in.");
+        f.requestSubmit(); return;
+      }
+      case 'start_work': {
+        const f = await goTo('driver-submit', 'form[data-onsubmit="driver-start-work"]');
+        if (!f) throw new Error('Finish your current work first, then start a new one.');
+        f.requestSubmit(); return;
+      }
+      case 'finish_work': {
+        const f = await goTo('driver-submit', 'form[data-onsubmit="driver-finish-work"]');
+        if (!f) throw new Error("You haven't started work yet.");
+        if (a.delivered) f.elements.delivered.value = a.delivered;
+        if (f.elements.failed && a.failed != null) f.elements.failed.value = a.failed;
+        f.scrollIntoView({ block: 'center' }); toast('Check the counts, add the screenshot if needed, and press Finish.', 'ok');
+        return;
+      }
+      default: throw new Error("I can't do that one yet.");
+    }
+  }
   async function aiHelpAsk(text) {
     if (/^fix a stop'?s location$/i.test(text.trim())) { aiHelpFix(); return; }
     aiHelp.messages.push({ role: 'user', content: text });
     aiHelp.busy = true; renderAiHelp();
+    const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 45000);
     try {
-      const res = await fetch('/api/ai/chat', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ page: aiPageSnapshot(), pages: aiAllowedPages(), messages: aiHelp.messages.map((m) => ({ role: m.role, content: m.content })) }) });
+      const res = await fetch('/api/ai/chat', { method: 'POST', credentials: 'same-origin', signal: ctl.signal, headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ page: aiPageSnapshot(), pages: aiAllowedPages(), can: aiCan(), messages: aiHelp.messages.filter((m) => !m.error).map((m) => ({ role: m.role, content: m.content })) }) });
       let body = {}; try { body = await res.json(); } catch (e) {}
-      if (!res.ok) throw new Error(body.error || 'The AI helper could not answer just now.');
-      aiHelp.messages.push({ role: 'assistant', content: body.reply, go: body.go && body.go !== state.route ? body.go : '', fixAddress: !!body.fixAddress });
+      if (!res.ok) throw new Error(body.error || (res.status >= 500 ? 'The AI helper is busy right now.' : 'The AI helper could not answer.'));
+      const actions = (body.actions || []).filter((a) => !(a.do === 'open_page' && a.page === state.route));
+      aiHelp.messages.push({ role: 'assistant', content: body.reply || 'Done.', actions });
     } catch (e) {
-      aiHelp.messages.push({ role: 'assistant', content: e.message });
-    }
+      aiHelp.messages.push({ role: 'assistant', error: true, content: e.name === 'AbortError' ? 'No answer after 45 seconds — the AI service is slow right now.' : (e.message || 'Something went wrong.'), retry: text });
+    } finally { clearTimeout(timer); }
     aiHelp.busy = false;
     if (document.getElementById('aiHelpChat')) renderAiHelp();
   }
@@ -3432,7 +3673,7 @@
     const btn = document.querySelector('#content [data-action="route-ai-fix"][data-kind="new"]');
     if (btn) { closeModal(); btn.click(); return; }
     const page = isDriverRole() ? 'driver-route' : 'routes';
-    aiHelp.messages.push({ role: 'assistant', content: isDriverRole() ? 'Open your Route first (plan it if you haven\'t yet), then I can fix any stop\'s location.' : 'Stop locations are fixed from the driver\'s route. Open Routes to see them.', go: page });
+    aiHelp.messages.push({ role: 'assistant', content: isDriverRole() ? 'Open your Route first (plan it if you haven\'t yet), then I can fix any stop\'s location.' : 'Stop locations are fixed from the driver\'s route. Open Routes to see them.', actions: [{ do: 'open_page', page }] });
     renderAiHelp();
   }
   function fixTargetFrom(el) {
@@ -3470,7 +3711,7 @@
     const remember = item ? item.address : (newAddress || '');
     if (remember && !pos.partial) {
       fetch('/api/route/geocache', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ items: [{ address: remember, lat: pos.lat, lng: pos.lng, formatted: pos.formatted || remember, precision: pos.precision, partial: false, replace: true }] }) }).catch(() => {});
+        body: JSON.stringify({ items: [{ address: remember, lat: pos.lat, lng: pos.lng, formatted: pos.formatted || remember, precision: pos.precision, partial: false, replace: true, confirmed: true }] }) }).catch(() => {});
     }
     closeModal(); renderView();
     toast(t.kind === 'stop' ? 'Location updated.' : `Added as stop ${at + 1}.`, 'ok');
@@ -3555,9 +3796,32 @@
     const out = []; const seen = new Set();
     for (const c of cands) {
       const q = [c.address, [c.suburb, c.state, c.postcode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+      const h = splitHouse(splitUnit(c.address || '').rest);
+      // Official NSW address list first: exact house points.
+      if (h.num && (c.suburb || c.postcode) && inNswArea(c.state)) {
+        const n = await nswLookup(h.num, h.letter, h.name, c.suburb, c.postcode);
+        if (n && !seen.has(n.formatted)) {
+          seen.add(n.formatted);
+          out.push({ label: n.formatted, lat: n.lat, lng: n.lng, approx: !!n.partial, note: n.partial ? `exact number not listed — pin at the ${n.estimate}` : 'found in the NSW address list', km: geoArea ? kmBetween(geoArea, n) : null, typed: q, nsw: true });
+          if (!n.partial) continue;
+        }
+      }
       let feats = await photonSearch(q, { suburb: c.suburb, postcode: c.postcode });
       if (!feats.length) feats = await photonSearch(q, {});
-      const h = splitHouse(c.address || '');
+      if (h.num && inNswArea(c.state)) {
+        // Suburb was missing/wrong: use the suburb the free map found.
+        let hitNsw = false;
+        for (const f of feats.slice(0, 2)) {
+          const p = f.properties || {}; const sub = p.locality || p.district || p.city || '';
+          if (!sub && !p.postcode) continue;
+          const n = await nswLookup(h.num, h.letter, h.name, sub, p.postcode);
+          if (n && !n.partial) {
+            hitNsw = true;
+            if (!seen.has(n.formatted)) { seen.add(n.formatted); out.push({ label: n.formatted, lat: n.lat, lng: n.lng, approx: false, note: 'found in the NSW address list', km: geoArea ? kmBetween(geoArea, n) : null, typed: q, nsw: true }); }
+          }
+        }
+        if (hitNsw) continue;
+      }
       for (const f of feats.slice(0, 3)) {
         const p = f.properties || {}; let [lng, lat] = f.geometry.coordinates;
         let label = addrLabel(p); let approx = !p.housenumber; let note = '';
@@ -3919,9 +4183,17 @@
       renderAiHelp();
     },
     'ai-help-chip': (el) => { aiHelpAsk(el.dataset.q || ''); },
+    'ai-help-retry': () => {
+      const i = aiHelp.messages.length - 1; const m = aiHelp.messages[i];
+      if (!m || !m.error) return;
+      const q = m.retry; aiHelp.messages.splice(i - 1, 2); aiHelpAsk(q);
+    },
+    'ai-help-do': async (el) => {
+      const m = aiHelp.messages[Number(el.dataset.m)]; const a = m && m.actions && m.actions[Number(el.dataset.a)]; if (!a || a.done) return;
+      try { await aiDoAction(a); a.done = true; }
+      catch (e) { toast(e.message, 'err'); }
+    },
     'ai-help-clear': () => { aiHelp.messages = []; renderAiHelp(); },
-    'ai-help-go': (el) => { closeModal(); setRoute(el.dataset.view); },
-    'ai-help-fix': () => aiHelpFix(),
     'ai-fix-pin-free': () => { if (aiFixPickReady(true)) openPinPicker(aiTarget()); },
     'ai-fix-here': async (el) => {
       if (!aiFixPickReady()) return;
@@ -4481,7 +4753,9 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     },
     'route-photo-edit': (el) => {
       const it = routeUi.photo && routeUi.photo.items.find((x) => x.id === el.dataset.item); if (!it) return;
-      const l = it.labels[Number(el.dataset.j)]; if (l) l[el.dataset.field] = el.value.trim();
+      const l = it.labels[Number(el.dataset.j)]; if (!l) return;
+      l[el.dataset.field] = el.value.trim();
+      if (['address', 'suburb', 'postcode', 'state'].includes(el.dataset.field)) { l.verified = undefined; delete l.secondLook; verifyLabel(l).then(() => photoRender()); }
     },
     'route-file': async (el) => {
       const file = el.files && el.files[0]; if (!file) return;
@@ -4909,6 +5183,17 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
       label: addrLabel(f.properties), lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0],
       exact: !!(f.properties.housenumber), type: f.properties.osm_value || f.properties.type || '',
     })).filter((it) => it.label && !seen.has(it.label) && seen.add(it.label));
+    // Typed a house number the free map doesn't have? Check the NSW list for
+    // that number on the streets it suggested and put an exact hit first.
+    const h = splitHouse(splitUnit(q).rest.trim());
+    if (h.num && !items.some((it) => it.exact && it.label.startsWith(h.num + ' '))) {
+      const streets = (data.features || []).map((f) => f.properties).filter((p) => (p.street || (p.osm_key === 'highway' && p.name)) && (p.locality || p.city || p.district || p.postcode)).slice(0, 2);
+      for (const p of streets) {
+        if (!inNswArea(p.state)) continue;
+        const n = await nswLookup(h.num, h.letter, p.street || p.name, p.locality || p.district || p.city, p.postcode);
+        if (n && !n.partial && !seen.has(n.formatted)) { seen.add(n.formatted); items.unshift({ label: n.formatted, lat: n.lat, lng: n.lng, exact: true, type: 'house' }); break; }
+      }
+    }
     addrUi.cache.set(key, items);
     return items;
   }
