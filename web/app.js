@@ -2780,10 +2780,30 @@
       clearTimeout(timer);
       if (res.ok) {
         const data = await res.json();
-        const r = data && data.addressResult; const a = r && r.addresses && r.addresses[0];
-        if (a && a.addressPoint && Number.isFinite(Number(a.addressPoint.centreY))) {
+        const r = data && data.addressResult;
+        // The list can return several buildings on the street (e.g. "2-10"
+        // and "5"): take the one whose number really matches — a range only
+        // counts when the number is inside it and on the same side of the road.
+        const want = parseInt(num, 10), wantStr = (String(num) + String(letter || '')).toUpperCase();
+        const fit = (x) => {
+          const f = Number(x.houseNumberFirst) || 0, t = Number(x.houseNumberSecond) || 0;
+          if (String(x.houseNumberString || '').replace(/\s/g, '').toUpperCase() === wantStr) return 4;
+          if (f === want && !t) return letter ? 2 : 3;
+          if (t && want >= f && want <= t && (want - f) % 2 === 0) return 2;
+          return 0;
+        };
+        const list = ((r && r.addresses) || []).filter((x) => x && x.addressPoint && Number.isFinite(Number(x.addressPoint.centreY)));
+        let a = null, best = 0;
+        list.forEach((x) => { const sc = fit(x); if (sc > best) { best = sc; a = x; } });
+        let forcedClosest = false;
+        if (!a && list.length) {
+          // Nothing matches exactly: nearest number on the same side of the road.
+          const dist = (x) => Math.abs((Number(x.houseNumberFirst) || 0) - want) + (((Number(x.houseNumberFirst) || 0) - want) % 2 ? 1000 : 0);
+          a = list.slice().sort((x, y) => dist(x) - dist(y))[0]; forcedClosest = true;
+        }
+        if (a) {
           const how = (r.searchMethod && r.searchMethod.methodDescriptions) || [];
-          const closest = how.some((m) => /closest/i.test(m));
+          const closest = forcedClosest || (best < 2 && how.some((m) => /closest/i.test(m)));
           out = {
             lat: Number(a.addressPoint.centreY), lng: Number(a.addressPoint.centreX),
             formatted: `${a.houseNumberString} ${titleCase(a.roadName)} ${titleCase(a.roadType)}, ${titleCase(a.suburbName)} NSW ${a.postCode}`.replace(/\s+/g, ' '),
@@ -3796,13 +3816,15 @@
     const out = []; const seen = new Set();
     for (const c of cands) {
       const q = [c.address, [c.suburb, c.state, c.postcode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
-      const h = splitHouse(splitUnit(c.address || '').rest);
+      const su = splitUnit(c.address || '');
+      const h = splitHouse(su.rest);
+      const withUnit = (f) => (su.unit ? `${su.unit}/` : '') + f;
       // Official NSW address list first: exact house points.
       if (h.num && (c.suburb || c.postcode) && inNswArea(c.state)) {
         const n = await nswLookup(h.num, h.letter, h.name, c.suburb, c.postcode);
-        if (n && !seen.has(n.formatted)) {
-          seen.add(n.formatted);
-          out.push({ label: n.formatted, lat: n.lat, lng: n.lng, approx: !!n.partial, note: n.partial ? `exact number not listed — pin at the ${n.estimate}` : 'found in the NSW address list', km: geoArea ? kmBetween(geoArea, n) : null, typed: q, nsw: true });
+        if (n && !seen.has(withUnit(n.formatted))) {
+          seen.add(withUnit(n.formatted));
+          out.push({ label: withUnit(n.formatted), lat: n.lat, lng: n.lng, approx: !!n.partial, note: n.partial ? `exact number not listed — pin at the ${n.estimate}` : 'found in the NSW address list', km: geoArea ? kmBetween(geoArea, n) : null, typed: q, nsw: true });
           if (!n.partial) continue;
         }
       }
@@ -3817,7 +3839,7 @@
           const n = await nswLookup(h.num, h.letter, h.name, sub, p.postcode);
           if (n && !n.partial) {
             hitNsw = true;
-            if (!seen.has(n.formatted)) { seen.add(n.formatted); out.push({ label: n.formatted, lat: n.lat, lng: n.lng, approx: false, note: 'found in the NSW address list', km: geoArea ? kmBetween(geoArea, n) : null, typed: q, nsw: true }); }
+            if (!seen.has(withUnit(n.formatted))) { seen.add(withUnit(n.formatted)); out.push({ label: withUnit(n.formatted), lat: n.lat, lng: n.lng, approx: false, note: 'found in the NSW address list', km: geoArea ? kmBetween(geoArea, n) : null, typed: q, nsw: true }); }
           }
         }
         if (hitNsw) continue;
@@ -3844,7 +3866,15 @@
     }
     return out.slice(0, 6);
   }
+  const REJECT_RE = /\b(not (this|that|it|right|correct|the one)|wrong|incorrect|nope|isn'?t (it|right|correct)|no,? (that|this|it))\b|^no\b/i;
   async function aiFixAsk(text) {
+    aiFix.rejected = aiFix.rejected || new Set();
+    // "Not this one": don't offer the same places again.
+    const rejecting = REJECT_RE.test(text.trim()) && text.length < 80;
+    if (rejecting) {
+      const lastBot = [...aiFix.messages].reverse().find((m) => m.role === 'assistant' && m.matches && m.matches.length);
+      if (lastBot) lastBot.matches.forEach((x) => aiFix.rejected.add(x.label));
+    }
     aiFix.messages.push({ role: 'user', content: text });
     aiFix.busy = true; renderAiFix();
     const { route } = fixTargetInfo(aiFix.target);
@@ -3852,11 +3882,15 @@
     const areaText = route && route.stops.length ? [...new Set(route.stops.map((x) => (x.parts && x.parts.suburb) || '').filter(Boolean))].slice(0, 4).join(', ') : '';
     try {
       const res = await fetch('/api/route/ai-address', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ area: areaText, messages: aiFix.messages.map((m) => ({ role: m.role, content: m.content })) }) });
+        body: JSON.stringify({ area: areaText, original: aiFix.original || '', rejected: [...aiFix.rejected].slice(0, 10),
+          messages: aiFix.messages.map((m) => ({ role: m.role, content: m.content + (m.matches && m.matches.length ? '\n[Matches shown: ' + m.matches.map((x) => x.label).join('; ') + ']' : '') })) }) });
       let body = {}; try { body = await res.json(); } catch (e) {}
       if (!res.ok) throw new Error(body.error || 'The AI helper could not answer just now.');
-      const matches = await mapMatchesFor(body.candidates || []);
+      const matches = (await mapMatchesFor(body.candidates || [])).filter((x) => !aiFix.rejected.has(x.label));
       let reply = body.reply || 'Here is what I found:';
+      if (!matches.length && aiFix.rejected.size) {
+        reply = "I couldn't find another match in the NSW address list or the free maps. Tell me something else about it (building name, nearby street, or the suburb), or tap \"Place pin on map\" and put it on the right building — it's remembered after that.";
+      }
       // Be straight about it when the map only knows the street.
       if (matches.length && matches.every((x) => x.approx)) {
         const best = matches[0];
@@ -4161,6 +4195,7 @@
     'route-ai-fix': (el) => {
       const t = fixTargetFrom(el); const { item } = fixTargetInfo(t);
       aiFix.target = t; aiFix.messages = []; aiFix.busy = false; aiFix.pick = ''; aiFix.pickTouched = false;
+      aiFix.rejected = new Set(); aiFix.original = item ? [item.address, item.name ? 'customer ' + item.name : '', item.notes ? 'notes: ' + item.notes : ''].filter(Boolean).join(' · ') : '';
       renderAiFix();
       if (item && item.address) aiFixAsk(item.address + (item.error ? ` (map search said: ${item.error})` : ''));
       else aiFix.messages.push({ role: 'assistant', content: 'Tell me the address that is in the wrong place (as it is written) and I\'ll find the right spot. Choose the stop above — or I\'ll match it for you.' }), renderAiFix();

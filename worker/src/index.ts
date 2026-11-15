@@ -654,9 +654,17 @@ async function api(request: Request, env: Env): Promise<Response> {
     const body = await jsonBody(request);
     const msgs: any[] = Array.isArray(body?.messages) ? body.messages.slice(-10) : [];
     const area = String(body?.area || '').slice(0, 120);
+    const original = String(body?.original || '').slice(0, 300);
+    const rejected: string[] = (Array.isArray(body?.rejected) ? body.rejected : []).map((x: unknown) => String(x || '').slice(0, 120)).slice(0, 10);
     const chat = msgs.map((m: any) => ({ role: m?.role === 'assistant' ? 'assistant' : 'user', content: String(m?.content || '').slice(0, 1500) })).filter((m) => m.content);
     if (!chat.length) return fail('Type the address to fix.');
-    const input = { messages: [{ role: 'system', content: ADDRESS_PROMPT + (area ? `\nThe driver is working around: ${area}. Prefer suburbs near there.` : '') }, ...chat], max_tokens: 700, temperature: 0.2 };
+    const extra = [
+      area ? `The driver is working around: ${area}. Prefer suburbs near there.` : '',
+      original ? `The stop being fixed is written on the run sheet as: "${original}". Combine it with whatever the driver adds (e.g. a postcode or suburb on its own means: this street and number in that place). Common misspellings of street names are likely (e.g. Moorama -> Mooramba).` : '',
+      rejected.length ? `The driver said these are WRONG — never suggest them again: ${rejected.join(' | ')}. Suggest other spellings, nearby suburbs or the building's real street.` : '',
+      'Keep unit numbers in the address (e.g. "311/5 Mooramba Road").',
+    ].filter(Boolean).join('\n');
+    const input = { messages: [{ role: 'system', content: ADDRESS_PROMPT + '\n' + extra }, ...chat], max_tokens: 700, temperature: 0.2 };
     let last = '';
     for (const model of ADDRESS_MODELS) {
       try {
