@@ -3315,6 +3315,7 @@
               <img src="${it.thumb}" alt="Label photo" class="photo-thumb">
               <div class="photo-fields">
                 ${l.stop ? `<span class="photo-stop">Stop ${esc(l.stop)}</span>` : ''}
+                ${l.ocr ? `<p class="helptext" style="margin:0 0 4px;">Read on this phone (free) — check the details</p>` : ''}
                 ${l.verified ? `<p class="helptext photo-ok" style="margin:0 0 4px;">✓ Found in the NSW address list${l.secondLook ? ' (read again to confirm)' : ''}</p>` : l.verified === false ? '<p class="helptext route-approx" style="margin:0 0 4px;">Not in the NSW address list — check the number, street and suburb</p>' : l.confidence === 'low' ? '<p class="helptext route-approx" style="margin:0 0 4px;">Hard to read — please check</p>' : ''}
                 ${l.place ? `<input type="text" value="${esc(l.place)}" placeholder="Business / building" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="place" aria-label="Business or building">` : ''}
                 <input type="text" name="address" value="${esc(l.address)}" placeholder="Street address" data-onchange="route-photo-edit" data-item="${it.id}" data-j="${j}" data-field="address" aria-label="Street address">
@@ -3332,7 +3333,7 @@
               </div>
               <button class="btn btn-sm" data-action="route-photo-remove" data-item="${it.id}" data-j="${j}" aria-label="Remove">✕</button>
             </div>`).join('')}</div>` : ''}
-        ${failed.length ? `<div class="photo-failed"><p class="helptext" style="margin:0;color:var(--danger);">${failed.length} photo${failed.length > 1 ? 's' : ''} had no readable deliveries${failed[0].error ? ` (${esc(failed[0].error)})` : ''}. Make sure the address is clear, then try again.</p>
+        ${failed.length ? `<div class="photo-failed"><p class="helptext" style="margin:0;color:var(--danger);">${failed.length} photo${failed.length > 1 ? 's' : ''} couldn't be read${failed[0].error ? ` — ${esc(failed[0].error)}` : ''}. Tap Try again, or type the address.</p>
           <div class="photo-failed-list">${failed.map((it) => `<span class="photo-failed-item"><img src="${it.thumb}" alt="" class="photo-thumb-sm">${it.tiles && it.tiles.length ? `<button class="btn btn-sm" data-action="route-photo-retry" data-item="${it.id}">Try again</button>` : ''}<button class="btn btn-sm" data-action="route-photo-drop" data-item="${it.id}" aria-label="Remove photo">✕</button></span>`).join('')}</div></div>` : ''}
         <div class="stop-edit-actions">
           <button class="btn btn-primary" data-action="route-photo-use" ${labels.length && !reading ? '' : 'disabled'}>${ph.target === 'new' ? `Plan route with ${labels.length} stop${labels.length === 1 ? '' : 's'}` : `Add ${labels.length} stop${labels.length === 1 ? '' : 's'} to route`}</button>
@@ -3385,19 +3386,97 @@
     return l;
   }
   const labelKey = (l) => String(l.tracking || l.stop || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  // ---- Free, unlimited reading on the phone itself (Tesseract OCR) ----
+  // Used automatically when the day's free AI allowance is used up (or AI is
+  // off). Text is read on the device, addresses are picked out of it and then
+  // checked against the NSW address list.
+  const AI_OFF_KEY = 'uma.aiOffUntil';
+  function aiPhotoOff() { try { return Number(localStorage.getItem(AI_OFF_KEY) || 0) > Date.now(); } catch (e) { return false; } }
+  function setAiPhotoOff() {
+    const n = new Date(); const next = Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate() + 1, 0, 1); // allowance resets 00:00 UTC
+    try { localStorage.setItem(AI_OFF_KEY, String(next)); } catch (e) {}
+  }
+  let ocrWorkerPromise = null;
+  function ocrWorker() {
+    if (!ocrWorkerPromise) {
+      ocrWorkerPromise = (async () => {
+        await loadScriptOnce('vendor/tesseract/tesseract.min.js');
+        const base = new URL('vendor/tesseract/', location.href).href;
+        return window.Tesseract.createWorker('eng', 1, { workerPath: base + 'worker.min.js', corePath: base, langPath: base.replace(/\/$/, ''), gzip: true, workerBlobURL: false });
+      })().catch((e) => { ocrWorkerPromise = null; throw new Error('The phone reader could not start. Check your connection and try again.'); });
+    }
+    return ocrWorkerPromise;
+  }
+  const OCR_TYPES = [...STREET_TYPE_WORDS].filter((w) => w.length > 1).sort((a, b) => b.length - a.length).join('|');
+  const OCR_STREET_RE = new RegExp(`^(.*?)((?:(?:unit|u|apt|flat|shop|lot|suite|villa)\\s*\\.?\\s*\\d+[a-z]?\\s*[/,]?\\s*)?(?:\\d+[a-z]?\\s*/\\s*)?\\d+[a-z]?(?:\\s*[-–]\\s*\\d+[a-z]?)?\\s+(?:[a-z][a-z'.-]*\\s+){1,4}?(?:${OCR_TYPES}))\\b\\.?\\s*,?\\s*(.*)$`, 'i');
+  const OCR_STATE = /\b(NSW|VIC|QLD|SA|WA|TAS|ACT|NT)\b/i;
+  function ocrArea(text) {
+    const t = String(text || '').replace(/[^A-Za-z0-9' ,-]/g, ' ').replace(/\s+/g, ' ').trim();
+    const m = t.match(/^,?\s*([A-Za-z][A-Za-z' -]{2,40}?)\s*,?\s*(NSW|VIC|QLD|SA|WA|TAS|ACT|NT)?\s*,?\s*(\d{4})?\s*(?:australia)?$/i);
+    if (!m) return null;
+    const words = m[1].trim().split(/\s+/);
+    if (!m[2] && !m[3] && (words.length > 3 || m[1] !== m[1].toUpperCase())) return null; // plain words: only ALL-CAPS suburb lines
+    return { suburb: titleCase(m[1].trim()), state: (m[2] || '').toUpperCase(), postcode: m[3] || '' };
+  }
+  function parseOcrText(text) {
+    const lines = String(text || '').split(/\n/).map((l) => l.replace(/[|_~*•·»«©®“”"]+/g, ' ').replace(/\s+/g, ' ').trim()).filter((l) => l.length > 2);
+    const out = []; const seenAddr = new Set();
+    lines.forEach((line, i) => {
+      const m = line.match(OCR_STREET_RE);
+      if (!m) return;
+      const before = m[1] || '', street = m[2].replace(/\s+/g, ' ').trim();
+      let area = ocrArea(m[3] || '');
+      if (!area && lines[i + 1] && !OCR_STREET_RE.test(lines[i + 1])) area = ocrArea(lines[i + 1]);
+      let stop = '', name = '';
+      const near = [before].concat(lines.slice(Math.max(0, i - 3), i).reverse());
+      for (const s of near) {
+        if (!s) continue;
+        if (s !== before && OCR_STREET_RE.test(s)) break;
+        const sm = s.match(/\b(\d{1,3}\s?[-–]\s?\d{1,2})\b/);
+        if (sm && !stop) stop = sm[1].replace(/[\s–]/g, '').replace('–', '-');
+        const nm = s.replace(/\b\d{1,3}\s?[-–]\s?\d{1,2}\b/, ' ').replace(/[^A-Za-z' -]/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!name && nm.split(' ').filter((w) => w.length > 1).length >= 2 && !OCR_STATE.test(s) && nm.length < 40) name = titleCase(nm);
+      }
+      const key = (street + '|' + (area ? area.suburb : '')).toLowerCase();
+      if (seenAddr.has(key)) return; seenAddr.add(key);
+      out.push(Object.assign({}, BLANK_LABEL, { address: titleCase(street).replace(/\b(Nsw|Qld|Vic)\b/g, (x) => x.toUpperCase()), suburb: area ? area.suburb : '', state: area ? area.state : '', postcode: area ? area.postcode : '', stop, name, confidence: 'low', ocr: true }));
+    });
+    return out;
+  }
+  async function readTileOnPhone(tile) {
+    const w = await ocrWorker();
+    const { data } = await w.recognize(tile);
+    return parseOcrText(data && data.text);
+  }
   async function photoWorker() {
     photoWorkers++;
     try {
       while (routeUi.photo) {
         const it = routeUi.photo.items.find((x) => x.status === 'queued');
         if (!it) break;
-        it.status = 'reading'; it.error = ''; it.labels = []; photoRender();
-        const results = await Promise.allSettled((it.tiles || []).map((t) => readPhotoTile(t, 1)));
-        results.forEach((r) => {
-          if (r.status === 'fulfilled') r.value.forEach((l) => it.labels.push(Object.assign({}, BLANK_LABEL, l)));
-          else it.error = r.reason && r.reason.message || 'Could not read this photo.';
-        });
-        if (it.labels.length) {
+        it.status = 'reading'; it.error = ''; it.labels = []; it.ocr = false; photoRender();
+        let usePhone = aiPhotoOff();
+        if (!usePhone) {
+          const results = await Promise.allSettled((it.tiles || []).map((t) => readPhotoTile(t, 1)));
+          let limit = false;
+          results.forEach((r) => {
+            if (r.status === 'fulfilled') r.value.forEach((l) => it.labels.push(Object.assign({}, BLANK_LABEL, l)));
+            else { it.error = r.reason && r.reason.message || 'Could not read this photo.'; if (/allowance|not switched on/i.test(it.error)) limit = true; }
+          });
+          if (limit && !it.labels.length) {
+            if (!aiPhotoOff()) toast('The free AI allowance is used up for today — reading photos on this phone instead (free, a bit slower).', 'ok');
+            setAiPhotoOff(); usePhone = true;
+          }
+        }
+        if (usePhone) {
+          it.ocr = true; it.error = '';
+          try {
+            for (const t of it.tiles || []) (await readTileOnPhone(t)).forEach((l) => it.labels.push(l));
+            if (!it.labels.length) it.error = 'No address found in this photo. Try a clearer screenshot, or type the address.';
+          } catch (e) { it.error = e.message; }
+        }
+        if (it.labels.length && !it.ocr) {
           await Promise.all(it.labels.map(verifyLabel));
           // Any address not in the official list? Have a second AI model read
           // the photo again and keep whichever reading is confirmed.
@@ -3416,12 +3495,9 @@
             });
           }
         }
+        if (it.labels.length && it.ocr) await Promise.all(it.labels.map(verifyLabel));
         it.status = it.labels.length ? 'done' : 'error';
         if (it.labels.length) { it.error = ''; delete it.tiles; }
-        if (!it.labels.length && /allowance|not switched on/i.test(it.error || '')) {
-          routeUi.photo.items.filter((x) => x.status === 'queued').forEach((x) => { x.status = 'error'; x.error = it.error; });
-          toast(it.error, 'err');
-        }
         photoRender();
       }
     } finally { photoWorkers--; if (!photoWorkers) photoRender(); }
