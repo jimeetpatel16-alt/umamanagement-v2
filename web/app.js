@@ -2579,8 +2579,24 @@
     }
     return seq;
   }
-  async function planStopOrder(start, stops, ret, onProgress) {
-    const M = await costMatrix([start].concat(stops), onProgress);
+  // Where the route finishes: a chosen end address, back at the start, or
+  // nowhere in particular (the last stop).
+  function routeFinishPoint(route) {
+    if (route.end && Number.isFinite(route.end.lat)) return route.end;
+    if (route.returnToStart && route.start && Number.isFinite(route.start.lat)) return route.start;
+    return null;
+  }
+  async function planStopOrder(start, stops, ret, onProgress, end) {
+    const M0 = await costMatrix([start].concat(stops, end ? [end] : []), onProgress);
+    let M = M0;
+    if (end) {
+      // Finish at a chosen address: treat "last stop -> end address" as the
+      // closing leg of a round trip, so the whole route is optimised for it.
+      const n1 = stops.length + 1, E = n1;
+      const dur = [];
+      for (let i = 0; i < n1; i++) { const row = new Array(n1); for (let j = 0; j < n1; j++) row[j] = j === 0 && i !== 0 ? M0.dur[i][E] : M0.dur[i][j]; dur.push(row); }
+      M = { dur, source: M0.source }; ret = true;
+    }
     const groups = { first: [], auto: [], last: [] };
     stops.forEach((s, i) => groups[PLACEMENT_RANK[s.placement] === 0 ? 'first' : PLACEMENT_RANK[s.placement] === 2 ? 'last' : 'auto'].push(i + 1));
     const used = ['first', 'auto', 'last'].filter((g) => groups[g].length);
@@ -2628,7 +2644,8 @@
     const stops = route.stops.map((s) => Object.assign({}, s));
     const pendingIdx = stops.map((s, i) => (s.status === 'pending' ? i : -1)).filter((i) => i >= 0);
     const pts = [anchor].concat(pendingIdx.map((i) => stops[i]));
-    if (route.returnToStart && route.start && pendingIdx.length) pts.push(route.start);
+    const endPt = routeFinishPoint(route);
+    if (endPt && pendingIdx.length) pts.push(endPt);
     const road = anchor ? await roadRoute(pts) : null;
     pendingIdx.forEach((si, k) => {
       const leg = road ? road.legs[k] : null;
@@ -2636,8 +2653,8 @@
       stops[si].legSec = Math.round(leg ? leg.sec : prev ? straightSeconds(prev, stops[si]) : 0);
       stops[si].legM = Math.round(leg ? leg.m : prev ? straightMetres(prev, stops[si]) : 0);
     });
-    const backLeg = route.returnToStart && pendingIdx.length
-      ? (road ? road.legs[pendingIdx.length] : { sec: straightSeconds(pts[pts.length - 2], route.start), m: straightMetres(pts[pts.length - 2], route.start) })
+    const backLeg = endPt && pendingIdx.length
+      ? (road ? road.legs[pendingIdx.length] : { sec: straightSeconds(pts[pts.length - 2], endPt), m: straightMetres(pts[pts.length - 2], endPt) })
       : null;
     const totalM = stops.reduce((m, s) => m + (Number(s.legM) || 0), 0) + (backLeg ? backLeg.m : 0);
     const totalSec = stops.reduce((t, s) => t + (Number(s.legSec) || 0), 0) + (backLeg ? backLeg.sec : 0);
@@ -2667,7 +2684,7 @@
       if (we != null && t > midnight.getTime() + we * 1000) late[s.id] = true;
       t += stopServiceSec(s) * 1000;
     });
-    const finish = new Date(t + (route.returnToStart ? (Number(route.returnLegSec) || 0) * 1000 : 0));
+    const finish = new Date(t + (routeFinishPoint(route) ? (Number(route.returnLegSec) || 0) * 1000 : 0));
     return { etas, late, finish, any: Object.keys(etas).length > 0 };
   }
   const fmtClock = (d) => d.toLocaleTimeString('en-AU', { hour: 'numeric', minute: '2-digit' });
@@ -3086,7 +3103,10 @@
         .addTo(routeMap).bindPopup(`<strong>${i + 1}. ${esc(s.address)}</strong>${s.name ? '<br>' + esc(s.name) : ''}`);
       pts.push([s.lat, s.lng]);
     });
-    if (route.returnToStart && route.start && Number.isFinite(route.start.lat)) pts.push([route.start.lat, route.start.lng]);
+    if (route.end && Number.isFinite(route.end.lat)) {
+      L.marker([route.end.lat, route.end.lng], { icon: L.divIcon({ className: 'route-pin route-pin-start route-pin-end', html: 'E', iconSize: [26, 26] }) }).addTo(routeMap).bindPopup('Finish: ' + esc(route.end.label || ''));
+      pts.push([route.end.lat, route.end.lng]);
+    } else if (route.returnToStart && route.start && Number.isFinite(route.start.lat)) pts.push([route.start.lat, route.start.lng]);
     const road = Array.isArray(route.geometry) ? route.geometry.filter(Boolean) : [];
     if (road.length) road.forEach((g) => { try { L.polyline(decodePolyline(g), { color: '#131c2e', weight: 4, opacity: 0.7 }).addTo(routeMap); } catch (e) {} });
     else if (pts.length > 1) L.polyline(pts, { color: '#131c2e', weight: 3, opacity: 0.45, dashArray: '6 6' }).addTo(routeMap);
@@ -3165,7 +3185,7 @@
           <div><span class="kpi-label">Driving</span><strong>${route.driveMin != null ? '≈ ' + fmtDuration(route.driveMin) : '—'}</strong></div>
         </div>
         <div class="route-progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><span style="width:${pct}%"></span></div>
-        <p class="helptext route-meta">≈ ${route.distanceKm || 0} km${etas.any ? ` · finish around ${fmtClock(etas.finish)}` : ''} · ${route.orderedBy === 'roads' ? 'ordered by real driving times' : 'ordered by straight-line distance (road data was unavailable)'}</p>
+        <p class="helptext route-meta">≈ ${route.distanceKm || 0} km${etas.any ? ` · finish around ${fmtClock(etas.finish)}` : ''}${route.end && route.end.label ? ` · ends at ${esc(route.end.label)}` : route.returnToStart ? ' · back to the start' : ''} · ${route.orderedBy === 'roads' ? 'ordered by real driving times' : 'ordered by straight-line distance (road data was unavailable)'}</p>
       </div>
       ${editable && next ? `
         <div class="card route-next">
@@ -3455,8 +3475,9 @@
           <p class="eyebrow" style="margin:0 0 8px;">Start and finish</p>
           <div class="field-row" style="margin-bottom:12px;">
             <div class="field"><label class="field-label">Start from</label><select name="startMode" data-onchange="route-start-mode"><option value="here">My current location</option><option value="address" ${df.startMode === 'address' ? 'selected' : ''}>An address (e.g. depot)</option></select></div>
-            <div class="field"><label class="field-label">Finish</label><select name="finish"><option value="last">At the last stop</option><option value="return" ${df.finish === 'return' ? 'selected' : ''}>Back at the start</option></select></div>
+            <div class="field"><label class="field-label">Finish</label><select name="finish" data-onchange="route-finish-mode"><option value="last">At the last stop</option><option value="return" ${df.finish === 'return' ? 'selected' : ''}>Back at the start</option><option value="address" ${df.finish === 'address' ? 'selected' : ''}>At an address I choose</option></select></div>
           </div>
+          <div class="field" id="routeEndAddress" style="margin-bottom:12px;display:${df.finish === 'address' ? 'block' : 'none'};"><label class="field-label">Finish address</label><input type="text" name="endAddress" value="${esc(df.endAddress || state.settings.routeEndAddress || '')}" placeholder="e.g. home or the depot" autocomplete="off"></div>
           <div class="field" id="routeStartAddress" style="margin-bottom:12px;display:${df.startMode === 'address' ? 'block' : 'none'};"><label class="field-label">Start address</label><input type="text" name="startAddress" value="${esc(df.startAddress != null ? df.startAddress : (state.settings.routeDepotAddress || ''))}" placeholder="Depot address"></div>
           <div style="display:flex;gap:10px;flex-wrap:wrap;">
             <button class="btn btn-primary" type="submit" ${stops.length ? '' : 'disabled'}>Plan my route</button>
@@ -4017,6 +4038,9 @@
     const startMode = fd.get('startMode'); const returnToStart = fd.get('finish') === 'return';
     const startAddress = String(fd.get('startAddress') || '').trim();
     if (startMode === 'address' && !startAddress) { toast('Enter the start address.', 'err'); return; }
+    const finishAtAddress = fd.get('finish') === 'address';
+    const endAddress = String(fd.get('endAddress') || '').trim();
+    if (finishAtAddress && !endAddress) { toast('Enter the finish address.', 'err'); return; }
     const driverId = currentDriverId();
     const driver = state.drivers.find((x) => x.id === driverId);
     try {
@@ -4034,6 +4058,13 @@
         start = { label: startAddress, lat: sg.lat, lng: sg.lng };
       }
       geoArea = { lat: start.lat, lng: start.lng };
+      let end = null;
+      if (finishAtAddress) {
+        routeUi.busy = 'Finding the finish address…'; renderView();
+        const [eg] = await geocodeForRoute([endAddress]);
+        if (!eg || eg.error) { routeUi.busy = ''; renderView(); toast('Finish address: ' + ((eg && eg.error) || 'not found') + '. Check it, or choose a different finish.', 'err'); return; }
+        end = { label: endAddress, lat: eg.lat, lng: eg.lng };
+      }
       routeUi.busy = `Finding ${stops.length} addresses…`; renderView();
       const lookups = await geocodeForRoute(stops.map((s) => s.address), (done, total, left) => {
         routeUi.busy = `Finding addresses… ${done} of ${total}` + (left > 3 ? ` (about ${Math.ceil(left * 1.1)} seconds left — saved addresses are instant next time)` : '');
@@ -4060,14 +4091,14 @@
       routeUi.busy = 'Checking real driving times between stops…'; renderView();
       const plan = await planStopOrder(start, found, returnToStart, (done, total) => {
         const p = document.querySelector('.route-spinner + p'); if (p) p.textContent = `Checking real driving times… ${done} of ${total}`;
-      });
+      }, end);
       routeUi.busy = 'Putting stops in the best order…'; renderView();
       const ordered = plan.order.map((idx, i) => Object.assign({}, found[idx], { id: 's' + (i + 1) + '_' + genId().slice(0, 6), status: 'pending', reason: '', doneAt: null }));
-      const metrics = await routeMetrics({ stops: ordered, start, returnToStart }, start);
+      const metrics = await routeMetrics({ stops: ordered, start, returnToStart, end }, start);
       const nowIso = new Date().toISOString();
       const doc = {
         driverId, driverName: driver ? driver.name : (state.session.name || ''), date: todayStr(), status: 'active',
-        fileName: d.fileName, start, returnToStart, unmatched, orderedBy: plan.source,
+        fileName: d.fileName, start, returnToStart, end, unmatched, orderedBy: plan.source,
         stops: metrics.stops, distanceKm: metrics.distanceKm, driveMin: metrics.driveMin, returnLegSec: metrics.returnLegSec,
         geometry: metrics.geometry, metricsSource: metrics.metricsSource, createdAt: nowIso, updatedAt: nowIso,
       };
@@ -4406,7 +4437,8 @@
         const pos = await getCurrentPosition();
         const here = { label: 'My location', lat: pos.lat, lng: pos.lng };
         el.textContent = 'Re-planning…';
-        const plan = await planStopOrder(here, pending, route.returnToStart);
+        // From here, still finishing where the driver chose (depot or end address).
+        const plan = await planStopOrder(here, pending, false, null, routeFinishPoint(route));
         const reordered = Object.assign({}, route, { stops: done.concat(plan.order.map((i) => pending[i])) });
         const m = await routeMetrics(reordered, here);
         await saveRouteStops(route, { stops: m.stops, distanceKm: m.distanceKm, driveMin: m.driveMin, returnLegSec: m.returnLegSec, geometry: m.geometry, metricsSource: m.metricsSource, orderedBy: plan.source });
@@ -4872,11 +4904,12 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     'route-map': (el) => {
       if (!routeUi.draft) return;
       routeUi.draft.map[el.dataset.field] = Number(el.value);
-      const form = el.closest('form'); const keep = form ? { startMode: form.startMode.value, finish: form.finish.value, startAddress: form.startAddress.value } : null;
+      const form = el.closest('form'); const keep = form ? { startMode: form.startMode.value, finish: form.finish.value, startAddress: form.startAddress.value, endAddress: form.endAddress ? form.endAddress.value : '' } : null;
       renderView();
       const f2 = document.querySelector('form[data-onsubmit="route-plan"]');
-      if (f2 && keep) { f2.startMode.value = keep.startMode; f2.finish.value = keep.finish; f2.startAddress.value = keep.startAddress; document.getElementById('routeStartAddress').style.display = keep.startMode === 'address' ? '' : 'none'; }
+      if (f2 && keep) { f2.startMode.value = keep.startMode; f2.finish.value = keep.finish; f2.startAddress.value = keep.startAddress; document.getElementById('routeStartAddress').style.display = keep.startMode === 'address' ? '' : 'none'; if (f2.endAddress) { f2.endAddress.value = keep.endAddress; document.getElementById('routeEndAddress').style.display = keep.finish === 'address' ? '' : 'none'; } }
     },
+    'route-finish-mode': (el) => { const box = document.getElementById('routeEndAddress'); if (box) box.style.display = el.value === 'address' ? '' : 'none'; },
     'route-start-mode': (el) => { const box = document.getElementById('routeStartAddress'); if (box) box.style.display = el.value === 'address' ? '' : 'none'; },
     'route-admin-date': (el) => { routeUi.adminDate = el.value; routeUi.viewId = null; renderView(); },
     'entry-date-change': async (el) => { state.entryDate = el.value; loadEntryRowsForDate(state.entryDate); renderView(); },
