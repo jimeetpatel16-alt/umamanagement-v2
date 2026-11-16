@@ -3112,6 +3112,10 @@
     else if (pts.length > 1) L.polyline(pts, { color: '#131c2e', weight: 3, opacity: 0.45, dashArray: '6 6' }).addTo(routeMap);
     if (pts.length) routeMap.fitBounds(pts, { padding: [24, 24], maxZoom: 15 });
     else routeMap.setView([-33.87, 151.21], 10);
+    // Summary box (stops left · total km), like the reference route map.
+    const left = (route.stops || []).filter((s) => s.status === 'pending').length;
+    const Legend = L.Control.extend({ onAdd() { const d = L.DomUtil.create('div', 'route-legend'); d.innerHTML = `<strong>${left}</strong> of ${(route.stops || []).length} stops left<br><strong>${route.distanceKm || 0}</strong> km total`; return d; } });
+    new Legend({ position: 'topright' }).addTo(routeMap);
   }
   function navLinks(s) {
     const g = `https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lng}&travelmode=driving`;
@@ -3185,7 +3189,7 @@
           <div><span class="kpi-label">Driving</span><strong>${route.driveMin != null ? '≈ ' + fmtDuration(route.driveMin) : '—'}</strong></div>
         </div>
         <div class="route-progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><span style="width:${pct}%"></span></div>
-        <p class="helptext route-meta">≈ ${route.distanceKm || 0} km${etas.any ? ` · finish around ${fmtClock(etas.finish)}` : ''}${route.end && route.end.label ? ` · ends at ${esc(route.end.label)}` : route.returnToStart ? ' · back to the start' : ''} · ${route.orderedBy === 'roads' ? 'ordered by real driving times' : 'ordered by straight-line distance (road data was unavailable)'}</p>
+        <p class="helptext route-meta">≈ ${route.distanceKm || 0} km${etas.any ? ` · finish around ${fmtClock(etas.finish)}` : ''}${route.end && route.end.label ? ` · ends at ${esc(route.end.label)}` : route.returnToStart ? ' · back to the start' : ''} · ${route.orderedBy === 'manual' ? 'in your own order (Re-optimise to let the app plan it)' : route.orderedBy === 'roads' ? 'ordered by real driving times' : 'ordered by straight-line distance (road data was unavailable)'}</p>
       </div>
       ${editable && next ? `
         <div class="card route-next">
@@ -3609,6 +3613,22 @@
     return bestAt;
   }
 
+  // New stops are first slotted into the nearest gap; then the stops still to
+  // do are re-planned with the full optimiser (from the last finished stop,
+  // keeping the chosen finish), so added stops never end up out of the way.
+  // Routes the driver ordered by hand are left as they are.
+  async function replanWithNew(route, stops) {
+    if (route.orderedBy === 'manual') return { stops, replanned: false };
+    const done = stops.filter((x) => x.status !== 'pending'); const pending = stops.filter((x) => x.status === 'pending');
+    if (pending.length < 3) return { stops, replanned: false };
+    try {
+      const from = routeAnchor(route) || pending[0];
+      const plan = await planStopOrder(from, pending, false, null, routeFinishPoint(route));
+      return { stops: done.concat(plan.order.map((i) => pending[i])), replanned: true, source: plan.source };
+    } catch (e) { return { stops, replanned: false }; }
+  }
+  const stopNumber = (stops, id) => stops.findIndex((x) => x.id === id) + 1;
+
   // ---- Editing stops (Spoke-style) ----
   const metricsPatch = (m) => ({ stops: m.stops, distanceKm: m.distanceKm, driveMin: m.driveMin, returnLegSec: m.returnLegSec, geometry: m.geometry, metricsSource: m.metricsSource });
   async function applyStops(route, stops, extra) {
@@ -3884,7 +3904,7 @@
     if (t.kind === 'unmatched' && item) {
       const stop = Object.assign({}, item, pos, { id: 's' + genId(), status: 'pending', reason: '', doneAt: null });
       delete stop.error;
-      at = insertCheapest(route, stops, stop);
+      at = insertCheapest(route, stops, stop); var newId = stop.id;
       unmatched = unmatched.filter((_, i) => i !== t.index);
     } else if (t.kind === 'stop' && item) {
       const i = stops.findIndex((x) => x.id === item.id);
@@ -3893,9 +3913,11 @@
       const stop = { id: 's' + genId(), address: newAddress || loc.formatted, name: '', phone: '', email: '', notes: '', access: '', refs: [], parcels: 1,
         stopType: 'delivery', placement: 'auto', status: 'pending', reason: '', doneAt: null };
       Object.assign(stop, pos);
-      at = insertCheapest(route, stops, stop);
+      at = insertCheapest(route, stops, stop); var newId = stop.id;
     }
-    await applyStops(route, stops, { unmatched });
+    let finalStops = stops;
+    if (t.kind !== 'stop') { const r = await replanWithNew(route, stops); finalStops = r.stops; at = stopNumber(finalStops, newId) - 1; }
+    await applyStops(route, finalStops, { unmatched });
     const remember = item ? item.address : (newAddress || '');
     if (remember && !pos.partial) {
       fetch('/api/route/geocache', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
@@ -4366,9 +4388,11 @@
           insertCheapest(route, stops, Object.assign(base, { id: 's' + genId(), lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: !!g.partial, access: g.access || '', status: 'pending', reason: '', doneAt: null }));
           added++;
         });
-        await applyStops(route, stops, { unmatched });
+        el.textContent = 'Re-planning the order…';
+        const rp = added ? await replanWithNew(route, stops) : { stops, replanned: false };
+        await applyStops(route, rp.stops, { unmatched });
         routeUi.photo = null; renderView();
-        toast(`Added ${added} stop${added === 1 ? '' : 's'} from photos${labels.length - added ? `, ${labels.length - added} need checking` : ''}.`, labels.length - added ? 'err' : 'ok');
+        toast(`Added ${added} stop${added === 1 ? '' : 's'} from photos${rp.replanned ? ' and re-planned the order' : ''}${labels.length - added ? `, ${labels.length - added} need checking` : ''}.`, labels.length - added ? 'err' : 'ok');
       } catch (e) { el.disabled = false; el.textContent = 'Try again'; toast(e.message, 'err'); }
     },
     'route-ai-fix': (el) => {
@@ -4461,13 +4485,13 @@
       if (i < 0 || j < 0 || j >= stops.length) return;
       [stops[i], stops[j]] = [stops[j], stops[i]];
       el.disabled = true;
-      try { await applyStops(route, stops); renderView(); } catch (e) { el.disabled = false; toast(e.message, 'err'); }
+      try { await applyStops(route, stops, { orderedBy: 'manual' }); renderView(); } catch (e) { el.disabled = false; toast(e.message, 'err'); }
     },
     'route-reverse': async (el) => {
       const route = state.routes.find((r) => r.id === el.dataset.route); if (!route) return;
       const done = route.stops.filter((x) => x.status !== 'pending'); const pending = route.stops.filter((x) => x.status === 'pending').reverse();
       el.disabled = true;
-      try { await applyStops(route, done.concat(pending)); renderView(); toast('Route reversed.', 'ok'); } catch (e) { el.disabled = false; toast(e.message, 'err'); }
+      try { await applyStops(route, done.concat(pending), { orderedBy: 'manual' }); renderView(); toast('Route reversed.', 'ok'); } catch (e) { el.disabled = false; toast(e.message, 'err'); }
     },
     'route-photo-view': async (el) => {
       try {
@@ -4492,7 +4516,8 @@
           insertCheapest(route, stops, stop); added++; if (g.partial) approx++;
         });
         if (!added) { el.disabled = false; el.textContent = label; toast('Still couldn\'t find these. Edit them (check spelling and suburb) and tap Find.', 'err'); return; }
-        const m = await routeMetrics(Object.assign({}, route, { stops }), routeAnchor(route));
+        const rp = await replanWithNew(route, stops);
+        const m = await routeMetrics(Object.assign({}, route, { stops: rp.stops }), routeAnchor(route));
         await saveRouteStops(route, { stops: m.stops, unmatched: still, distanceKm: m.distanceKm, driveMin: m.driveMin, returnLegSec: m.returnLegSec, geometry: m.geometry, metricsSource: m.metricsSource });
         renderView();
         toast(`Added ${added} stop${added > 1 ? 's' : ''}${approx ? ` (${approx} with an approximate pin — check the house number on arrival)` : ''}${still.length ? `. ${still.length} still need fixing.` : '.'}`, still.length ? 'err' : 'ok');
@@ -5135,9 +5160,11 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
           parcels: Math.min(99, Math.max(1, Number(fd.get('parcels')) || 1)), stopType: get('stopType') === 'pickup' ? 'pickup' : 'delivery', placement: 'auto',
           lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: !!g.partial, status: 'pending', reason: '', doneAt: null };
         const stops = route.stops.slice();
-        const at = insertCheapest(route, stops, stop);
-        await applyStops(route, stops);
-        closeModal(); renderView(); toast(`Added as stop ${at + 1}.`, 'ok');
+        insertCheapest(route, stops, stop);
+        btn.textContent = 'Re-planning the order…';
+        const rp = await replanWithNew(route, stops);
+        await applyStops(route, rp.stops);
+        closeModal(); renderView(); toast(`Added as stop ${stopNumber(rp.stops, stop.id)}.`, 'ok');
       } catch (e) { btn.disabled = false; btn.textContent = 'Add to route'; toast(e.message, 'err'); }
     },
     'route-fail-save': async (form) => {
@@ -5159,9 +5186,11 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
         const stop = Object.assign({}, u, { address, lat: g.lat, lng: g.lng, formatted: g.formatted, precision: g.precision, partial: g.partial, id: 's' + genId(), status: 'pending', reason: '', doneAt: null });
         delete stop.error;
         const stops = route.stops.slice();
-        const bestAt = insertCheapest(route, stops, stop);
+        insertCheapest(route, stops, stop);
         const unmatched = route.unmatched.filter((_, i) => i !== idx);
-        const m = await routeMetrics(Object.assign({}, route, { stops }), routeAnchor(route));
+        const rp = await replanWithNew(route, stops);
+        const bestAt = stopNumber(rp.stops, stop.id) - 1;
+        const m = await routeMetrics(Object.assign({}, route, { stops: rp.stops }), routeAnchor(route));
         await saveRouteStops(route, { stops: m.stops, unmatched, distanceKm: m.distanceKm, driveMin: m.driveMin, returnLegSec: m.returnLegSec, geometry: m.geometry, metricsSource: m.metricsSource });
         renderView(); toast(`Added as stop ${bestAt + 1}.`, 'ok');
       } catch (e) { toast(e.message, 'err'); }

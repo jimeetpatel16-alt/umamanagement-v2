@@ -832,3 +832,5 @@ table.data tfoot td { background: var(--surface-2); border-top: 1px solid var(--
 .photo-ok { color: var(--ok, #2f7d4f); font-weight: 600; }
 .ai-msg.ai-error { background: #fbeaea; color: #7a2323; }
 .route-pin-end { background: var(--gold); color: var(--navy); }
+.route-legend { background: rgba(255,255,255,.95); padding: 6px 10px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.15); font-size: 13px; line-height: 1.45; color: var(--navy); }
+.route-legend strong { color: var(--gold-ink, #8a6a2f); }
