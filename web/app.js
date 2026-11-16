@@ -2085,6 +2085,76 @@
   // The driver works through the stops and ticks Delivered / Failed; the
   // counts pre-fill their daily submission. Admin/Manager see every route.
   const routeUi = { draft: null, busy: '', adminDate: '', viewId: null, showAll: false, reorder: false, photo: null };
+
+  // ---- Keep an unfinished route through a refresh ----
+  // The run sheet being matched and the label photos being read live in the
+  // page, so they are also kept on this phone (IndexedDB, per login, today
+  // only) and brought back after a refresh or if the browser is closed.
+  const DRAFT_DB = 'uma-drafts';
+  let draftDbPromise = null;
+  function draftDb() {
+    if (!draftDbPromise) draftDbPromise = new Promise((resolve, reject) => {
+      const r = indexedDB.open(DRAFT_DB, 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('d');
+      r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error);
+    });
+    return draftDbPromise;
+  }
+  async function draftStore(key, value) {
+    const db = await draftDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('d', 'readwrite');
+      if (value == null) tx.objectStore('d').delete(key); else tx.objectStore('d').put(value, key);
+      tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
+    });
+  }
+  async function draftLoad(key) {
+    const db = await draftDb();
+    return new Promise((resolve, reject) => {
+      const rq = db.transaction('d', 'readonly').objectStore('d').get(key);
+      rq.onsuccess = () => resolve(rq.result || null); rq.onerror = () => reject(rq.error);
+    });
+  }
+  const routeDraftKey = () => 'route:' + ((state.session && state.session.staffId) || 'anon');
+  let routeDraftTimer = 0, routeDraftReady = false;
+  function saveRouteDraftSoon() {
+    if (!routeDraftReady || !state.session || typeof indexedDB === 'undefined') return;
+    clearTimeout(routeDraftTimer);
+    routeDraftTimer = setTimeout(() => {
+      const ph = routeUi.photo;
+      const keep = routeUi.draft || (ph && ph.items.length);
+      const data = keep ? {
+        date: todayStr(), savedAt: Date.now(), draft: routeUi.draft,
+        photo: ph ? { target: ph.target, items: ph.items.map((it) => ({ id: it.id, thumb: it.thumb, status: it.status, labels: it.labels, error: it.error || '', tiles: it.tiles || null })) } : null,
+      } : null;
+      draftStore(routeDraftKey(), data).catch(() => {});
+    }, 300);
+  }
+  async function restoreRouteDraft() {
+    routeDraftReady = true;
+    if (!state.session || typeof indexedDB === 'undefined') return false;
+    try {
+      const d = await draftLoad(routeDraftKey());
+      if (!d) return false;
+      if (d.date !== todayStr()) { draftStore(routeDraftKey(), null).catch(() => {}); return false; }
+      let any = false;
+      if (!routeUi.draft && d.draft) { routeUi.draft = d.draft; any = true; }
+      if (!routeUi.photo && d.photo && d.photo.items && d.photo.items.length) {
+        routeUi.photo = d.photo;
+        // Photos that were being read when the page closed are read again.
+        routeUi.photo.items.forEach((it) => {
+          if (['reading', 'checking', 'queued'].includes(it.status)) {
+            if (it.labels && it.labels.length) { it.status = 'done'; delete it.tiles; } // already read (was only double-checking)
+            else if (it.tiles && it.tiles.length) { it.status = 'queued'; it.error = ''; }
+            else { it.status = 'error'; it.error = 'Interrupted — please add this photo again.'; }
+          }
+        });
+        any = true;
+        setTimeout(() => runPhotoQueue(), 0);
+      }
+      return any;
+    } catch (e) { return false; }
+  }
   const ROUTE_FIELDS = [
     ['address', 'Street address', /^(delivery |receiver |consignee |customer |recipient )?(street )?(address|addr)( ?line ?1)?$|^street$|address 1|address line 1|delivery address/],
     ['suburb', 'Suburb / city', /suburb|city|town|locality/],
@@ -3370,6 +3440,7 @@
         </div>`;
     }
     const stops = draftStops(d);
+    const df = d.form || {};
     const options = (key) => `<option value="-1">— not in file —</option>` + d.headers.map((h, i) => `<option value="${i}" ${d.map[key] === i ? 'selected' : ''}>${esc(h)}</option>`).join('');
     return `
       <div class="card">
@@ -3383,10 +3454,10 @@
           ${stops.length ? `<div class="table-wrap" style="margin:6px 0 16px;"><table class="data"><thead><tr><th>Address we'll look up</th><th>Recipient</th><th class="tnum">Parcels</th></tr></thead><tbody>${stops.slice(0, 4).map((s) => `<tr><td>${esc(s.address)}</td><td>${esc(s.name)}</td><td class="tnum">${s.parcels}</td></tr>`).join('')}</tbody></table></div>` : '<p class="helptext" style="color:var(--danger);">No addresses found — choose the column that holds the street address.</p>'}
           <p class="eyebrow" style="margin:0 0 8px;">Start and finish</p>
           <div class="field-row" style="margin-bottom:12px;">
-            <div class="field"><label class="field-label">Start from</label><select name="startMode" data-onchange="route-start-mode"><option value="here">My current location</option><option value="address">An address (e.g. depot)</option></select></div>
-            <div class="field"><label class="field-label">Finish</label><select name="finish"><option value="last">At the last stop</option><option value="return">Back at the start</option></select></div>
+            <div class="field"><label class="field-label">Start from</label><select name="startMode" data-onchange="route-start-mode"><option value="here">My current location</option><option value="address" ${df.startMode === 'address' ? 'selected' : ''}>An address (e.g. depot)</option></select></div>
+            <div class="field"><label class="field-label">Finish</label><select name="finish"><option value="last">At the last stop</option><option value="return" ${df.finish === 'return' ? 'selected' : ''}>Back at the start</option></select></div>
           </div>
-          <div class="field" id="routeStartAddress" style="margin-bottom:12px;display:none;"><label class="field-label">Start address</label><input type="text" name="startAddress" value="${esc(state.settings.routeDepotAddress || '')}" placeholder="Depot address"></div>
+          <div class="field" id="routeStartAddress" style="margin-bottom:12px;display:${df.startMode === 'address' ? 'block' : 'none'};"><label class="field-label">Start address</label><input type="text" name="startAddress" value="${esc(df.startAddress != null ? df.startAddress : (state.settings.routeDepotAddress || ''))}" placeholder="Depot address"></div>
           <div style="display:flex;gap:10px;flex-wrap:wrap;">
             <button class="btn btn-primary" type="submit" ${stops.length ? '' : 'disabled'}>Plan my route</button>
             <button class="btn" type="button" data-action="route-draft-clear">Choose a different file</button>
@@ -4019,6 +4090,7 @@
     state.route = route;
     const fab = document.getElementById('aiFab'); if (fab) fab.hidden = !state.session;
     document.getElementById('content').innerHTML = VIEWS[route]();
+    if (route === 'driver-route' || route === 'routes') saveRouteDraftSoon();
     if (document.getElementById('routeMap')) initRouteMap(); else if (routeMap) { try { routeMap.remove(); } catch (e) {} routeMap = null; }
     const topbarTitle = document.getElementById('topbar-title');
     if (topbarTitle) { const item = NAV.find((n) => n.id === route); topbarTitle.textContent = item ? item.label : ''; }
@@ -5346,6 +5418,13 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     const fn = CHANGE_HANDLERS[el.dataset.onchange];
     if (fn) fn(el, e);
   });
+  // Remember the Start/Finish choices on an unfinished route too.
+  ['input', 'change'].forEach((type) => document.addEventListener(type, (e) => {
+    const f = e.target && e.target.closest && e.target.closest('form[data-onsubmit="route-plan"]');
+    if (!f || !routeUi.draft || !e.target.name) return;
+    routeUi.draft.form = Object.assign(routeUi.draft.form || {}, { [e.target.name]: e.target.value });
+    saveRouteDraftSoon();
+  }));
   document.addEventListener('input', (e) => {
     if (e.target && e.target.id === 'gate-mobile-input') clearGateError();
   });
@@ -5406,8 +5485,10 @@ Rules: "block" is whatever block/route label the note gives, or "" if none is me
     document.getElementById('shell').classList.remove('hidden');
     const initialRoute = location.hash.replace('#', '') || 'dashboard';
     state.route = VIEWS[initialRoute] ? initialRoute : 'dashboard';
+    const restored = await restoreRouteDraft();
     renderSidebar();
     renderView();
+    if (restored) toast('Your unfinished route was brought back. Carry on where you left off.', 'ok');
   }
 
   async function boot() {
